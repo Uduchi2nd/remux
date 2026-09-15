@@ -1973,6 +1973,77 @@ async fn item_for_user(
         base_item.media_sources = Some(vec![source]);
     }
 
+    // PATCH (uduchi2nd): the item document's MediaSources must describe
+    // redirect-able HTTP sources as remote as well (same rule as the
+    // PlaybackInfo path in services/stream_service.rs).
+    if let (Some(msis), Some(rows)) = (base_item.media_sources.as_mut(), media.sources.as_ref()) {
+        for msi in msis.iter_mut() {
+            let path_uuid = msi
+                .path
+                .as_deref()
+                .and_then(|p| p.strip_prefix("/remux/"))
+                .and_then(|rest| rest.split('/').next())
+                .and_then(|u| uuid::Uuid::parse_str(u).ok());
+            let row = rows
+                .iter()
+                .find(|r| r.group_id.unwrap_or(r.id) == msi.id || r.id == msi.id)
+                .or_else(|| path_uuid.and_then(|pu| rows.iter().find(|r| r.id == pu)));
+            let Some(row) = row else { continue };
+            let Some(si) = row.stream_info.as_ref() else { continue };
+            if let (Some(addon_id), crate::stream::StreamDescriptor::Http { url, .. }) =
+                (si.addon_id, &si.descriptor)
+            {
+                let host_is_internal = url::Url::parse(url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(crate::stream::is_internal_host))
+                    .unwrap_or(true);
+                let redirects = state
+                    .ctx
+                    .addons
+                    .get(addon_id)
+                    .map(|a| a.row.http_redirect_stream)
+                    .unwrap_or(false);
+                if !host_is_internal && redirects {
+                    msi.is_remote = true;
+                    msi.protocol = api::MediaProtocol::Http;
+                    msi.path = Some(url.clone());
+                }
+            }
+        }
+    }
+    // PATCH (uduchi2nd): mirror Jellyfin's item document — a playable item
+    // carries Container / Width / Height / IsHD / MediaStreams of its (first
+    // probed) media source at the ITEM level too; some clients read those to
+    // pick a player path. remux only populated them inside MediaSources.
+    if base_item.container.is_none() {
+        if let Some(src) = base_item
+            .media_sources
+            .as_ref()
+            .and_then(|v| v.iter().find(|s| s.container.is_some()))
+        {
+            base_item.container = src
+                .container
+                .as_ref()
+                .and_then(|c| serde_json::to_value(c).ok())
+                .and_then(|v| v.as_str().map(String::from));
+            if base_item
+                .media_streams
+                .as_ref()
+                .map_or(true, |v| v.is_empty())
+            {
+                base_item.media_streams = Some(src.media_streams.clone());
+            }
+            if let Some(v) = src
+                .media_streams
+                .iter()
+                .find(|s| matches!(s.type_, Some(api::MediaStreamType::Video)))
+            {
+                base_item.width = v.width;
+                base_item.height = v.height;
+                base_item.is_hd = v.height.map(|h| h >= 720);
+            }
+        }
+    }
     if media.kind == db::MediaKind::Episode {
         if let Some(sid) = media.grandparent_id {
             if let Ok(Some(s)) = db::Media::get_by_id(

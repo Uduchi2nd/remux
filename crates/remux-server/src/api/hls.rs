@@ -632,6 +632,39 @@ pub async fn master_hls_video(
     Query(q): Query<api::HlsVideoQuery>,
 ) -> Result<impl IntoResponse> {
     debug!("master_hls_video: item_id={}, q={:?}", id, q);
+    // PATCH (uduchi2nd): HLS passthrough — if the requested media source is a
+    // remote HLS playlist from an addon with http_redirect_stream, send the
+    // player straight to the origin playlist instead of starting a transcode.
+    if let Some(msid) = q.media_source_id {
+        if let Ok(Some(media)) = crate::db::Media::get_by_id(&state.ctx.db, &msid).await {
+            if let Some(si) = media.stream_info.as_ref() {
+                if let (Some(addon_id), crate::stream::StreamDescriptor::Http { url, .. }) =
+                    (si.addon_id, &si.descriptor)
+                {
+                    let host_is_internal = url::Url::parse(url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(crate::stream::is_internal_host))
+                        .unwrap_or(true);
+                    let redirects = state
+                        .ctx
+                        .addons
+                        .get(addon_id)
+                        .map(|a| a.row.http_redirect_stream)
+                        .unwrap_or(false);
+                    let looks_hls = url.to_ascii_lowercase().contains(".m3u8")
+                        || media
+                            .probe_data
+                            .as_ref()
+                            .and_then(|p| p.container.as_ref())
+                            .map_or(false, |c| c.is_hls_input());
+                    if !host_is_internal && redirects && looks_hls {
+                        info!(%msid, "hls passthrough: redirecting player to origin playlist");
+                        return Ok(axum::response::Redirect::temporary(url).into_response());
+                    }
+                }
+            }
+        }
+    }
     let (session, _) = match create_hls_session(&state, &auth, id, &q).await {
         Ok(s) => s,
         Err(_) => {
