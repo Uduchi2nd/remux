@@ -586,6 +586,33 @@ impl StreamService {
                 None => format!("/remux/{}", effective_stream.id),
             });
             source.is_remote = false;
+            // PATCH (uduchi2nd): a source the /Videos/{id}/stream endpoint would
+            // 302 to an external host is a REMOTE stream from the client's point
+            // of view. Say so, the way Jellyfin does for .strm/remote items, so
+            // clients fetch the URL directly (Infuse direct play) and jellyfin-web
+            // does not force CORS mode on the media element (it only skips
+            // crossOrigin="anonymous" when IsRemote is true).
+            if let Some(si) = effective_stream.stream_info.as_ref() {
+                if let (Some(addon_id), crate::stream::StreamDescriptor::Http { url, .. }) =
+                    (si.addon_id, &si.descriptor)
+                {
+                    let host_is_internal = url::Url::parse(url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(crate::stream::is_internal_host))
+                        .unwrap_or(true);
+                    let redirects = self
+                        .ctx
+                        .addons
+                        .get(addon_id)
+                        .map(|a| a.row.http_redirect_stream)
+                        .unwrap_or(false);
+                    if !host_is_internal && redirects {
+                        source.is_remote = true;
+                        source.protocol = api::MediaProtocol::Http;
+                        source.path = Some(url.clone());
+                    }
+                }
+            }
             // Re-apply binge-group headers — ffmpeg probing produces a fresh
             // MediaSourceInfo and would otherwise drop provider hints. Must
             // preserve whatever probe_source tag probe_stream() already set
