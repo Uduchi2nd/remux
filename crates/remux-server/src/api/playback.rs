@@ -567,6 +567,7 @@ async fn items_playbackinfo_inner(
             saved_audio,
             saved_subtitle,
         );
+        ensure_remote_hls_audio_default(source);
     }
 
     // Cache the group-resolved stream UUID so the stream endpoint can find it
@@ -679,6 +680,49 @@ async fn items_playbackinfo_inner(
         None
     };
 
+    // Fladder indexes PlaybackInfo using its cached item-version index, then
+    // reads slot zero for track metadata. Supply aliases of the ONE requested
+    // source in those slots; never resolve or play unrelated versions here.
+    // Other clients retain Jellyfin's normal single-source response.
+    if session
+        .device
+        .app_name
+        .eq_ignore_ascii_case("Fladder")
+        && specific_stream_requested
+        && media_sources.len() == 1
+    {
+        let key = fladder_version_count_key(&session, id);
+        let mut count = state
+            .ctx
+            .store
+            .get::<usize>(key.clone())
+            .map(|v| *v);
+        if count.is_none() {
+            // A client can retain item metadata across a server restart.
+            if let Ok(Some(item)) = super::items::item(
+                state.clone(),
+                auth::AuthSession {
+                    device: session
+                        .device
+                        .clone(),
+                    user: session
+                        .user
+                        .clone(),
+                },
+                id,
+                Some(&[api::ItemFields::MediaSources]),
+            )
+            .await
+            {
+                count = item
+                    .media_sources
+                    .as_ref()
+                    .map(Vec::len);
+            }
+        }
+        fladder_source_aliases(&mut media_sources, count.unwrap_or(1));
+    }
+
     let info = api::PlaybackInfoResponse {
         media_sources,
         play_session_id: Some(play_session_id),
@@ -691,6 +735,49 @@ async fn items_playbackinfo_inner(
 }
 
 static NO_STREAMS_VIDEO: &[u8] = include_bytes!("../../assets/no-streams.mp4");
+
+pub(super) fn fladder_version_count_key(
+    session: &auth::AuthSession,
+    id: Uuid,
+) -> String {
+    format!(
+        "fladder-versions:{}:{}:{}",
+        session
+            .user
+            .id,
+        session
+            .device
+            .id,
+        id
+    )
+}
+
+fn fladder_source_aliases(sources: &mut Vec<api::MediaSourceInfo>, count: usize) {
+    if sources.len() == 1 {
+        let selected = sources[0].clone();
+        sources.resize(count.max(1), selected);
+    }
+}
+
+pub(super) fn ensure_remote_hls_audio_default(source: &mut api::MediaSourceInfo) {
+    if source.is_remote
+        && source
+            .container
+            .as_ref()
+            .is_some_and(|c| c.is_hls_input())
+        && source
+            .default_audio_stream_index
+            .is_none()
+    {
+        // HLS often has an unflagged, language-undetermined AAC track. Leaving
+        // the default unset makes native clients interpret it as audio off.
+        source.default_audio_stream_index = source
+            .media_streams
+            .iter()
+            .find(|s| s.type_ == Some(api::MediaStreamType::Audio))
+            .map(|s| s.index);
+    }
+}
 
 fn no_streams_response() -> http::Response<Body> {
     http::Response::builder()
@@ -877,8 +964,20 @@ fn can_serve_mkv_source_directly(
     }
 }
 
+pub(super) fn remote_hls_url(url: &str, container: Option<&VideoContainer>) -> bool {
+    container.is_some_and(|c| c.is_hls_input())
+        || url::Url::parse(url)
+            .ok()
+            .is_some_and(|u| {
+                let path = u
+                    .path()
+                    .to_ascii_lowercase();
+                path.ends_with(".m3u8") || path.ends_with(".m3u")
+            })
+}
+
 async fn videos_stream_inner(
-    headers: headers::HeaderMap,
+    mut headers: headers::HeaderMap,
     state: AppState,
     user_id: Option<Uuid>,
     id: Uuid,
@@ -969,6 +1068,14 @@ async fn videos_stream_inner(
         }
     }
 
+    // Cached addon URLs can be extensionless. Use the actual probe result as
+    // well as the URL so they receive the same HLS response as fresh URLs.
+    let hls_inline = matches!(
+        &descriptor,
+        crate::stream::StreamDescriptor::Http { url, .. }
+            if remote_hls_url(url, media.probe_data.as_ref().and_then(|p| p.container.as_ref()))
+    );
+
     // Direct play: serve bytes directly through the StreamSource trait.
     // This handles HTTP, local files, torrents, and opendal without going through
     // our own HTTP proxy — TorrentSource resolves and streams inline.
@@ -996,7 +1103,7 @@ async fn videos_stream_inner(
             // addon proxy path below (Jellyfin does the same for .strm HLS
             // sources) — Infuse's Jellyfin direct-play reader plays the
             // playlist body but not a redirect to it. Segments stay direct.
-            let looks_hls = url.to_ascii_lowercase().contains(".m3u8");
+            let looks_hls = hls_inline;
             if !host_is_internal
                 && !looks_hls
                 && state
@@ -1015,11 +1122,12 @@ async fn videos_stream_inner(
 
         // PATCH (uduchi2nd): HLS playlists served inline get Jellyfin's exact
         // response shape (see patch notes) — no Content-Length, Accept-Ranges: none.
-        let hls_inline = matches!(
-            &descriptor,
-            crate::stream::StreamDescriptor::Http { url, .. }
-                if url.to_ascii_lowercase().contains(".m3u8")
-        );
+        if hls_inline {
+            // A partial playlist is not playable. Fetch the complete manifest;
+            // media segments retain their existing URLs and range behavior.
+            headers.remove(http::header::RANGE);
+            headers.remove(http::header::IF_RANGE);
+        }
         let resp = if let Some(addon_id) = descriptor.addon_id() {
             let addon = state
                 .ctx
@@ -1040,19 +1148,28 @@ async fn videos_stream_inner(
                 .await?
         };
         let mut resp = resp.into_response();
-        if hls_inline {
+        if hls_inline && resp.status() == StatusCode::OK {
             let (mut parts, body) = resp.into_parts();
-            parts.status = StatusCode::OK;
-            parts.headers.remove(http::header::CONTENT_LENGTH);
-            parts.headers.remove(http::header::CONTENT_RANGE);
             parts
                 .headers
-                .insert(http::header::ACCEPT_RANGES, http::HeaderValue::from_static("none"));
-            parts.headers.insert(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
-            );
-            resp = Response::from_parts(parts, Body::from_stream(body.into_data_stream()));
+                .remove(http::header::CONTENT_LENGTH);
+            parts
+                .headers
+                .remove(http::header::CONTENT_RANGE);
+            parts
+                .headers
+                .insert(
+                    http::header::ACCEPT_RANGES,
+                    http::HeaderValue::from_static("none"),
+                );
+            parts
+                .headers
+                .insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
+                );
+            resp =
+                Response::from_parts(parts, Body::from_stream(body.into_data_stream()));
         }
         return Ok(resp);
     }
@@ -1385,6 +1502,77 @@ pub struct BitrateTestQuery {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_hls_audio_default_handles_unflagged_tracks() {
+        let mut source = crate::api::MediaSourceInfo {
+            is_remote: true,
+            container: Some(remux_sdks::remux::VideoContainer::Other("hls".into())),
+            media_streams: vec![crate::api::MediaStream {
+                type_: Some(crate::api::MediaStreamType::Audio),
+                index: 1,
+                is_default: Some(false),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        super::ensure_remote_hls_audio_default(&mut source);
+        assert_eq!(source.default_audio_stream_index, Some(1));
+        source.default_audio_stream_index = Some(2);
+        super::ensure_remote_hls_audio_default(&mut source);
+        assert_eq!(source.default_audio_stream_index, Some(2));
+    }
+
+    #[test]
+    fn fladder_cached_version_index_always_resolves_requested_source() {
+        let selected_id = uuid::Uuid::new_v4();
+        let mut sources = vec![crate::api::MediaSourceInfo {
+            id: selected_id,
+            path: Some("https://cdn.example/master.m3u8".into()),
+            default_audio_stream_index: Some(1),
+            ..Default::default()
+        }];
+        super::fladder_source_aliases(&mut sources, 6);
+        assert_eq!(sources.len(), 6);
+        assert!(
+            sources
+                .iter()
+                .all(|s| s.id == selected_id)
+        );
+        assert_eq!(sources[5].path, sources[0].path);
+        assert_eq!(sources[5].default_audio_stream_index, Some(1));
+        let mut empty = vec![];
+        super::fladder_source_aliases(&mut empty, 6);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn remote_hls_url_accepts_cached_extensionless_playlists() {
+        assert!(super::remote_hls_url(
+            "https://vnphim.example/p/s.encoded",
+            Some(&remux_sdks::remux::VideoContainer::Other("hls".into())),
+        ));
+    }
+
+    #[test]
+    fn remote_hls_url_uses_path_not_query_hints() {
+        assert!(super::remote_hls_url(
+            "https://cdn.example/master.M3U8?key=x",
+            None
+        ));
+        assert!(super::remote_hls_url(
+            "https://cdn.example/master.m3u",
+            None
+        ));
+        assert!(!super::remote_hls_url(
+            "https://cdn.example/movie.mp4?name=.m3u8",
+            None
+        ));
+        assert!(!super::remote_hls_url(
+            "https://cdn.example/movie.mp4",
+            None
+        ));
+    }
+
     use http::{StatusCode, header::HeaderValue};
     use remux_sdks::remux::VideoContainer;
     use serde_json::json;
