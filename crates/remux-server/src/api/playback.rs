@@ -992,7 +992,13 @@ async fn videos_stream_inner(
                         .map(crate::stream::is_internal_host)
                 })
                 .unwrap_or(true);
+            // PATCH (uduchi2nd): HLS playlists are served inline through the
+            // addon proxy path below (Jellyfin does the same for .strm HLS
+            // sources) — Infuse's Jellyfin direct-play reader plays the
+            // playlist body but not a redirect to it. Segments stay direct.
+            let looks_hls = url.to_ascii_lowercase().contains(".m3u8");
             if !host_is_internal
+                && !looks_hls
                 && state
                     .ctx
                     .addons
@@ -1007,6 +1013,13 @@ async fn videos_stream_inner(
             }
         }
 
+        // PATCH (uduchi2nd): HLS playlists served inline get Jellyfin's exact
+        // response shape (see patch notes) — no Content-Length, Accept-Ranges: none.
+        let hls_inline = matches!(
+            &descriptor,
+            crate::stream::StreamDescriptor::Http { url, .. }
+                if url.to_ascii_lowercase().contains(".m3u8")
+        );
         let resp = if let Some(addon_id) = descriptor.addon_id() {
             let addon = state
                 .ctx
@@ -1026,7 +1039,22 @@ async fn videos_stream_inner(
                 .serve(&state, &headers)
                 .await?
         };
-        return Ok(resp.into_response());
+        let mut resp = resp.into_response();
+        if hls_inline {
+            let (mut parts, body) = resp.into_parts();
+            parts.status = StatusCode::OK;
+            parts.headers.remove(http::header::CONTENT_LENGTH);
+            parts.headers.remove(http::header::CONTENT_RANGE);
+            parts
+                .headers
+                .insert(http::header::ACCEPT_RANGES, http::HeaderValue::from_static("none"));
+            parts.headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
+            );
+            resp = Response::from_parts(parts, Body::from_stream(body.into_data_stream()));
+        }
+        return Ok(resp);
     }
 
     let url = descriptor.server_input(
