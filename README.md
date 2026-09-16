@@ -16,6 +16,10 @@ Remux is a Jellyfin-compatible media server that brings Stremio add-ons, local f
 
 ---
 
+## Compatibility branch
+
+See [FORK-RETIREMENT.md](FORK-RETIREMENT.md) for patch ownership, verification gaps, and the criteria for returning to stock upstream.
+
 ## Features
 
 - **Works with your Jellyfin clients**  
