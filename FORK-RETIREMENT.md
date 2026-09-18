@@ -84,3 +84,7 @@ Verified 2026-09-15 using GitHub releases and commits:
 Sources: https://github.com/lostb1t/remux/releases and https://github.com/lostb1t/remux/commits/main/
 
 Assessment: active development with frequent releases and relevant playback work. None of those changes alone proves our remote-HLS or Fladder workaround can be removed. No upstream upgrade or patch retirement was performed for this documentation update.
+
+
+## 2026-09-18 stock 0.32.0 check
+An isolated official 0.32.0 container used an online SQLite backup (integrity check passed) and loopback port 13001. Same user and Pursuit of Jade episode 4 on both servers: all seven production sources reported IsRemote=true, Protocol=Http, HTTPS paths. Stock reported IsRemote=false, Protocol=File, local paths, including both HLS variants. See UPSTREAM-0.32.0-CHECK.json (sanitized; no tokens/URLs). Production already uses the 0.32.0 image for assets with its patched binary bind mount. Do not confuse image version with binary compatibility. Stock has not passed retirement criteria. No physical client or seek acceptance was performed this run; retain patches. Test container removed after comparison.
