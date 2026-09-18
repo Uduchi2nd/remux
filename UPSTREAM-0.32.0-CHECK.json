@@ -1,0 +1,126 @@
+[
+  {
+    "port": 3000,
+    "item": "Pursuit of Jade episode 4",
+    "sources": [
+      {
+        "id": "40d32c3c9842530d8996797bb489060c",
+        "remote": true,
+        "protocol": "Http",
+        "container": "mkv",
+        "path_scheme": "https",
+        "streams": 2
+      },
+      {
+        "id": "057d1511ac0c5757bcc6efd0d69abeb4",
+        "remote": true,
+        "protocol": "Http",
+        "container": "mkv",
+        "path_scheme": "https",
+        "streams": 2
+      },
+      {
+        "id": "ea3c0ce5289d52db9ba95ca1f90fd454",
+        "remote": true,
+        "protocol": "Http",
+        "container": "mkv",
+        "path_scheme": "https",
+        "streams": 2
+      },
+      {
+        "id": "2fd394048db158c88fae4459890f04dc",
+        "remote": true,
+        "protocol": "Http",
+        "container": "mkv",
+        "path_scheme": "https",
+        "streams": 2
+      },
+      {
+        "id": "c93add68973d51eeaa6a1688d1b244a4",
+        "remote": true,
+        "protocol": "Http",
+        "container": "mkv",
+        "path_scheme": "https",
+        "streams": 2
+      },
+      {
+        "id": "c67df8c5927e534ca1a5e6c0788c1d99",
+        "remote": true,
+        "protocol": "Http",
+        "container": "hls",
+        "path_scheme": "https",
+        "streams": 2
+      },
+      {
+        "id": "be043f70b4ac53bca2c55e5c7ea0f936",
+        "remote": true,
+        "protocol": "Http",
+        "container": "hls",
+        "path_scheme": "https",
+        "streams": 2
+      }
+    ]
+  },
+  {
+    "port": 13001,
+    "item": "Pursuit of Jade episode 4",
+    "sources": [
+      {
+        "id": "40d32c3c9842530d8996797bb489060c",
+        "remote": false,
+        "protocol": "File",
+        "container": "mkv",
+        "path_scheme": "",
+        "streams": 2
+      },
+      {
+        "id": "057d1511ac0c5757bcc6efd0d69abeb4",
+        "remote": false,
+        "protocol": "File",
+        "container": "mkv",
+        "path_scheme": "",
+        "streams": 2
+      },
+      {
+        "id": "ea3c0ce5289d52db9ba95ca1f90fd454",
+        "remote": false,
+        "protocol": "File",
+        "container": "mkv",
+        "path_scheme": "",
+        "streams": 2
+      },
+      {
+        "id": "2fd394048db158c88fae4459890f04dc",
+        "remote": false,
+        "protocol": "File",
+        "container": "mkv",
+        "path_scheme": "",
+        "streams": 2
+      },
+      {
+        "id": "c93add68973d51eeaa6a1688d1b244a4",
+        "remote": false,
+        "protocol": "File",
+        "container": "mkv",
+        "path_scheme": "",
+        "streams": 2
+      },
+      {
+        "id": "c67df8c5927e534ca1a5e6c0788c1d99",
+        "remote": false,
+        "protocol": "File",
+        "container": "hls",
+        "path_scheme": "",
+        "streams": 2
+      },
+      {
+        "id": "be043f70b4ac53bca2c55e5c7ea0f936",
+        "remote": false,
+        "protocol": "File",
+        "container": "hls",
+        "path_scheme": "",
+        "streams": 1
+      }
+    ]
+  }
+]
