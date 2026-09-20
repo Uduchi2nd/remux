@@ -1086,30 +1086,40 @@ fn select_candidates(
         .stream_info
         .as_ref()
         .and_then(|si| si.resolution_tag());
-    probe_pool
-        .iter()
-        .filter(|c| {
-            if c.id == primary.id {
-                return false;
-            }
-            let c_p2p = c
+    let matches_primary = |c: &db::Media| {
+        let c_p2p = c
+            .stream_info
+            .as_ref()
+            .map_or(false, |si| si.is_p2p());
+        if c_p2p != pri_p2p {
+            return false;
+        }
+        if restrict_resolution {
+            let c_res = c
                 .stream_info
                 .as_ref()
-                .map_or(false, |si| si.is_p2p());
-            if c_p2p != pri_p2p {
+                .and_then(|si| si.resolution_tag());
+            if c_res != pri_res {
                 return false;
             }
-            if restrict_resolution {
-                let c_res = c
-                    .stream_info
-                    .as_ref()
-                    .and_then(|si| si.resolution_tag());
-                if c_res != pri_res {
-                    return false;
-                }
-            }
-            true
-        })
+        }
+        true
+    };
+    let others = probe_pool
+        .iter()
+        .filter(|c| c.id != primary.id);
+    let preferred = others
+        .clone()
+        .filter(|c| matches_primary(c));
+    // In restricted mode, streams of another resolution / transport are still
+    // tried after the matching ones ran out: a PlaybackInfo without a chosen
+    // version must not fail while any listed stream still probes. The
+    // resolution tag comes from the filename, which many addons (Torrentio's
+    // "Show S01E11.mkv") do not carry, so an exact-match-only pool is often
+    // empty even when playable siblings exist.
+    let deferred = others.filter(|c| restrict_resolution && !matches_primary(c));
+    preferred
+        .chain(deferred)
         // In group-cascade mode (restrict_resolution=false) try all candidates;
         // otherwise honour the configured retry cap.
         .take(if restrict_resolution {
@@ -1522,14 +1532,56 @@ mod probe_tests {
     }
 
     #[test]
-    fn resolution_mismatch_excluded_when_restricted() {
+    fn resolution_mismatch_deferred_when_restricted() {
+        // A stream of another resolution is still a fallback (after the
+        // matching ones) so a PlaybackInfo does not fail while a playable
+        // sibling exists.
         let primary =
             http_media_with_filename("http://a.example.com", "Movie.1080p.BluRay.mkv");
         let other =
             http_media_with_filename("http://b.example.com", "Movie.720p.BluRay.mkv");
-        let all = vec![primary.clone(), other];
+        let all = vec![primary.clone(), other.clone()];
         let result = select_candidates(&primary, &all, true, 10, true, 3000);
-        assert!(result.is_empty());
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0]
+                .0
+                .id,
+            other.id
+        );
+    }
+
+    #[test]
+    fn matching_resolution_tried_before_mismatch_when_restricted() {
+        let primary =
+            http_media_with_filename("http://a.example.com", "Movie.1080p.BluRay.mkv");
+        let lower =
+            http_media_with_filename("http://b.example.com", "Movie.720p.BluRay.mkv");
+        let untagged =
+            http_media_with_filename("http://c.example.com", "Movie S01E11.mkv");
+        let same =
+            http_media_with_filename("http://d.example.com", "Movie.1080p.WEB-DL.mkv");
+        let all = vec![
+            primary.clone(),
+            lower.clone(),
+            untagged.clone(),
+            same.clone(),
+        ];
+        let result = select_candidates(&primary, &all, true, 10, true, 3000);
+        let ids: Vec<_> = result
+            .iter()
+            .map(|(m, _)| m.id)
+            .collect();
+        assert_eq!(ids, vec![same.id, lower.id, untagged.id]);
+        // The retry cap bounds the whole fallback list, preferred first.
+        let capped = select_candidates(&primary, &all, true, 1, true, 3000);
+        assert_eq!(capped.len(), 1);
+        assert_eq!(
+            capped[0]
+                .0
+                .id,
+            same.id
+        );
     }
 
     #[test]
