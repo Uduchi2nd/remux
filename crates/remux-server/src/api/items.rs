@@ -2235,6 +2235,48 @@ async fn item_for_user(
                 );
                 super::playback::ensure_remote_hls_audio_default(source);
             }
+
+            // Addon subtitles (AIOStreams / vnphim) used to exist only in
+            // PlaybackInfo. Infuse and VidHub build their subtitle picker from
+            // the item document, so a Vietnamese track that was perfectly
+            // deliverable never showed up. `EnableSubtitlesDetail` (dashboard
+            // setting, previously unused) now opts the item document in;
+            // fetch_subtitles is cache-backed (24 h) so browsing stays cheap.
+            if server_config
+                .enable_subtitles_detail
+                .unwrap_or(false)
+                && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
+            {
+                let mut subtitle_media = media.clone();
+                let sub_langs = server_config
+                    .subtitle_languages
+                    .clone()
+                    .unwrap_or_default();
+                super::subtitles::inject_external_subtitles(
+                    &state.ctx,
+                    &mut subtitle_media,
+                    sources,
+                    id,
+                    session
+                        .device
+                        .access_token
+                        .expose(),
+                    sub_langs,
+                    Some(
+                        session
+                            .user
+                            .id,
+                    ),
+                )
+                .await;
+                for source in sources.iter_mut() {
+                    for s in &mut source.media_streams {
+                        if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {
+                            s.is_text_subtitle_stream = s.is_text_subtitle_stream();
+                        }
+                    }
+                }
+            }
         }
     }
 
