@@ -1138,6 +1138,42 @@ fn select_candidates(
         .collect()
 }
 
+/// How long a failed probe keeps a stream out of the fallback rotation.
+const PROBE_FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Streams whose last probe failed (timeout, ffprobe error, placeholder
+/// duration), with the time of that failure. Process-local: a restart forgets
+/// everything, which is fine — the cost of a stale entry is one skipped probe
+/// while another stream is available, never a missing source.
+static RECENT_PROBE_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<Uuid, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn recently_failed(id: Uuid) -> bool {
+    RECENT_PROBE_FAILURES
+        .lock()
+        .map(|m| {
+            m.get(&id)
+                .is_some_and(|t| t.elapsed() < PROBE_FAILURE_TTL)
+        })
+        .unwrap_or(false)
+}
+
+fn note_probe_failure(id: Uuid) {
+    if let Ok(mut m) = RECENT_PROBE_FAILURES.lock() {
+        if m.len() >= 4096 {
+            m.retain(|_, t| t.elapsed() < PROBE_FAILURE_TTL);
+        }
+        m.insert(id, std::time::Instant::now());
+    }
+}
+
+fn clear_probe_failure(id: Uuid) {
+    if let Ok(mut m) = RECENT_PROBE_FAILURES.lock() {
+        m.remove(&id);
+    }
+}
+
 /// Probe a stream URL, retrying with the next matching candidate on failure.
 ///
 /// Returns a 500 error if all candidates fail to probe.
@@ -1181,7 +1217,19 @@ where
     let total_available = probe_pool.len();
     let mut attempts = 0usize;
 
-    for (stream, url_opt) in all_to_try {
+    // A stream whose probe failed a moment ago is almost certainly still dead;
+    // re-probing it costs the full timeout on EVERY PlaybackInfo (clients give
+    // up long before 60 s). Skip it while any candidate without a recent
+    // failure is still ahead — it stays the last resort otherwise.
+    let fresh: Vec<bool> = all_to_try
+        .iter()
+        .map(|(m, _)| !recently_failed(m.id))
+        .collect();
+
+    for (idx, (stream, url_opt)) in all_to_try
+        .into_iter()
+        .enumerate()
+    {
         let is_retry = stream.id != primary.id;
         let url = match url_opt {
             Some(u) => u,
@@ -1190,6 +1238,18 @@ where
                 continue;
             }
         };
+        if !fresh[idx]
+            && fresh[idx + 1..]
+                .iter()
+                .any(|f| *f)
+        {
+            info!(
+                id = %stream.id,
+                url = %url,
+                "skipping stream that failed to probe recently"
+            );
+            continue;
+        }
         attempts += 1;
         if is_retry {
             info!(
@@ -1242,9 +1302,11 @@ where
                             known_runtime_secs = ?stream.runtime,
                             "stream is suspiciously short, treating as probe failure"
                         );
+                        note_probe_failure(stream.id);
                         continue;
                     }
                 }
+                clear_probe_failure(stream.id);
 
                 if probed
                     .video_stream()
@@ -1275,12 +1337,15 @@ where
             }
             Ok(Ok(Err(e))) => {
                 warn!(url = %url, error = %e, "probe failed");
+                note_probe_failure(stream.id);
             }
             Ok(Err(e)) => {
                 warn!(url = %url, error = %e, "probe task panicked");
+                note_probe_failure(stream.id);
             }
             Err(_) => {
                 warn!(url = %url, timeout = timeout_secs, "probe timed out");
+                note_probe_failure(stream.id);
             }
         }
     }
@@ -1702,6 +1767,79 @@ mod probe_tests {
             effective.id, fallback_id,
             "fallback succeeded — effective stream must be the fallback, not the primary"
         );
+    }
+
+    #[tokio::test]
+    async fn recently_failed_primary_is_skipped_while_a_fresh_fallback_exists() {
+        let db = test_db().await;
+        let primary = http_media("http://dead.example.com");
+        let fallback = http_media("http://alive.example.com");
+        let fallback_id = fallback.id;
+        let all = vec![primary.clone(), fallback];
+        // First request: the primary really is probed, fails, and is remembered.
+        let (_, effective) = probe_with_fallback(
+            primary.clone(),
+            Some("http://dead.example.com".to_string()),
+            10,
+            true,
+            5,
+            &all,
+            false,
+            3000,
+            &db,
+            queued_probe(vec![Err(anyhow!("primary failed")), video_probe()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(effective.id, fallback_id);
+        assert!(recently_failed(primary.id));
+        assert!(!recently_failed(fallback_id));
+
+        // Second request: only ONE probe result is queued. If the dead primary
+        // were probed again it would consume it and become the effective
+        // stream; the failure memory must hand it straight to the fallback.
+        let (_, effective) = probe_with_fallback(
+            primary.clone(),
+            Some("http://dead.example.com".to_string()),
+            10,
+            true,
+            5,
+            &all,
+            false,
+            3000,
+            &db,
+            queued_probe(vec![video_probe()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            effective.id, fallback_id,
+            "recently failed primary must be skipped without a probe"
+        );
+
+        // Last resort: when every candidate failed recently the primary is
+        // still probed rather than failing with zero attempts.
+        note_probe_failure(fallback_id);
+        let (_, effective) = probe_with_fallback(
+            primary.clone(),
+            Some("http://dead.example.com".to_string()),
+            10,
+            true,
+            5,
+            &all,
+            false,
+            3000,
+            &db,
+            queued_probe(vec![video_probe()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(effective.id, primary.id);
+        assert!(
+            !recently_failed(primary.id),
+            "a successful probe clears the memory"
+        );
+        clear_probe_failure(fallback_id);
     }
 
     #[tokio::test]
