@@ -893,6 +893,15 @@ pub(crate) async fn inject_external_subtitles(
                 "/Videos/{item_id}/{source_id}/Subtitles/{idx}/0/Stream.vtt?ApiKey={api_key}",
                 source_id = source.id,
             ));
+            // Vidhub requires Path to discover external subtitles and uses its
+            // basename as the label. Keep credentials in DeliveryUrl only.
+            stream.path = Some(format!(
+                "{}.vtt",
+                stream
+                    .language
+                    .as_deref()
+                    .unwrap_or("und")
+            ));
             if wants_default && i == 0 {
                 stream.is_default = Some(true);
                 source.default_subtitle_stream_index = Some(next_idx);
