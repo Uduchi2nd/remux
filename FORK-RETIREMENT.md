@@ -105,3 +105,21 @@ The final candidate uses a language filename (e.g. vie.vtt) for Path and retains
 Retirement criterion: stock upstream exposes addon subtitles in the documents these clients read, with a usable Path/label and DeliveryUrl; actual Vidhub discovers and renders the track on explicitly selected debrid and Usenet versions, including seek/resume. Infuse should retain working subtitles. Test with a freshly opened item to avoid client metadata caching. Do not infer success from API fields or HTTP 200 alone. The patch affects subtitle metadata only, without changing video routes or adding a video relay. Precise subtitle synchronization across different encodes is a separate property, not guaranteed by this check.
 
 Deployment: nimo LXC 111, 2026-09-20, binary SHA256 `3142908b1d1c95d83fa841de856ca9077f79712b1647a80ea81418d53f5cd608`. Built on seedbox in the existing Debian-trixie Rust container; `cargo fmt -p remux-server`, release build, `git diff --check`, live API checks and physical Vidhub playback passed. Original binary rollback: `/opt/remux/remux-server-patched.backup-vidhub-path-20260920T230927Z` inside LXC 111 (stop remux, stage/copy backup and recreate container; do not overwrite a running mapped binary). The original source snapshot is `/root/remux-patch/subtitles-before-vidhub-path.rs` on nimo. No vnphim change was needed. No new diagnostic logging remains enabled from this investigation.
+
+
+## Episode release timing is separate from subtitle discovery (2026-09-20)
+Follow-up on No Pain No Gain S1E12: Infuse 8.5.3 selected the Usenet HHWEB source, Vietnamese vie.vtt, subtitle Time Offset +0.00. Vidhub 3.0.6 on that same Usenet version also showed a mismatched cue (Shenhua International title while still in the apartment scene). The Path discovery fix works in both clients; rendering alone does not prove dialogue synchronization.
+
+Compared original embedded subtitle timestamps using ffmpeg -copyts and -avoid_negative_ts disabled in short seek samples. Ordinary seeked SRT extraction can shift the output timestamps; do not use those relative samples as exact timing evidence.
+
+| Dialogue anchor | Vietnamese external / TorBox embedded English | Usenet embedded Chinese | Usenet difference |
+| --- | --- | --- | --- |
+| Mr. Pei, don't worry | 00:10:59.190 | 00:11:14.261 | +15.071 s |
+| To ensure users' needs are met | 00:33:37.710 | 00:34:10.700 | +32.990 s |
+| 24-hour housekeeping | 00:33:43.950 | 00:34:16.940 | +32.990 s |
+
+TorBox/Torrentio source 65e11276edf25e7296aa3315ccac006e matches the Vietnamese cue times exactly in both early and late samples. Usenet HHWEB source 8281a9552ee855b4b75f66d2a5db1a1f differs by a changing offset. Episode item: 8281a955-2ee8-55b4-b75f-66d2a5db1a1f. This is evidence of different release timelines, not a player-specific delay, and a single global offset is not a valid fix. We have not established all cut boundaries or guaranteed full-episode sync from two samples.
+
+Practical workaround: select the matching TorBox release when using this Vietnamese subtitle. Long-term: match subtitle editions to the selected video source, or perform validated per-source alignment (including cuts) and cache that result by video/subtitle identity. The current same-episode fallback must not be described as synchronization-verified for every debrid/Usenet release. Do not add an episode-wide hard-coded delay or change the shared Vietnamese subtitle for all sources. No subtitle timing code or delay setting changed during this investigation.
+
+During this follow-up LXC111 was found stopped. The user confirmed no maintenance and authorized restoring it; pct start 111 succeeded and remux health returned 200. The reason for the stop was not established.
