@@ -6,7 +6,7 @@ Last reviewed: 2026-09-15. This is a retirement plan, not a claim that stock ups
 
 - Upstream: https://github.com/lostb1t/remux
 - Compatibility branch: https://github.com/Uduchi2nd/remux/tree/remote-hls-sources
-- Current baseline: upstream v0.31.0. Patch stack before this documentation: c9989c01.
+- Current baseline: upstream v0.33.0 (rebased 2026-09-20; earlier baselines v0.31.0, v0.32.0). v0.33.0 adds `AddonFetchTimeoutSecs` (default 5 s) — production sets it to 30 because UsenetStreamer's triage takes 3–20 s; re-check the value after any upgrade.
 - VNPHIM is the user's own project, not a fork: https://github.com/Uduchi2nd/vnphim/tree/kkphim-playlist-compat
 - VNPHIM's INFUSE-COMPAT.md and HOTPHIM-COMPAT.md describe provider fixes and their verification.
 
@@ -26,6 +26,7 @@ Keep changes server-side. Retire the remux fork when stock upstream demonstrates
 | ac6d40ef: probe fallback cascade (2026-09-20) | PlaybackInfo without a chosen version probed only the first stream and fell back solely to same-resolution siblings; the tag comes from the filename, which Torrentio-style names lack, so one dead debrid link became a 500 for the whole episode ("tried 1 of 4 streams"). Matching streams are still tried first, then the rest, bounded by MaxProbeFallbackStreams | Stock PlaybackInfo (no MediaSourceId) returns a playable source when the first listed stream is dead but another listed stream probes; upstream #464-style "probe fallback on subsequent requests" alone is not equivalent |
 | probe failure memory (2026-09-20, commit after ac6d40ef) | A stream whose probe just failed is skipped for 10 minutes while any candidate without a recent failure is still ahead (last resort otherwise; success clears it). Without it every PlaybackInfo re-probed the dead TorBox link for the full timeout and Infuse/VidHub gave up first | Stock returns a playable source quickly on the second and later PlaybackInfo when the first listed stream is dead |
 | addon subtitles in item documents (2026-09-20) | `EnableSubtitlesDetail` (dashboard setting, previously unused) makes `item_for_user` inject AIOStreams/vnphim subtitle tracks into the item's MediaSources, exactly as PlaybackInfo does; Infuse and VidHub build their subtitle picker from the item document, so external Vietnamese tracks were invisible on sources without embedded ones. Cache-backed, ~4 s cold per item, 0.04 s warm | Stock item documents list addon subtitle tracks (or both clients pick them up from PlaybackInfo) |
+| addon subtitles at item top level (2026-09-20) | Jellyfin mirrors the primary source's streams at `BaseItemDto.MediaStreams`; VidHub reads its subtitle list from there, Infuse from `MediaSources[n]`. External addon subtitles are now mirrored there too and `HasSubtitles` set | Stock item documents expose addon subtitle tracks at both levels |
 
 The original commits bundle multiple behaviors. If upstream fixes only some, split or reduce the remaining patch rather than discarding the whole commit blindly.
 
