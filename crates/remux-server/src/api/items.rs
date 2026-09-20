@@ -2539,6 +2539,28 @@ async fn item_for_user(
                         s.is_text_subtitle_stream = s.is_text_subtitle_stream();
                     }
                 }
+                // Jellyfin mirrors the primary source's streams at the item's
+                // top level; VidHub reads its subtitle list from there.
+                if let Some(first) = sources.first() {
+                    let is_ext_sub = |s: &api::MediaStream| {
+                        s.is_external
+                            && matches!(s.type_, Some(api::MediaStreamType::Subtitle))
+                    };
+                    let ext: Vec<api::MediaStream> = first
+                        .media_streams
+                        .iter()
+                        .filter(|s| is_ext_sub(s))
+                        .cloned()
+                        .collect();
+                    if !ext.is_empty() {
+                        let list = base_item
+                            .media_streams
+                            .get_or_insert_with(Vec::new);
+                        list.retain(|s| !is_ext_sub(s));
+                        list.extend(ext);
+                        base_item.has_subtitles = Some(true);
+                    }
+                }
             }
         }
     }
