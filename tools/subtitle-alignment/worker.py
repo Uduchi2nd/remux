@@ -13,11 +13,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
-import onnxruntime as ort
 import pysubs2
-from tokenizers import Tokenizer
 
-VERSION = "embedded-text-v3"
+VERSION = "embedded-text-v4-alass-only"
 ROOT = Path(os.environ.get("ALIGN_RUNTIME", "/root/remux-alignment-runtime"))
 MAX_BYTES = 2_000_000
 MAX_CUES = 5000
@@ -44,6 +42,9 @@ def parse(text):
 
 class Encoder:
     def __init__(self):
+        # Retained for offline comparisons only; production Engine never uses it.
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
         self.tokenizer = Tokenizer.from_file(str(ROOT / "model/tokenizer.json"))
         self.tokenizer.enable_truncation(max_length=128)
         self.tokenizer.no_padding()
@@ -162,9 +163,20 @@ def validate(original, reference, candidate, similarities):
             "coverage_bins":bins}
 
 
+def structural_validation(original, candidate):
+    """Integrity checks only; these do not verify dialogue meaning or sync."""
+    if len(candidate) != len(original) or any(a.text != b.text for a,b in zip(original,candidate)):
+        return {"accepted": False, "reason": "content changed", "method": "alass-only"}
+    if any(s.start < 0 or s.end <= s.start for s in candidate):
+        return {"accepted": False, "reason": "invalid output times", "method": "alass-only"}
+    if any(a.start > b.start for a,b in zip(candidate,candidate[1:])):
+        return {"accepted": False, "reason": "non-monotonic output", "method": "alass-only"}
+    return {"accepted": True, "reason": "structural checks passed",
+            "method": "alass-only", "semantic_validation": False}
+
+
 class Engine:
     def __init__(self):
-        self.encoder = Encoder()
         self.lock = threading.Lock()
         (ROOT / "cache").mkdir(exist_ok=True)
 
@@ -181,7 +193,7 @@ class Engine:
                 original.save(str(p/'external.srt'), keep_ssa_tags=True)
                 ref.save(str(p/'reference.srt'))
                 subprocess.run([str(ROOT/'alass'),str(p/'reference.srt'),str(p/'external.srt'),str(p/'result.srt')],
-                               check=True,timeout=90,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                               check=True,timeout=20,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 candidate=pysubs2.load(str(p/'result.srt'))
                 # ALASS supplies timestamps; the original supplies all dialogue.
                 # Validate its serialized cue mapping before copying any times.
@@ -192,11 +204,7 @@ class Engine:
                 for cue, proposed in zip(timed,candidate):
                     cue.start, cue.end = proposed.start, proposed.end
                 candidate=timed
-            report=exact_validation(original,ref,candidate)
-            if report is None:
-                similarities=self.encoder.encode(original) @ self.encoder.encode(ref).T
-                report=validate(original,ref,candidate,similarities)
-                report['method']='semantic'
+            report=structural_validation(original,candidate)
             result={"version":VERSION,"key":key,"report":report}
             if report['accepted']:
                 result['subtitle']=candidate.to_string('srt', keep_ssa_tags=True)

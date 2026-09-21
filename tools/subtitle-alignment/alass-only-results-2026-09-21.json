@@ -1,0 +1,329 @@
+{
+  "engine": [
+    {
+      "case": "E12 original case",
+      "seconds": 1.31,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "cues": 1070,
+      "anchor_errors_ms": [
+        8,
+        10,
+        10
+      ]
+    },
+    {
+      "case": "E11 same Vietnamese",
+      "seconds": 1.02,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "cues": 939
+    },
+    {
+      "case": "E11 real vnphim vs embedded Vietnamese",
+      "seconds": 1.07,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "cues": 1001
+    },
+    {
+      "case": "Chad4 same Spanish",
+      "seconds": 0.25,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "cues": 350
+    }
+  ],
+  "matrix": [
+    {
+      "title": "No Pain No Gain E11",
+      "case": "unchanged",
+      "seconds": 0.97,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 0,
+      "recovery_p95_ms": 0
+    },
+    {
+      "title": "No Pain No Gain E11",
+      "case": "offset17",
+      "seconds": 1.01,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 0,
+      "recovery_p95_ms": 0
+    },
+    {
+      "title": "No Pain No Gain E11",
+      "case": "cut15to33",
+      "seconds": 0.96,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 0,
+      "recovery_p95_ms": 0
+    },
+    {
+      "title": "No Pain No Gain E11",
+      "case": "rate104",
+      "seconds": 1.01,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 280,
+      "recovery_p95_ms": 227
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "unchanged",
+      "seconds": 0.26,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 82,
+      "recovery_p95_ms": 82
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "offset17",
+      "seconds": 0.26,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 82,
+      "recovery_p95_ms": 82
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "cut15to33",
+      "seconds": 0.31,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 82,
+      "recovery_p95_ms": 82
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "rate104",
+      "seconds": 0.37,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 640,
+      "recovery_p95_ms": 454
+    },
+    {
+      "title": "Supergirl",
+      "case": "unchanged",
+      "seconds": 3.37,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 222,
+      "recovery_p95_ms": 222
+    },
+    {
+      "title": "Supergirl",
+      "case": "offset17",
+      "seconds": 3.28,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 222,
+      "recovery_p95_ms": 222
+    },
+    {
+      "title": "Supergirl",
+      "case": "cut15to33",
+      "seconds": 3.33,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 222,
+      "recovery_p95_ms": 222
+    },
+    {
+      "title": "Supergirl",
+      "case": "rate104",
+      "seconds": 3.31,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 1366,
+      "recovery_p95_ms": 625
+    },
+    {
+      "title": "Die My Love",
+      "case": "unchanged",
+      "seconds": 1.95,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 0,
+      "recovery_p95_ms": 0
+    },
+    {
+      "title": "Die My Love",
+      "case": "offset17",
+      "seconds": 2.16,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 0,
+      "recovery_p95_ms": 0
+    },
+    {
+      "title": "Die My Love",
+      "case": "cut15to33",
+      "seconds": 1.95,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 1,
+      "recovery_p95_ms": 1
+    },
+    {
+      "title": "Die My Love",
+      "case": "rate104",
+      "seconds": 2.1,
+      "report": {
+        "accepted": true,
+        "reason": "structural checks passed",
+        "method": "alass-only",
+        "semantic_validation": false
+      },
+      "text_preserved": true,
+      "recovery_max_ms": 1199,
+      "recovery_p95_ms": 516
+    }
+  ],
+  "live_worker": {
+    "seconds": 1.23,
+    "version": "embedded-text-v4-alass-only",
+    "report": {
+      "accepted": true,
+      "reason": "structural checks passed",
+      "method": "alass-only",
+      "semantic_validation": false
+    }
+  },
+  "live_serving": {
+    "formats": [
+      "SRT",
+      "VTT",
+      "Jellyfin JSON"
+    ],
+    "cue_count": 1070,
+    "all_text_preserved": true,
+    "original_bypass": true,
+    "anchors": [
+      {
+        "original_ms": 659190,
+        "served_ms": 674269,
+        "reference_ms": 674261
+      },
+      {
+        "original_ms": 2017710,
+        "served_ms": 2050710,
+        "reference_ms": 2050700
+      },
+      {
+        "original_ms": 2023950,
+        "served_ms": 2056950,
+        "reference_ms": 2056940
+      }
+    ]
+  },
+  "live_embedded_language": {
+    "status": "embedded-language",
+    "original_unchanged": true,
+    "title": "No Pain No Gain E11"
+  },
+  "deployed": {
+    "binary_sha256": "db358ae4227324ad688dd09eedb7b2e02e220f1a759b419d9ecb6eff15c89fd0",
+    "worker_sha256": "26054fce79036a7f0194718d66e32413ccc9b9068d1e26e5d510096eb7f1146c"
+  }
+}

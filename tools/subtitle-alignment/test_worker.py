@@ -1,8 +1,12 @@
 import copy
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 import numpy as np
 import pysubs2
-from worker import normalize, parse, validate, exact_validation
+import worker
+from worker import normalize, parse, validate, exact_validation, structural_validation
 
 
 def cues():
@@ -14,6 +18,38 @@ def cues():
 
 
 class ValidationTests(unittest.TestCase):
+    def test_production_engine_never_constructs_language_model(self):
+        def propose(args, **kwargs):
+            self.assertEqual(kwargs['timeout'], 20)
+            source=pysubs2.load(args[2])
+            source.shift(ms=17000)
+            source.save(args[3],keep_ssa_tags=True)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(worker,'ROOT',Path(directory)), \
+             patch.object(worker,'Encoder',side_effect=AssertionError('model called')), \
+             patch.object(worker.subprocess,'run',side_effect=propose):
+            s=cues();result=worker.Engine().align(s.to_string('srt'),s.to_string('srt'))
+            self.assertEqual(result['report']['method'],'alass-only')
+            self.assertFalse(result['report']['semantic_validation'])
+            aligned=parse(result['subtitle'])
+            self.assertEqual(aligned[20].start,s[20].start+17000)
+            self.assertEqual([c.text for c in aligned],[c.text for c in s])
+
+    def test_structural_checks_reject_corrupt_output(self):
+        s=cues()
+        for change in ['text','negative','duration','order']:
+            bad=copy.deepcopy(s)
+            if change=='text':bad[5].text='Modified'
+            if change=='negative':bad[0].start=-1
+            if change=='duration':bad[5].end=bad[5].start
+            if change=='order':bad[5].start=bad[4].start-1
+            self.assertFalse(structural_validation(s,bad)['accepted'])
+
+    def test_structural_acceptance_does_not_claim_semantic_confidence(self):
+        s=cues();result=structural_validation(s,s)
+        self.assertTrue(result['accepted'])
+        self.assertFalse(result['semantic_validation'])
+
     def test_exact_dialogue_fast_path(self):
         s=cues()
         self.assertTrue(exact_validation(s,s,s)['accepted'])
