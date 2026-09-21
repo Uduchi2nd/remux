@@ -50,7 +50,32 @@ fn text_codec(codec: Option<&str>) -> bool {
 }
 
 fn cache_key(source: Uuid, external: &[u8]) -> String {
-    format!("subtitle-alignment-v2:{}", Uuid::new_v5(&source, external))
+    format!("subtitle-alignment-v4:{}", Uuid::new_v5(&source, external))
+}
+
+fn alignment_skip_reason(
+    language: Option<&str>,
+    streams: &[api::MediaStream],
+) -> Option<&'static str> {
+    let language = language.and_then(super::lang_to_two_letter);
+    if !matches!(language.as_deref(), Some("en" | "vi")) {
+        return Some("language-skipped");
+    }
+    if streams
+        .iter()
+        .any(|s| {
+            matches!(s.type_, Some(api::MediaStreamType::Subtitle))
+                && !s.is_external
+                && !s.is_forced
+                && s.language
+                    .as_deref()
+                    .and_then(super::lang_to_two_letter)
+                    == language
+        })
+    {
+        return Some("embedded-language");
+    }
+    None
 }
 
 fn source_identity(
@@ -235,6 +260,12 @@ pub(super) async fn resolve(
     let (Some(info), Some(probe)) = (&source.stream_info, &source.probe_data) else {
         return (original, "no-reference");
     };
+    // Only fill a missing English/Vietnamese language. A full embedded track
+    // already in that language needs no external timing work, even if bitmap.
+    // Forced/signs-only tracks do not count as full dialogue coverage.
+    if let Some(reason) = alignment_skip_reason(language, &probe.media_streams) {
+        return (original, reason);
+    }
     let Some(source_key) = source_identity(source.id, info, probe.run_time_ticks)
     else {
         return (original, "unavailable");
@@ -412,6 +443,34 @@ pub(super) async fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_missing_english_or_vietnamese_is_aligned() {
+        let mut track = api::MediaStream {
+            type_: Some(api::MediaStreamType::Subtitle),
+            language: Some("eng".into()),
+            codec: Some("hdmv_pgs_subtitle".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            alignment_skip_reason(Some("en"), &[track.clone()]),
+            Some("embedded-language")
+        );
+        assert_eq!(alignment_skip_reason(Some("vie"), &[track.clone()]), None);
+        track.language = Some("vie".into());
+        assert_eq!(
+            alignment_skip_reason(Some("vi"), &[track.clone()]),
+            Some("embedded-language")
+        );
+        track.is_forced = true;
+        assert_eq!(alignment_skip_reason(Some("vi"), &[track.clone()]), None);
+        track.is_forced = false;
+        track.is_external = true;
+        assert_eq!(alignment_skip_reason(Some("vi"), &[track]), None);
+        for lang in [None, Some("es"), Some("zho"), Some("und")] {
+            assert_eq!(alignment_skip_reason(lang, &[]), Some("language-skipped"));
+        }
+        assert_eq!(alignment_skip_reason(Some("eng"), &[]), None);
+    }
     #[test]
     fn renewed_urls_reuse_only_the_same_guarded_release() {
         let mut info = crate::stream::StreamInfo {
