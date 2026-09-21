@@ -83,7 +83,7 @@ at most about 64 MB; worker data lives on nimo, outside the small remux LXC disk
 No external media URL, addon token, or API key is sent to the worker.
 
 Response header `X-Remux-Subtitle-Alignment` reports `aligned`, `wait-timeout`,
-`rejected`, `unavailable`, `no-reference`, `unsupported`, `disabled`, `original`,
+`unchanged`, `rejected`, `unavailable`, `no-reference`, `unsupported`, `disabled`, `original`,
 `language-skipped`, or `embedded-language`.
 Alignment responses use `private, no-store` so an intermediary cannot retain a
 cold fallback after a correction becomes ready. The worker requires a bearer
@@ -172,3 +172,7 @@ reference, including points near minutes 11 and 34.
 See [QUALITY.md](QUALITY.md) for the four-title, full-timeline recovery matrix, false negatives, exact-dialogue fast path, formatting fix, and remaining cold-start costs. Worker v3 preserves the existing E12 correction; it does not promise perfect alignment or instant cross-language matching.
 
 Reference accuracy is an assumption: embedded text can itself be mistimed relative to audio. The user explicitly chose general ALASS matching without title/reference-specific exceptions on 2026-09-21. No E12 offset override remains active.
+
+## Subtitle naming
+
+See [SUBTITLE-LABELS.md](SUBTITLE-LABELS.md). Confirmed timing changes get `[Auto-synced]` in subsequent subtitle metadata titles and filenames; this indicates an adjustment, not independent audio verification. Existing player menus may need a metadata refresh or playback reopen.

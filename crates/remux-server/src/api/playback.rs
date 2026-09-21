@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use axum::Json;
 
 use super::subtitles::{
-    SidecarSubtitleRoute, SubtitleDedupSettings, append_external_subtitles,
+    SidecarSubtitleRoute, SubtitleDedupSettings, append_external_subtitles_with_context,
     drop_unsupported_embedded_subtitles_with_external_match,
     filter_external_subtitles_for_source, inject_sidecar_subtitles, provider_filename,
     save_sidecar_subtitle_routes,
@@ -697,6 +697,28 @@ async fn items_playbackinfo_inner(
             allow_subtitle_extraction,
         );
 
+        let label_source = source.clone();
+        for route in &routes {
+            if let Some(descriptor) = route
+                .subtitle
+                .url
+                .as_ref()
+            {
+                if let Some(stream) = source
+                    .media_streams
+                    .iter_mut()
+                    .find(|s| s.index == route.index)
+                {
+                    super::subtitles::apply_subtitle_sync_label(
+                        &state.ctx,
+                        &label_source,
+                        descriptor,
+                        stream,
+                    );
+                }
+            }
+        }
+
         source.transcoding_reasons = transcode_reasons;
 
         // The subtitle the client will most likely request (the selected or
@@ -795,7 +817,8 @@ async fn items_playbackinfo_inner(
 
     // Probe and subtitle lookup ran concurrently. Append only after the real
     // stream indexes are known.
-    append_external_subtitles(
+    append_external_subtitles_with_context(
+        &state.ctx,
         &mut media_sources,
         &external_subtitles,
         &probe_cfg
