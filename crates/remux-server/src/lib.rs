@@ -573,11 +573,18 @@ fn default_torrent_http_port() -> u16 {
     9876
 }
 
+fn default_subtitle_alignment_wait_seconds() -> u64 {
+    10
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Config {
     /// Optional private subtitle alignment worker. Disabled unless configured.
     #[serde(default)]
     pub subtitle_alignment_url: Option<String>,
+    /// Maximum subtitle-request wait, including queue and reference extraction.
+    #[serde(default = "default_subtitle_alignment_wait_seconds")]
+    pub subtitle_alignment_wait_seconds: u64,
     /// Bearer token file, so secrets never appear in serialized configuration.
     #[serde(default)]
     pub subtitle_alignment_token_file: Option<std::path::PathBuf>,
@@ -740,6 +747,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             subtitle_alignment_url: None,
+            subtitle_alignment_wait_seconds: default_subtitle_alignment_wait_seconds(),
             subtitle_alignment_token_file: None,
             data_dir: default_data_dir(),
             database_url: None,

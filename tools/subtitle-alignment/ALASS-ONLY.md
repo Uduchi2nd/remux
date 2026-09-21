@@ -1,5 +1,8 @@
 # ALASS-only production mode — 2026-09-21
 
+Current delivery behavior is documented in README.md and SYNCHRONOUS-DELIVERY.md.
+The dated investigations below describe the earlier immediate-original behavior.
+
 User requested the fast timing path without multilingual-model validation. Production Engine no longer constructs Encoder, loads ONNX/tokenizer, or calls semantic/exact-language validation. Those helpers remain available only for historical offline comparisons. Model files may remain installed but are unused. Version and result-cache namespace changed so old rejected/accepted results cannot hide the new behavior.
 
 ## Eligibility in remux

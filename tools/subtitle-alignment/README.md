@@ -47,11 +47,19 @@ are retained only in offline research/testing functions, never in Engine.align.
 
 ## Latency, bandwidth, and bounds
 
-One job at a time per remux process. Requests never wait for cold extraction or
-alignment: they get the original while the background job runs. **Re-select the
-subtitle or reopen playback after processing completes.** A client holding an
-already loaded subtitle cannot be updated by the server. No background scan of
-every library item/version is started. ALASS itself measured about 0.3–3.4 seconds on the current fixtures; cold extraction can still take minutes.
+One job at a time per remux process. Subtitle requests now wait for the corrected
+result, including requests that encounter an existing pending job. The shared
+request budget is `subtitle_alignment_wait_seconds` (environment variable
+`SUBTITLE_ALIGNMENT_WAIT_SECONDS`), default 10 seconds, capped at 120 seconds;
+zero opts out of waiting. Queueing, reference extraction and worker time all use
+this one budget. Cached corrections return immediately. A completed rejection or
+failure returns the original; an expired request budget returns the original with
+`wait-timeout`, while the bounded background job can finish for later requests.
+This avoids forcing a reload for normal fast alignment, but a genuinely cold
+remote extraction exceeding the budget still needs a new subtitle request after
+completion. A loaded player track cannot be replaced by HTTP headers alone.
+No library-wide scan or language model is added. ALASS itself measured about
+0.3–3.4 seconds on the fixtures; remote extraction can take much longer.
 
 Reading an embedded track from a remote MKV can require reading much or all of
 the video once. No video file is saved and playback remains direct, but this
@@ -74,7 +82,7 @@ Both input tracks are limited to 2 MB and 30–5,000 cues. Cached references occ
 at most about 64 MB; worker data lives on nimo, outside the small remux LXC disk.
 No external media URL, addon token, or API key is sent to the worker.
 
-Response header `X-Remux-Subtitle-Alignment` reports `aligned`, `pending`, `busy`,
+Response header `X-Remux-Subtitle-Alignment` reports `aligned`, `wait-timeout`,
 `rejected`, `unavailable`, `no-reference`, `unsupported`, `disabled`, `original`,
 `language-skipped`, or `embedded-language`.
 Alignment responses use `private, no-store` so an intermediary cannot retain a
