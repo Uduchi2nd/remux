@@ -1,0 +1,1050 @@
+{
+  "multilingual": [
+    {
+      "title": "No Pain No Gain E11",
+      "case": "unchanged",
+      "encoding_seconds": 42.28,
+      "alignment_seconds": 1.7,
+      "text_preserved": true,
+      "recovery_median_ms": 0.0,
+      "recovery_p95_ms": 0.0,
+      "recovery_max_ms": 0,
+      "end_p95_ms": 0.0,
+      "report": {
+        "accepted": true,
+        "reason": "validated",
+        "anchors": 581,
+        "anchor_fraction": 0.619,
+        "within_2_5s": 0.924,
+        "median_abs_error_s": 0.0,
+        "p90_abs_error_s": 2.0,
+        "coverage_bins": [
+          1.0,
+          0.9682539682539683,
+          0.9166666666666666,
+          0.8113207547169812,
+          0.9387755102040817,
+          0.9402985074626866,
+          0.9148936170212766,
+          0.9375,
+          0.9324324324324325,
+          0.9041095890410958
+        ]
+      }
+    },
+    {
+      "title": "No Pain No Gain E11",
+      "case": "offset17",
+      "encoding_seconds": 42.28,
+      "alignment_seconds": 1.42,
+      "text_preserved": true,
+      "recovery_median_ms": 0.0,
+      "recovery_p95_ms": 0.0,
+      "recovery_max_ms": 0,
+      "end_p95_ms": 0.0,
+      "report": {
+        "accepted": true,
+        "reason": "validated",
+        "anchors": 581,
+        "anchor_fraction": 0.619,
+        "within_2_5s": 0.924,
+        "median_abs_error_s": 0.0,
+        "p90_abs_error_s": 2.0,
+        "coverage_bins": [
+          1.0,
+          0.9710144927536232,
+          0.9295774647887324,
+          0.8,
+          0.9375,
+          0.9411764705882353,
+          0.9130434782608695,
+          0.9387755102040817,
+          0.9342105263157895,
+          0.9041095890410958
+        ]
+      }
+    },
+    {
+      "title": "No Pain No Gain E11",
+      "case": "cut15to33",
+      "encoding_seconds": 42.28,
+      "alignment_seconds": 1.42,
+      "text_preserved": true,
+      "recovery_median_ms": 0.0,
+      "recovery_p95_ms": 0.0,
+      "recovery_max_ms": 0,
+      "end_p95_ms": 0.0,
+      "report": {
+        "accepted": true,
+        "reason": "validated",
+        "anchors": 581,
+        "anchor_fraction": 0.619,
+        "within_2_5s": 0.924,
+        "median_abs_error_s": 0.0,
+        "p90_abs_error_s": 2.0,
+        "coverage_bins": [
+          1.0,
+          0.9714285714285714,
+          0.9305555555555556,
+          0.8,
+          0.94,
+          0.9354838709677419,
+          0.9166666666666666,
+          0.9361702127659575,
+          0.9342105263157895,
+          0.9066666666666666
+        ]
+      }
+    },
+    {
+      "title": "No Pain No Gain E11",
+      "case": "rate104",
+      "encoding_seconds": 42.28,
+      "alignment_seconds": 1.42,
+      "text_preserved": true,
+      "recovery_median_ms": 109.0,
+      "recovery_p95_ms": 227.0,
+      "recovery_max_ms": 280,
+      "end_p95_ms": 225.19999999999982,
+      "report": {
+        "accepted": true,
+        "reason": "validated",
+        "anchors": 581,
+        "anchor_fraction": 0.619,
+        "within_2_5s": 0.924,
+        "median_abs_error_s": 0.129,
+        "p90_abs_error_s": 2.006,
+        "coverage_bins": [
+          0.9714285714285714,
+          0.9682539682539683,
+          0.9305555555555556,
+          0.8113207547169812,
+          0.9387755102040817,
+          0.9402985074626866,
+          0.9148936170212766,
+          0.9375,
+          0.9324324324324325,
+          0.9041095890410958
+        ]
+      }
+    },
+    {
+      "title": "No Pain No Gain E11",
+      "case": "real-vnphim-external",
+      "seconds": 33.22,
+      "report": {
+        "accepted": false,
+        "reason": "dialogue timing disagreement",
+        "anchors": 333,
+        "anchor_fraction": 0.333,
+        "within_2_5s": 0.799,
+        "median_abs_error_s": 0.009,
+        "p90_abs_error_s": 13.849,
+        "coverage_bins": [
+          0.72,
+          0.7666666666666667,
+          0.8648648648648649,
+          0.71875,
+          0.9130434782608695,
+          0.9333333333333333,
+          0.7441860465116279,
+          0.84375,
+          0.8409090909090909,
+          0.5
+        ]
+      }
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "unchanged",
+      "encoding_seconds": 23.45,
+      "alignment_seconds": 0.62,
+      "text_preserved": true,
+      "recovery_median_ms": 82.0,
+      "recovery_p95_ms": 82.0,
+      "recovery_max_ms": 82,
+      "end_p95_ms": 82.0,
+      "report": {
+        "accepted": false,
+        "reason": "dialogue timing disagreement",
+        "anchors": 190,
+        "anchor_fraction": 0.543,
+        "within_2_5s": 0.742,
+        "median_abs_error_s": 0.667,
+        "p90_abs_error_s": 4.476,
+        "coverage_bins": [
+          0.75,
+          0.6363636363636364,
+          0.7241379310344828,
+          0.8571428571428571,
+          0.7692307692307693,
+          0.8333333333333334,
+          0.75,
+          0.375,
+          0.6842105263157895,
+          0.8571428571428571
+        ]
+      }
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "offset17",
+      "encoding_seconds": 23.45,
+      "alignment_seconds": 0.45,
+      "text_preserved": true,
+      "recovery_median_ms": 82.0,
+      "recovery_p95_ms": 82.0,
+      "recovery_max_ms": 82,
+      "end_p95_ms": 82.0,
+      "report": {
+        "accepted": false,
+        "reason": "dialogue timing disagreement",
+        "anchors": 190,
+        "anchor_fraction": 0.543,
+        "within_2_5s": 0.742,
+        "median_abs_error_s": 0.667,
+        "p90_abs_error_s": 4.476,
+        "coverage_bins": [
+          0.6875,
+          0.6956521739130435,
+          0.71875,
+          0.8333333333333334,
+          0.7857142857142857,
+          0.8387096774193549,
+          0.75,
+          0.375,
+          0.6842105263157895,
+          0.8571428571428571
+        ]
+      }
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "cut15to33",
+      "encoding_seconds": 23.45,
+      "alignment_seconds": 0.44,
+      "text_preserved": true,
+      "recovery_median_ms": 41.5,
+      "recovery_p95_ms": 82.0,
+      "recovery_max_ms": 82,
+      "end_p95_ms": 82.0,
+      "report": {
+        "accepted": false,
+        "reason": "dialogue timing disagreement",
+        "anchors": 190,
+        "anchor_fraction": 0.543,
+        "within_2_5s": 0.742,
+        "median_abs_error_s": 0.669,
+        "p90_abs_error_s": 4.468,
+        "coverage_bins": [
+          0.7222222222222222,
+          0.6666666666666666,
+          0.71875,
+          0.8571428571428571,
+          0.76,
+          0.8214285714285714,
+          0.8181818181818182,
+          0.375,
+          0.6842105263157895,
+          0.8571428571428571
+        ]
+      }
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "rate104",
+      "encoding_seconds": 23.45,
+      "alignment_seconds": 0.44,
+      "text_preserved": true,
+      "recovery_median_ms": 151.5,
+      "recovery_p95_ms": 454.55,
+      "recovery_max_ms": 640,
+      "end_p95_ms": 458.55,
+      "report": {
+        "accepted": false,
+        "reason": "dialogue timing disagreement",
+        "anchors": 190,
+        "anchor_fraction": 0.543,
+        "within_2_5s": 0.737,
+        "median_abs_error_s": 0.5,
+        "p90_abs_error_s": 4.422,
+        "coverage_bins": [
+          0.75,
+          0.6363636363636364,
+          0.6896551724137931,
+          0.9047619047619048,
+          0.7692307692307693,
+          0.8333333333333334,
+          0.75,
+          0.375,
+          0.631578947368421,
+          0.8571428571428571
+        ]
+      }
+    },
+    {
+      "title": "Supergirl",
+      "case": "unchanged",
+      "encoding_seconds": 49.26,
+      "alignment_seconds": 3.44,
+      "text_preserved": true,
+      "recovery_median_ms": 222.0,
+      "recovery_p95_ms": 222.0,
+      "recovery_max_ms": 222,
+      "end_p95_ms": 222.0,
+      "report": {
+        "accepted": false,
+        "reason": "dialogue timing disagreement",
+        "anchors": 703,
+        "anchor_fraction": 0.714,
+        "within_2_5s": 0.831,
+        "median_abs_error_s": 0.219,
+        "p90_abs_error_s": 3.816,
+        "coverage_bins": [
+          0.8656716417910447,
+          0.8214285714285714,
+          0.8493150684931506,
+          0.8421052631578947,
+          0.8690476190476191,
+          0.7678571428571429,
+          0.8554216867469879,
+          0.7681159420289855,
+          0.7142857142857143,
+          0.8666666666666667
+        ]
+      }
+    },
+    {
+      "title": "Supergirl",
+      "case": "offset17",
+      "encoding_seconds": 49.26,
+      "alignment_seconds": 3.23,
+      "text_preserved": true,
+      "recovery_median_ms": 222.0,
+      "recovery_p95_ms": 222.0,
+      "recovery_max_ms": 222,
+      "end_p95_ms": 222.0,
+      "report": {
+        "accepted": false,
+        "reason": "dialogue timing disagreement",
+        "anchors": 703,
+        "anchor_fraction": 0.714,
+        "within_2_5s": 0.831,
+        "median_abs_error_s": 0.219,
+        "p90_abs_error_s": 3.816,
+        "coverage_bins": [
+          0.859375,
+          0.8313253012048193,
+          0.8493150684931506,
+          0.8362068965517241,
+          0.872093023255814,
+          0.7547169811320755,
+          0.8588235294117647,
+          0.7714285714285715,
+          0.7142857142857143,
+          0.8666666666666667
+        ]
+      }
+    },
+    {
+      "title": "Supergirl",
+      "case": "cut15to33",
+      "encoding_seconds": 49.26,
+      "alignment_seconds": 3.08,
+      "text_preserved": true,
+      "recovery_median_ms": 183.0,
+      "recovery_p95_ms": 222.0,
+      "recovery_max_ms": 222,
+      "end_p95_ms": 222.0,
+      "report": {
+        "accepted": false,
+        "reason": "dialogue timing disagreement",
+        "anchors": 703,
+        "anchor_fraction": 0.714,
+        "within_2_5s": 0.831,
+        "median_abs_error_s": 0.202,
+        "p90_abs_error_s": 3.855,
+        "coverage_bins": [
+          0.8615384615384616,
+          0.8214285714285714,
+          0.8493150684931506,
+          0.8421052631578947,
+          0.872093023255814,
+          0.7692307692307693,
+          0.8452380952380952,
+          0.7777777777777778,
+          0.7142857142857143,
+          0.8666666666666667
+        ]
+      }
+    },
+    {
+      "title": "Supergirl",
+      "case": "rate104",
+      "encoding_seconds": 49.26,
+      "alignment_seconds": 3.08,
+      "text_preserved": true,
+      "recovery_median_ms": 255.0,
+      "recovery_p95_ms": 625.0,
+      "recovery_max_ms": 1366,
+      "end_p95_ms": 628.5999999999999,
+      "report": {
+        "accepted": false,
+        "reason": "dialogue timing disagreement",
+        "anchors": 703,
+        "anchor_fraction": 0.714,
+        "within_2_5s": 0.828,
+        "median_abs_error_s": 0.373,
+        "p90_abs_error_s": 3.926,
+        "coverage_bins": [
+          0.8656716417910447,
+          0.8333333333333334,
+          0.8356164383561644,
+          0.8421052631578947,
+          0.8928571428571429,
+          0.75,
+          0.8554216867469879,
+          0.7681159420289855,
+          0.6785714285714286,
+          0.8222222222222222
+        ]
+      }
+    },
+    {
+      "title": "Die My Love",
+      "case": "unchanged",
+      "encoding_seconds": 64.79,
+      "alignment_seconds": 3.79,
+      "text_preserved": true,
+      "recovery_median_ms": 0.0,
+      "recovery_p95_ms": 0.0,
+      "recovery_max_ms": 0,
+      "end_p95_ms": 0.0,
+      "report": {
+        "accepted": true,
+        "reason": "validated",
+        "anchors": 628,
+        "anchor_fraction": 0.778,
+        "within_2_5s": 0.868,
+        "median_abs_error_s": 0.078,
+        "p90_abs_error_s": 3.084,
+        "coverage_bins": [
+          0.8181818181818182,
+          0.8613861386138614,
+          0.8125,
+          0.8857142857142857,
+          0.8727272727272727,
+          0.8658536585365854,
+          0.8166666666666667,
+          0.9078947368421053,
+          0.9130434782608695,
+          1.0
+        ]
+      }
+    },
+    {
+      "title": "Die My Love",
+      "case": "offset17",
+      "encoding_seconds": 64.79,
+      "alignment_seconds": 3.31,
+      "text_preserved": true,
+      "recovery_median_ms": 0.0,
+      "recovery_p95_ms": 0.0,
+      "recovery_max_ms": 0,
+      "end_p95_ms": 0.0,
+      "report": {
+        "accepted": true,
+        "reason": "validated",
+        "anchors": 628,
+        "anchor_fraction": 0.778,
+        "within_2_5s": 0.868,
+        "median_abs_error_s": 0.078,
+        "p90_abs_error_s": 3.084,
+        "coverage_bins": [
+          0.813953488372093,
+          0.8541666666666666,
+          0.8333333333333334,
+          0.8857142857142857,
+          0.8703703703703703,
+          0.8674698795180723,
+          0.8166666666666667,
+          0.9078947368421053,
+          0.9130434782608695,
+          1.0
+        ]
+      }
+    },
+    {
+      "title": "Die My Love",
+      "case": "cut15to33",
+      "encoding_seconds": 64.79,
+      "alignment_seconds": 3.16,
+      "text_preserved": true,
+      "recovery_median_ms": 1.0,
+      "recovery_p95_ms": 1.0,
+      "recovery_max_ms": 1,
+      "end_p95_ms": 1.0,
+      "report": {
+        "accepted": true,
+        "reason": "validated",
+        "anchors": 628,
+        "anchor_fraction": 0.778,
+        "within_2_5s": 0.868,
+        "median_abs_error_s": 0.078,
+        "p90_abs_error_s": 3.084,
+        "coverage_bins": [
+          0.813953488372093,
+          0.8585858585858586,
+          0.8235294117647058,
+          0.8857142857142857,
+          0.8679245283018868,
+          0.8674698795180723,
+          0.819672131147541,
+          0.9066666666666666,
+          0.9130434782608695,
+          1.0
+        ]
+      }
+    },
+    {
+      "title": "Die My Love",
+      "case": "rate104",
+      "encoding_seconds": 64.79,
+      "alignment_seconds": 3.19,
+      "text_preserved": true,
+      "recovery_median_ms": 184.0,
+      "recovery_p95_ms": 518.7999999999997,
+      "recovery_max_ms": 1199,
+      "end_p95_ms": 516.4999999999997,
+      "report": {
+        "accepted": true,
+        "reason": "validated",
+        "anchors": 628,
+        "anchor_fraction": 0.778,
+        "within_2_5s": 0.879,
+        "median_abs_error_s": 0.249,
+        "p90_abs_error_s": 3.142,
+        "coverage_bins": [
+          0.8181818181818182,
+          0.8712871287128713,
+          0.8125,
+          0.9142857142857143,
+          0.8545454545454545,
+          0.8902439024390244,
+          0.8333333333333334,
+          0.9210526315789473,
+          0.9130434782608695,
+          1.0
+        ]
+      }
+    },
+    {
+      "title": "No Pain No Gain E11",
+      "case": "wrong-title-reference",
+      "reference": "Chad Powers E4",
+      "report": {
+        "accepted": false,
+        "reason": "too few distinct dialogue anchors",
+        "anchors": 10
+      }
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "wrong-title-reference",
+      "reference": "Supergirl",
+      "report": {
+        "accepted": false,
+        "reason": "too few distinct dialogue anchors",
+        "anchors": 3
+      }
+    },
+    {
+      "title": "Supergirl",
+      "case": "wrong-title-reference",
+      "reference": "Die My Love",
+      "report": {
+        "accepted": false,
+        "reason": "too few distinct dialogue anchors",
+        "anchors": 11
+      }
+    }
+  ],
+  "exact_dialogue": [
+    {
+      "title": "No Pain No Gain E11",
+      "case": "unchanged",
+      "seconds": 2.86,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 748,
+        "anchor_fraction": 0.797,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 939,
+      "recovery_max_ms": 0
+    },
+    {
+      "title": "No Pain No Gain E11",
+      "case": "offset17",
+      "seconds": 2.51,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 748,
+        "anchor_fraction": 0.797,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 939,
+      "recovery_max_ms": 0
+    },
+    {
+      "title": "No Pain No Gain E11",
+      "case": "cut15to33",
+      "seconds": 2.55,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 748,
+        "anchor_fraction": 0.797,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 939,
+      "recovery_max_ms": 0
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "unchanged",
+      "seconds": 0.81,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 288,
+        "anchor_fraction": 0.823,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 350,
+      "recovery_max_ms": 1
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "offset17",
+      "seconds": 0.68,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 288,
+        "anchor_fraction": 0.823,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 350,
+      "recovery_max_ms": 1
+    },
+    {
+      "title": "Chad Powers E4",
+      "case": "cut15to33",
+      "seconds": 0.56,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 288,
+        "anchor_fraction": 0.823,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 350,
+      "recovery_max_ms": 1
+    },
+    {
+      "title": "Supergirl",
+      "case": "unchanged",
+      "seconds": 4.75,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 748,
+        "anchor_fraction": 0.759,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 985,
+      "recovery_max_ms": 0
+    },
+    {
+      "title": "Supergirl",
+      "case": "offset17",
+      "seconds": 4.72,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 748,
+        "anchor_fraction": 0.759,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 985,
+      "recovery_max_ms": 0
+    },
+    {
+      "title": "Supergirl",
+      "case": "cut15to33",
+      "seconds": 4.79,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 748,
+        "anchor_fraction": 0.759,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 985,
+      "recovery_max_ms": 0
+    },
+    {
+      "title": "Die My Love",
+      "case": "unchanged",
+      "seconds": 3.31,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 671,
+        "anchor_fraction": 0.831,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 807,
+      "recovery_max_ms": 1
+    },
+    {
+      "title": "Die My Love",
+      "case": "offset17",
+      "seconds": 3.57,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 671,
+        "anchor_fraction": 0.831,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 807,
+      "recovery_max_ms": 1
+    },
+    {
+      "title": "Die My Love",
+      "case": "cut15to33",
+      "seconds": 3.33,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 671,
+        "anchor_fraction": 0.831,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 807,
+      "recovery_max_ms": 1
+    }
+  ],
+  "engine": [
+    {
+      "case": "E12 original case",
+      "seconds": 79.18,
+      "report": {
+        "accepted": true,
+        "reason": "validated",
+        "anchors": 510,
+        "anchor_fraction": 0.477,
+        "within_2_5s": 0.859,
+        "median_abs_error_s": 0.01,
+        "p90_abs_error_s": 3.501,
+        "coverage_bins": [
+          0.9583333333333334,
+          0.8615384615384616,
+          0.8301886792452831,
+          0.8867924528301887,
+          0.8688524590163934,
+          0.9365079365079365,
+          0.8363636363636363,
+          0.8615384615384616,
+          0.8571428571428571,
+          0.6666666666666666
+        ],
+        "method": "semantic"
+      },
+      "text_preserved": true,
+      "cues": 1070,
+      "anchor_errors_ms": [
+        8,
+        10,
+        10
+      ]
+    },
+    {
+      "case": "E11 same Vietnamese",
+      "seconds": 0.0,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 748,
+        "anchor_fraction": 0.797,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 939
+    },
+    {
+      "case": "E11 real vnphim vs embedded Vietnamese",
+      "seconds": 61.27,
+      "report": {
+        "accepted": false,
+        "reason": "dialogue timing disagreement",
+        "anchors": 322,
+        "anchor_fraction": 0.322,
+        "within_2_5s": 0.826,
+        "median_abs_error_s": 0.009,
+        "p90_abs_error_s": 10.196,
+        "coverage_bins": [
+          0.8275862068965517,
+          0.9,
+          0.8823529411764706,
+          0.8666666666666667,
+          0.625,
+          0.85,
+          0.8,
+          0.813953488372093,
+          0.8181818181818182,
+          0.8333333333333334
+        ],
+        "method": "semantic"
+      }
+    },
+    {
+      "case": "Chad4 same Spanish",
+      "seconds": 0.54,
+      "report": {
+        "accepted": true,
+        "reason": "exact dialogue validated",
+        "method": "exact",
+        "anchors": 288,
+        "anchor_fraction": 0.823,
+        "within_250ms": 1.0,
+        "coverage_bins": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "text_preserved": true,
+      "cues": 350
+    }
+  ],
+  "live_serving": {
+    "formats": [
+      "SRT",
+      "VTT",
+      "Jellyfin JSON"
+    ],
+    "cue_count": 1070,
+    "all_text_preserved": true,
+    "original_bypass": true,
+    "anchors": [
+      {
+        "original_ms": 659190,
+        "served_ms": 674269,
+        "reference_ms": 674261
+      },
+      {
+        "original_ms": 2017710,
+        "served_ms": 2050710,
+        "reference_ms": 2050700
+      },
+      {
+        "original_ms": 2023950,
+        "served_ms": 2056950,
+        "reference_ms": 2056940
+      }
+    ]
+  }
+}

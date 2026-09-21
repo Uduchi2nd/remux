@@ -2,7 +2,7 @@ import copy
 import unittest
 import numpy as np
 import pysubs2
-from worker import normalize, parse, validate
+from worker import normalize, parse, validate, exact_validation
 
 
 def cues():
@@ -14,6 +14,29 @@ def cues():
 
 
 class ValidationTests(unittest.TestCase):
+    def test_exact_dialogue_fast_path(self):
+        s=cues()
+        self.assertTrue(exact_validation(s,s,s)['accepted'])
+
+    def test_exact_path_rejects_bad_timing_and_missing_tail(self):
+        s=cues(); bad=copy.deepcopy(s)
+        for cue in bad[-10:]: cue.start+=20000; cue.end+=20000
+        self.assertIsNone(exact_validation(s,s,bad))
+        ref=copy.deepcopy(s)
+        for cue in ref[-20:]: cue.text='Different dialogue'
+        self.assertIsNone(exact_validation(s,ref,s))
+
+    def test_exact_path_rejects_repeated_dialogue(self):
+        s=cues()
+        for cue in s:cue.text='A repeated line of dialogue'
+        self.assertIsNone(exact_validation(s,s,s))
+
+    def test_position_tags_survive_srt_roundtrip(self):
+        s=cues();s[4].text=r'{\an8}Positioned dialogue\NSecond line'
+        roundtrip=parse(s.to_string('srt',keep_ssa_tags=True))
+        self.assertEqual(s[4].text,roundtrip[4].text)
+        self.assertTrue(exact_validation(s,s,roundtrip)['accepted'])
+
     def test_http_crlf_and_file_lf_preserve_identical_dialogue(self):
         text = cues().to_string('vtt')
         wire = '\ufeff' + text.replace('\n', '\r\n')
