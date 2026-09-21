@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 use axum_anyhow::ApiResult as Result;
@@ -10,6 +10,15 @@ use http::{Response, StatusCode};
 use remux_macros::get;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+mod alignment;
+
+#[derive(Default, serde::Deserialize)]
+pub struct SubtitleOptions {
+    /// Additive escape hatch; default Jellyfin URLs need no client changes.
+    #[serde(default)]
+    remux_original: bool,
+}
 
 use crate::{
     AppState, IntoApiError, OptionExt, ResultExt, api, common::HideConsole, db,
@@ -310,6 +319,8 @@ fn build_subtitle_extraction_args(
                 .clone(),
             "-an".to_string(),
             "-vn".to_string(),
+            "-avoid_negative_ts".to_string(),
+            "disabled".to_string(),
             "-c:s".to_string(),
             s.ffmpeg_codec
                 .clone(),
@@ -555,6 +566,7 @@ async fn ensure_subtitle_cached(
 pub async fn subtitles_stream(
     State(state): State<AppState>,
     session: auth::AuthSession,
+    Query(options): Query<SubtitleOptions>,
     Path((item_id, media_source_id, stream_index, _start_ticks, format)): Path<(
         Uuid,
         Uuid,
@@ -570,6 +582,7 @@ pub async fn subtitles_stream(
         media_source_id,
         stream_index,
         format,
+        options.remux_original,
     )
     .await
 }
@@ -581,6 +594,7 @@ pub async fn subtitles_stream(
 pub async fn subtitles_stream_tickless(
     State(state): State<AppState>,
     session: auth::AuthSession,
+    Query(options): Query<SubtitleOptions>,
     Path((item_id, media_source_id, stream_index, format)): Path<(
         Uuid,
         Uuid,
@@ -595,6 +609,7 @@ pub async fn subtitles_stream_tickless(
         media_source_id,
         stream_index,
         format,
+        options.remux_original,
     )
     .await
 }
@@ -636,7 +651,7 @@ async fn fetch_external_subtitle_bytes(
     {
         return Err(anyhow!("upstream subtitle status {}", resp.status()));
     }
-    axum::body::to_bytes(resp.into_body(), usize::MAX)
+    axum::body::to_bytes(resp.into_body(), 2_000_000)
         .await
         .map_err(|e| anyhow!("read subtitle bytes: {e}"))
 }
@@ -664,6 +679,38 @@ fn external_subtitle_response(
         .header("Access-Control-Allow-Origin", "*")
         .body(Body::from(converted))
         .unwrap()
+}
+
+async fn aligned_external_response(
+    state: &AppState,
+    source: &db::Media,
+    bytes: axum::body::Bytes,
+    language: Option<&str>,
+    format: &str,
+    bypass: bool,
+) -> Response<Body> {
+    let (bytes, status) =
+        alignment::resolve(state, source, bytes, language, format, bypass).await;
+    let mut response = external_subtitle_response(bytes, format);
+    response
+        .headers_mut()
+        .insert(
+            "X-Remux-Subtitle-Alignment",
+            status
+                .parse()
+                .unwrap(),
+        );
+    // Clients must reload the endpoint to see newly ready corrections. Never
+    // retain a cold original in an intermediary cache after alignment finishes.
+    response
+        .headers_mut()
+        .insert(
+            "Cache-Control",
+            "private, no-store"
+                .parse()
+                .unwrap(),
+        );
+    response
 }
 
 #[derive(Clone)]
@@ -751,11 +798,13 @@ fn load_sidecar_subtitle_routes(
 
 async fn sidecar_subtitle_response(
     state: &AppState,
+    user_id: Uuid,
     routes: Option<&[SidecarSubtitleRoute]>,
     item_id: Uuid,
     media_source_id: Uuid,
     stream_index: i64,
     format: &str,
+    bypass: bool,
 ) -> Option<Response<Body>> {
     let route = routes?
         .iter()
@@ -768,6 +817,38 @@ async fn sidecar_subtitle_response(
     Some(
         match fetch_external_subtitle_bytes(state, descriptor).await {
             Ok(bytes) => {
+                if state
+                    .ctx
+                    .config
+                    .subtitle_alignment_url
+                    .is_some()
+                    && !bypass
+                {
+                    if let Ok(source) = crate::services::StreamService::lookup(
+                        &state.ctx,
+                        item_id,
+                        Some(media_source_id),
+                        None,
+                        Some(user_id),
+                    )
+                    .await
+                    {
+                        return Some(
+                            aligned_external_response(
+                                state,
+                                &source,
+                                bytes,
+                                route
+                                    .subtitle
+                                    .lang
+                                    .as_deref(),
+                                &format.to_ascii_lowercase(),
+                                bypass,
+                            )
+                            .await,
+                        );
+                    }
+                }
                 external_subtitle_response(bytes, &format.to_ascii_lowercase())
             }
             Err(error) => {
@@ -808,6 +889,7 @@ async fn subtitles_stream_inner(
     media_source_id: Uuid,
     stream_index: i64,
     format: String,
+    bypass: bool,
 ) -> Result<impl IntoResponse> {
     let sidecar_routes = load_sidecar_subtitle_routes(
         &state.ctx,
@@ -819,6 +901,9 @@ async fn subtitles_stream_inner(
     );
     if let Some(response) = sidecar_subtitle_response(
         &state,
+        session
+            .user
+            .id,
         sidecar_routes
             .as_ref()
             .map(|routes| routes.as_slice()),
@@ -826,6 +911,7 @@ async fn subtitles_stream_inner(
         media_source_id,
         stream_index,
         &format,
+        bypass,
     )
     .await
     {
@@ -1007,10 +1093,16 @@ async fn subtitles_stream_inner(
                         let output_format = format.to_ascii_lowercase();
                         match fetch_external_subtitle_bytes(&state, descriptor).await {
                             Ok(bytes) => {
-                                return Ok(external_subtitle_response(
+                                return Ok(aligned_external_response(
+                                    &state,
+                                    source,
                                     bytes,
+                                    sub.lang
+                                        .as_deref(),
                                     &output_format,
-                                ));
+                                    bypass,
+                                )
+                                .await);
                             }
                             Err(e) => {
                                 warn!(error = %e, item_id = %item_id, stream_index,

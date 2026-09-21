@@ -123,3 +123,15 @@ TorBox/Torrentio source 65e11276edf25e7296aa3315ccac006e matches the Vietnamese 
 Practical workaround: select the matching TorBox release when using this Vietnamese subtitle. Long-term: match subtitle editions to the selected video source, or perform validated per-source alignment (including cuts) and cache that result by video/subtitle identity. The current same-episode fallback must not be described as synchronization-verified for every debrid/Usenet release. Do not add an episode-wide hard-coded delay or change the shared Vietnamese subtitle for all sources. No subtitle timing code or delay setting changed during this investigation.
 
 During this follow-up LXC111 was found stopped. The user confirmed no maintenance and authorized restoring it; pct start 111 succeeded and remux health returned 200. The reason for the stop was not established.
+
+## Optional embedded-text alignment (2026-09-20)
+
+A separate opt-in feature now addresses the release-timing issue above. Remux resolves the selected source, extracts a full embedded text reference, and asks a private subtitle-only worker to propose and validate piecewise corrections. The worker uses ALASS plus pinned local multilingual semantic anchors. See [the alignment operations guide](tools/subtitle-alignment/README.md) for limits, setup, acceptance criteria, validation evidence, and rollback.
+
+This does not replace the remote-HLS or Vidhub discovery patches. Keep it as its own commit. Remove its configuration to disable it independently; retire the code only after upstream passes selected-release alignment, no-reference/rejection fallback, and source/cache isolation checks. Cold requests return the original while processing; a client must reload subtitles to receive a ready correction. Extracting an embedded track can read much of the video once, so the reference text is cached; video playback itself remains direct. Do not promise perfect alignment for every language or every release.
+
+Alignment deployment uses server SHA256 `ad335bb887a29154cf016cd7a0a13d4853443098191aa1696644e8a2700e636f` with worker `embedded-text-v2`.
+Live SRT/VTT/Jellyfin JSON checks preserve all 1,070 E12 cues and verify the three
+independent timing anchors; original bypass works. Rollback locations are recorded
+in `/root/remux-patch/subtitle-alignment-rollback.txt` on nimo. Restoring its compose
+backup disables alignment while retaining ordinary subtitle delivery.
