@@ -1,0 +1,39 @@
+{
+  "remux_result_cache": "empty after deployment restart",
+  "reference_cache": "warm",
+  "requests": [
+    {
+      "request": 0,
+      "seconds": 2.047,
+      "status": "aligned",
+      "sha256": "aade2e12433ad2ba451cd21a38a7bc4280d2e8f93e8d8c9dafd14aab1744eb62",
+      "bytes": 82671
+    },
+    {
+      "request": 1,
+      "seconds": 2.045,
+      "status": "aligned",
+      "sha256": "aade2e12433ad2ba451cd21a38a7bc4280d2e8f93e8d8c9dafd14aab1744eb62",
+      "bytes": 82671
+    },
+    {
+      "request": 2,
+      "seconds": 2.05,
+      "status": "aligned",
+      "sha256": "aade2e12433ad2ba451cd21a38a7bc4280d2e8f93e8d8c9dafd14aab1744eb62",
+      "bytes": 82671
+    },
+    {
+      "request": 3,
+      "seconds": 0.075,
+      "status": "aligned",
+      "sha256": "aade2e12433ad2ba451cd21a38a7bc4280d2e8f93e8d8c9dafd14aab1744eb62",
+      "bytes": 82671
+    }
+  ],
+  "matching_e12_worker_results_set_aside": 7,
+  "new_worker_results": 1,
+  "binary_sha256": "ea23d9eaa50c198d6c4fd0089f087de114b5cc95072c6e651f9abc02a1819f3e",
+  "code_commit": "2bbee957",
+  "note": "All worker results matching the 1070 E12 cue texts were set aside. One new worker cache result was created. Reference extraction cache remained warm. Test did not measure a cold remote-video extraction."
+}
