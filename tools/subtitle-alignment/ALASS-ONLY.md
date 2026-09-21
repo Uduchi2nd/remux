@@ -59,3 +59,24 @@ Resumed Vidhub and sought into the reported scene (visible timeline 07:15 then 0
 Twelve authenticated HTTP requests to the deployed v4 worker: four pairs, each original, artificial +19-second offset, and repeated offset request. E11 Vietnamese/Chinese: 0.957–0.983s uncached, 0ms recovery error; Chad Powers E4 English/Spanish: 0.307s, 85ms; Supergirl English/Spanish: 1.977–2.069s, 204ms; Die My Love English/Spanish: 1.205–1.206s, 38ms. Errors compare output cue starts with the unshifted input sample timeline, not independently measured audio truth. All cue text/counts preserved; repeats 2–3ms. Cache absence/presence checked before each request. Results: live-multisample-2026-09-21.json. Fixtures were sent directly to worker; this does not bypass production eligibility or claim these titles were tested in players. Embedded-reference extraction time excluded.
 
 Live Remux recheck: E12 external Vietnamese returns aligned; original bypass works. E11 selected source with embedded Vietnamese returns embedded-language and byte-identical original. Deployed binary and worker hashes still match those above. Remux cold delivery is STILL asynchronous (original/pending); worker HTTP computation is synchronous. No synchronous-delivery fix deployed during these checks.
+
+## User decision: remove reference-specific correction — 2026-09-21
+
+The user requested removal of the E12 special correction and accepts that an
+incorrect embedded reference can produce incorrect external timing. Commit
+5810a184 was reverted. Worker v4 ALASS-only is restored, and the deployed override
+file was moved outside the worker runtime. No reference-specific correction logic
+remains active. The general bounded synchronous delivery fix (2bbee957) remains
+in Remux: first requests wait up to 10 seconds, with original fallback on timeout.
+
+Systemic scope: use eligible embedded text as timing reference, match missing
+English/Vietnamese external subtitles without a model, isolate source caches,
+serve completed corrections on first requests within the budget, and retain
+originals on failure. This does NOT validate the embedded reference against audio.
+Earlier millisecond comparisons against E12's reference were delivery/reference
+checks, not proof of audio sync. Historical audio investigation and withdrawn
+exception remain in Git commit 5810a184 for context; do not reintroduce the special
+case without a new request. Runtime worker SHA256 restored to
+26054fce79036a7f0194718d66e32413ccc9b9068d1e26e5d510096eb7f1146c.
+15 worker tests passed. Remux binary remains
+ea23d9eaa50c198d6c4fd0089f087de114b5cc95072c6e651f9abc02a1819f3e.

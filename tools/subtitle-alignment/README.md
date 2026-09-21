@@ -170,3 +170,5 @@ reference, including points near minutes 11 and 34.
 ## Broader quality and latency follow-up
 
 See [QUALITY.md](QUALITY.md) for the four-title, full-timeline recovery matrix, false negatives, exact-dialogue fast path, formatting fix, and remaining cold-start costs. Worker v3 preserves the existing E12 correction; it does not promise perfect alignment or instant cross-language matching.
+
+Reference accuracy is an assumption: embedded text can itself be mistimed relative to audio. The user explicitly chose general ALASS matching without title/reference-specific exceptions on 2026-09-21. No E12 offset override remains active.
