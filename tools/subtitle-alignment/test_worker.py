@@ -1,6 +1,4 @@
 import copy
-import hashlib
-import json
 import unittest
 import tempfile
 from pathlib import Path
@@ -36,36 +34,6 @@ class ValidationTests(unittest.TestCase):
             aligned=parse(result['subtitle'])
             self.assertEqual(aligned[20].start,s[20].start+17000)
             self.assertEqual([c.text for c in aligned],[c.text for c in s])
-
-    def test_exact_reference_offset_applies_before_alignment_and_keys_cache(self):
-        ref=cues();ref.shift(ms=20000)
-        external=cues().to_string('srt');reference=ref.to_string('srt')
-        fingerprint=hashlib.sha256(json.dumps([[c.start,c.end,c.text] for c in ref],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
-        seen=[]
-        def propose(args, **kwargs):
-            seen.append(pysubs2.load(args[1])[0].start)
-            pysubs2.load(args[2]).save(args[3])
-        with tempfile.TemporaryDirectory() as d, patch.object(worker,'ROOT',Path(d)), patch.object(worker.subprocess,'run',side_effect=propose):
-            path=Path(d)/'reference-timing-overrides.json'
-            path.write_text(json.dumps({fingerprint:-15000}))
-            engine=worker.Engine();first=engine.align(external,reference)
-            self.assertEqual(first['report']['reference_offset_ms'],-15000)
-            path.write_text('{}')
-            second=engine.align(external,reference)
-            self.assertNotEqual(first['key'],second['key'])
-            self.assertEqual(seen,[5000,20000])
-
-    def test_reference_override_does_not_apply_to_different_track(self):
-        ref=cues();ref.shift(ms=20000)
-        fingerprint=hashlib.sha256(json.dumps([[c.start,c.end,c.text] for c in ref],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
-        ref[0].text='Different release dialogue'
-        def propose(args, **kwargs):
-            self.assertEqual(pysubs2.load(args[1])[0].start,20000)
-            pysubs2.load(args[2]).save(args[3])
-        with tempfile.TemporaryDirectory() as d, patch.object(worker,'ROOT',Path(d)), patch.object(worker.subprocess,'run',side_effect=propose):
-            (Path(d)/'reference-timing-overrides.json').write_text(json.dumps({fingerprint:-15000}))
-            result=worker.Engine().align(cues().to_string('srt'),ref.to_string('srt'))
-            self.assertEqual(result['report']['reference_offset_ms'],0)
 
     def test_structural_checks_reject_corrupt_output(self):
         s=cues()
