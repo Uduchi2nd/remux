@@ -31,3 +31,40 @@ Delivery records both the internal media path and the HTTP source URL, because
 remote-source metadata exposes the latter. The same duration and exact subtitle
 descriptor isolate both aliases from other releases. Live verification covers
 this raw-source versus metadata identity boundary.
+
+## Deployment verification — 2026-09-21
+
+18 Rust subtitle tests and 16 worker tests passed. Live E12 Usenet delivery
+changed both metadata names after the aligned response; language and subtitle
+route were unchanged. Original bypass retained the label. E11 same-language
+skip returned identical original bytes and remained unmarked.
+
+Binary SHA256: `90fe42ede45f434de39ab3382e03acd39181f8ab8010788b6d831186dd3eae71`. Worker `embedded-text-v5-change-label`,
+ALASS-only with no reference override. Full rollback binary
+`/root/remux-patch/remux-pre-subtitle-labels` and worker
+`/root/remux-patch/worker-pre-subtitle-labels.py`; restart both services.
+The iPad was disconnected from USB, so no new physical client menu check is claimed.
+
+```json
+[
+  {
+    "before_title": "vie - WEBVTT - External",
+    "before_path": "vie.vtt",
+    "status": "aligned",
+    "seconds": 0.284,
+    "after_title": "vie - WEBVTT - External [Auto-synced]",
+    "after_path": "vie [Auto-synced].vtt",
+    "language_unchanged": true,
+    "route_unchanged": true
+  },
+  {
+    "source": "79df18dc781b5093a9144d500bd981db",
+    "status": "embedded-language",
+    "bytes": 71583,
+    "original_unchanged": true
+  },
+  {
+    "skipped_subtitle_unmarked": true
+  }
+]
+```
