@@ -123,6 +123,50 @@ fn result(outcome: &Outcome, original: Bytes) -> (Bytes, &'static str) {
     }
 }
 
+// Join an in-flight job without returning the uncorrected track immediately.
+// Polling avoids a lost wakeup between a cache lookup and waiter registration.
+async fn await_outcome(
+    mut read: impl FnMut() -> Option<Outcome>,
+    deadline: tokio::time::Instant,
+) -> Option<Outcome> {
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            if let Some(outcome) = read() {
+                if !matches!(outcome, Outcome::Pending) {
+                    return Some(outcome);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn awaited_result(
+    state: &AppState,
+    key: &str,
+    original: Bytes,
+    deadline: tokio::time::Instant,
+) -> (Bytes, &'static str) {
+    match await_outcome(
+        || {
+            state
+                .ctx
+                .store
+                .get::<Outcome>(key)
+                .map(|outcome| (*outcome).clone())
+        },
+        deadline,
+    )
+    .await
+    {
+        Some(outcome) => result(&outcome, original),
+        None => (original, "wait-timeout"),
+    }
+}
+
 async fn reference_text(
     state: &AppState,
     input: &str,
@@ -271,11 +315,20 @@ pub(super) async fn resolve(
         return (original, "unavailable");
     };
     let key = cache_key(source_key, &original);
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(
+            config
+                .subtitle_alignment_wait_seconds
+                .min(120),
+        );
     if let Some(cached) = state
         .ctx
         .store
         .get::<Outcome>(&key)
     {
+        if matches!(*cached, Outcome::Pending) {
+            return awaited_result(state, &key, original, deadline).await;
+        }
         return result(&cached, original);
     }
     // Use the actual input stream index. Forced/signs-only and bitmap tracks are
@@ -318,8 +371,9 @@ pub(super) async fn resolve(
     if references.is_empty() {
         return (original, "no-reference");
     }
-    let Ok(permit) = JOB_SLOT.try_acquire() else {
-        return (original, "busy");
+    let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, JOB_SLOT.acquire()).await
+    else {
+        return (original, "wait-timeout");
     };
     // Re-check after taking the global slot to avoid duplicate jobs.
     if let Some(cached) = state
@@ -327,18 +381,24 @@ pub(super) async fn resolve(
         .store
         .get::<Outcome>(&key)
     {
+        if matches!(*cached, Outcome::Pending) {
+            return awaited_result(state, &key, original, deadline).await;
+        }
         return result(&cached, original);
     }
     let input = info
         .descriptor
         .server_input(source.id, config.port);
     let external = external.to_owned();
-    let state = state.clone();
     state
         .ctx
         .store
         .save(key.clone(), Outcome::Pending, Duration::from_secs(900));
+    let job_state = state.clone();
+    let job_key = key.clone();
     tokio::spawn(async move {
+        let state = job_state;
+        let key = job_key;
         let _permit = permit;
         let outcome = tokio::time::timeout(Duration::from_secs(720), async {
             let token = tokio::fs::read_to_string(token_file)
@@ -437,12 +497,54 @@ pub(super) async fn resolve(
             .store
             .save_with_weight(key, outcome, weight, ttl);
     });
-    (original, "pending")
+    awaited_result(state, &key, original, deadline).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn first_request_waits_for_ready_instead_of_pending() {
+        let start = tokio::time::Instant::now();
+        let outcome = await_outcome(
+            || {
+                Some(if start.elapsed() < Duration::from_millis(50) {
+                    Outcome::Pending
+                } else {
+                    Outcome::Ready("corrected".into())
+                })
+            },
+            start + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result(&outcome, Bytes::from_static(b"original")),
+            (Bytes::from_static(b"corrected"), "aligned")
+        );
+    }
+    #[tokio::test]
+    async fn pending_wait_has_a_deadline() {
+        let outcome = await_outcome(
+            || Some(Outcome::Pending),
+            tokio::time::Instant::now() + Duration::from_millis(30),
+        )
+        .await;
+        assert!(outcome.is_none());
+    }
+    #[tokio::test]
+    async fn failed_job_finishes_wait_without_changing_original() {
+        let outcome = await_outcome(
+            || Some(Outcome::Unavailable),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result(&outcome, Bytes::from_static(b"original")),
+            (Bytes::from_static(b"original"), "unavailable")
+        );
+    }
     #[test]
     fn only_missing_english_or_vietnamese_is_aligned() {
         let mut track = api::MediaStream {

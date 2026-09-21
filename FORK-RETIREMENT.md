@@ -137,3 +137,7 @@ in `/root/remux-patch/subtitle-alignment-rollback.txt` on nimo. Restoring its co
 backup disables alignment while retaining ordinary subtitle delivery.
 
 Current ALASS-only behavior, measured latency, and rollback are documented in [ALASS-ONLY.md](tools/subtitle-alignment/ALASS-ONLY.md). Do not re-enable the model or claim historical semantic rejection tests apply to this mode.
+
+## Bounded synchronous subtitle delivery — 2026-09-21
+
+See tools/subtitle-alignment/SYNCHRONOUS-DELIVERY.md. Retire this part only when upstream serves a completed correction on a cold result-cache request (including concurrent requests), preserves originals on failure, and bounds waiting. Matching quality and subtitle delivery are separate acceptance checks. Long reference extraction can still exceed the request budget.
