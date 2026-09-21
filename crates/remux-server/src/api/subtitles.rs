@@ -298,21 +298,33 @@ async fn aligned_external_response(
         alignment::resolve(state, source, bytes, language, format, bypass).await;
     if !bypass {
         let source_info = api::MediaSourceInfo::from(source.clone());
-        if let Some(key) = subtitle_sync_label_key(
+        // Item metadata exposes a redirectable source as its remote HTTP URL,
+        // while the stored source still has its internal /remux path.
+        let remote_path = source
+            .stream_info
+            .as_ref()
+            .and_then(|info| {
+                info.descriptor
+                    .as_http_url()
+            });
+        for path in [
             source_info
                 .path
                 .as_deref(),
-            source_info.run_time_ticks,
-            descriptor,
-        ) {
-            state
-                .ctx
-                .store
-                .save(
-                    key,
-                    status == "aligned",
-                    std::time::Duration::from_secs(24 * 3600),
-                );
+            remote_path,
+        ] {
+            if let Some(key) =
+                subtitle_sync_label_key(path, source_info.run_time_ticks, descriptor)
+            {
+                state
+                    .ctx
+                    .store
+                    .save(
+                        key,
+                        status == "aligned",
+                        std::time::Duration::from_secs(24 * 3600),
+                    );
+            }
         }
     }
     let mut response = external_subtitle_response(bytes, format);
