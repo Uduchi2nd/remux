@@ -27,4 +27,7 @@ No reference-specific offset exception or language model is enabled.
 
 Worker version `embedded-text-v5-change-label` invalidates older results lacking
 the timing_changed field. Remux treats a missing field conservatively as false.
-Live deployment results will be appended after verification.
+Delivery records both the internal media path and the HTTP source URL, because
+remote-source metadata exposes the latter. The same duration and exact subtitle
+descriptor isolate both aliases from other releases. Live verification covers
+this raw-source versus metadata identity boundary.
