@@ -31,9 +31,17 @@ class ValidationTests(unittest.TestCase):
             s=cues();result=worker.Engine().align(s.to_string('srt'),s.to_string('srt'))
             self.assertEqual(result['report']['method'],'alass-only')
             self.assertFalse(result['report']['semantic_validation'])
+            self.assertTrue(result['report']['timing_changed'])
             aligned=parse(result['subtitle'])
             self.assertEqual(aligned[20].start,s[20].start+17000)
             self.assertEqual([c.text for c in aligned],[c.text for c in s])
+
+    def test_identical_timing_is_not_marked_changed(self):
+        def propose(args, **kwargs):
+            pysubs2.load(args[2]).save(args[3])
+        with tempfile.TemporaryDirectory() as d, patch.object(worker,'ROOT',Path(d)), patch.object(worker.subprocess,'run',side_effect=propose):
+            s=cues().to_string('srt');result=worker.Engine().align(s,s)
+            self.assertFalse(result['report']['timing_changed'])
 
     def test_structural_checks_reject_corrupt_output(self):
         s=cues()

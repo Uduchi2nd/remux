@@ -15,7 +15,7 @@ static JOB_SLOT: Semaphore = Semaphore::const_new(1);
 #[derive(Clone)]
 enum Outcome {
     Pending,
-    Ready(String),
+    Ready(String, bool),
     Rejected,
     Unavailable,
 }
@@ -29,6 +29,8 @@ struct WorkerReply {
 #[derive(Deserialize)]
 struct WorkerReport {
     accepted: bool,
+    #[serde(default)]
+    timing_changed: bool,
 }
 
 fn text_codec(codec: Option<&str>) -> bool {
@@ -116,7 +118,10 @@ fn source_identity(
 
 fn result(outcome: &Outcome, original: Bytes) -> (Bytes, &'static str) {
     match outcome {
-        Outcome::Ready(text) => (Bytes::copy_from_slice(text.as_bytes()), "aligned"),
+        Outcome::Ready(text, changed) => (
+            Bytes::copy_from_slice(text.as_bytes()),
+            if *changed { "aligned" } else { "unchanged" },
+        ),
         Outcome::Pending => (original, "pending"),
         Outcome::Rejected => (original, "rejected"),
         Outcome::Unavailable => (original, "unavailable"),
@@ -266,8 +271,8 @@ async fn reference_text(
     Some(reference)
 }
 
-/// Never blocks playback on extraction/inference. A subsequent subtitle load uses
-/// the completed result. Cache identity includes the guarded provider release
+/// Waits within the configured request budget for completed alignment.
+/// Cache identity includes the guarded provider release
 /// identity and external content; unknown sources retain the full descriptor.
 pub(super) async fn resolve(
     state: &AppState,
@@ -465,7 +470,12 @@ pub(super) async fn resolve(
                                 && s.len() <= MAX_SUBTITLE_BYTES
                         })
                     {
-                        return Some(Outcome::Ready(text));
+                        return Some(Outcome::Ready(
+                            text,
+                            reply
+                                .report
+                                .timing_changed,
+                        ));
                     }
                 } else {
                     rejected = true;
@@ -486,10 +496,10 @@ pub(super) async fn resolve(
         } else {
             CACHE_TTL
         };
-        tracing::info!(cache_key = %key, aligned = matches!(outcome, Outcome::Ready(_)),
+        tracing::info!(cache_key = %key, aligned = matches!(outcome, Outcome::Ready(..)),
             "subtitle alignment job finished");
         let weight = match &outcome {
-            Outcome::Ready(text) => text.len() as u32 + 256,
+            Outcome::Ready(text, _) => text.len() as u32 + 256,
             _ => 256,
         };
         state
@@ -511,7 +521,7 @@ mod tests {
                 Some(if start.elapsed() < Duration::from_millis(50) {
                     Outcome::Pending
                 } else {
-                    Outcome::Ready("corrected".into())
+                    Outcome::Ready("corrected".into(), true)
                 })
             },
             start + Duration::from_secs(1),

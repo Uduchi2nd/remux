@@ -516,6 +516,28 @@ async fn items_playbackinfo_inner(
             cfg.subtitle_mode,
         );
 
+        let label_source = source.clone();
+        for route in &routes {
+            if let Some(descriptor) = route
+                .subtitle
+                .url
+                .as_ref()
+            {
+                if let Some(stream) = source
+                    .media_streams
+                    .iter_mut()
+                    .find(|s| s.index == route.index)
+                {
+                    super::subtitles::apply_subtitle_sync_label(
+                        &state.ctx,
+                        &label_source,
+                        descriptor,
+                        stream,
+                    );
+                }
+            }
+        }
+
         source.transcoding_reasons = transcode_reasons;
 
         // Recompute from codec — never trust the stored DB value (may be stale).

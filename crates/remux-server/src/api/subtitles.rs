@@ -288,6 +288,7 @@ fn external_subtitle_response(
 async fn aligned_external_response(
     state: &AppState,
     source: &db::Media,
+    descriptor: &crate::stream::StreamDescriptor,
     bytes: axum::body::Bytes,
     language: Option<&str>,
     format: &str,
@@ -295,6 +296,25 @@ async fn aligned_external_response(
 ) -> Response<Body> {
     let (bytes, status) =
         alignment::resolve(state, source, bytes, language, format, bypass).await;
+    if !bypass {
+        let source_info = api::MediaSourceInfo::from(source.clone());
+        if let Some(key) = subtitle_sync_label_key(
+            source_info
+                .path
+                .as_deref(),
+            source_info.run_time_ticks,
+            descriptor,
+        ) {
+            state
+                .ctx
+                .store
+                .save(
+                    key,
+                    status == "aligned",
+                    std::time::Duration::from_secs(24 * 3600),
+                );
+        }
+    }
     let mut response = external_subtitle_response(bytes, format);
     response
         .headers_mut()
@@ -319,8 +339,8 @@ async fn aligned_external_response(
 
 #[derive(Clone)]
 pub(crate) struct SidecarSubtitleRoute {
-    index: i64,
-    subtitle: crate::addons::SubtitleInfo,
+    pub(crate) index: i64,
+    pub(crate) subtitle: crate::addons::SubtitleInfo,
 }
 
 fn sidecar_subtitle_routes_key(
@@ -441,6 +461,7 @@ async fn sidecar_subtitle_response(
                             aligned_external_response(
                                 state,
                                 &source,
+                                descriptor,
                                 bytes,
                                 route
                                     .subtitle
@@ -592,6 +613,7 @@ async fn subtitles_stream_inner(
                                 return Ok(aligned_external_response(
                                     &state,
                                     source,
+                                    descriptor,
                                     bytes,
                                     sub.lang
                                         .as_deref(),
@@ -939,6 +961,90 @@ pub(crate) fn scored_external_subtitles<'a>(
         .collect()
 }
 
+// The exact media path and subtitle descriptor make aliases harmless and avoid
+// carrying a label across different releases/tracks. URL renewal may conservatively
+// lose a label until another successful request; no signed URL appears in labels.
+fn subtitle_sync_label_key(
+    path: Option<&str>,
+    duration: Option<i64>,
+    descriptor: &crate::stream::StreamDescriptor,
+) -> Option<String> {
+    let path = path.filter(|p| !p.is_empty())?;
+    let mut identity =
+        serde_json::json!({"path":path,"duration":duration,"subtitle":descriptor});
+    identity.sort_all_objects();
+    Some(format!(
+        "subtitle-sync-label:{}",
+        Uuid::new_v5(&Uuid::nil(), &serde_json::to_vec(&identity).ok()?)
+    ))
+}
+
+pub(crate) fn apply_subtitle_sync_label(
+    ctx: &crate::AppContext,
+    source: &api::MediaSourceInfo,
+    descriptor: &crate::stream::StreamDescriptor,
+    stream: &mut api::MediaStream,
+) {
+    if ctx
+        .config
+        .subtitle_alignment_url
+        .is_none()
+        || ctx
+            .config
+            .subtitle_alignment_token_file
+            .is_none()
+    {
+        return;
+    }
+    let changed = subtitle_sync_label_key(
+        source
+            .path
+            .as_deref(),
+        source.run_time_ticks,
+        descriptor,
+    )
+    .and_then(|key| {
+        ctx.store
+            .get::<bool>(&key)
+    })
+    .is_some_and(|value| *value);
+    if changed {
+        mark_subtitle_auto_synced(stream);
+    }
+}
+
+fn mark_subtitle_auto_synced(stream: &mut api::MediaStream) {
+    const MARKER: &str = "[Auto-synced]";
+    let title = stream
+        .display_title
+        .get_or_insert_with(|| {
+            stream
+                .language
+                .clone()
+                .unwrap_or_else(|| "Subtitle".into())
+        });
+    if !title.contains(MARKER) {
+        title.push_str(" [Auto-synced]");
+    }
+    let path = stream
+        .path
+        .get_or_insert_with(|| {
+            format!(
+                "{}.vtt",
+                stream
+                    .language
+                    .as_deref()
+                    .unwrap_or("und")
+            )
+        });
+    if !path.contains(MARKER) {
+        let (stem, extension) = path
+            .rsplit_once('.')
+            .unwrap_or((path.as_str(), "vtt"));
+        *path = format!("{stem} [Auto-synced].{extension}");
+    }
+}
+
 /// Inject external subtitles into a list of `MediaSourceInfo` entries.
 pub(crate) async fn inject_external_subtitles(
     ctx: &crate::AppContext,
@@ -992,6 +1098,12 @@ pub(crate) async fn inject_external_subtitles(
                     .as_deref()
                     .unwrap_or("und")
             ));
+            if let Some(descriptor) = sub
+                .url
+                .as_ref()
+            {
+                apply_subtitle_sync_label(ctx, source, descriptor, &mut stream);
+            }
             if wants_default && i == 0 {
                 stream.is_default = Some(true);
                 source.default_subtitle_stream_index = Some(next_idx);
@@ -1009,6 +1121,53 @@ mod tests {
     use http::header::HeaderValue;
 
     use crate::integration_test::{auth_header_with_token, authenticated_server};
+    #[test]
+    fn auto_synced_label_preserves_language_extension_and_is_idempotent() {
+        let mut stream = api::MediaStream {
+            language: Some("vie".into()),
+            display_title: Some("Vietnamese - External".into()),
+            path: Some("vie.vtt".into()),
+            ..Default::default()
+        };
+        mark_subtitle_auto_synced(&mut stream);
+        mark_subtitle_auto_synced(&mut stream);
+        assert_eq!(
+            stream
+                .display_title
+                .as_deref(),
+            Some("Vietnamese - External [Auto-synced]")
+        );
+        assert_eq!(
+            stream
+                .path
+                .as_deref(),
+            Some("vie [Auto-synced].vtt")
+        );
+        assert_eq!(
+            stream
+                .language
+                .as_deref(),
+            Some("vie")
+        );
+    }
+    #[test]
+    fn sync_labels_are_isolated_by_media_and_subtitle() {
+        let a = crate::stream::StreamDescriptor::http("https://sub.test/a.vtt");
+        let b = crate::stream::StreamDescriptor::http("https://sub.test/b.vtt");
+        assert_ne!(
+            subtitle_sync_label_key(Some("release-a"), Some(10), &a),
+            subtitle_sync_label_key(Some("release-b"), Some(10), &a)
+        );
+        assert_ne!(
+            subtitle_sync_label_key(Some("release-a"), Some(10), &a),
+            subtitle_sync_label_key(Some("release-a"), Some(10), &b)
+        );
+        assert_ne!(
+            subtitle_sync_label_key(Some("release-a"), Some(10), &a),
+            subtitle_sync_label_key(Some("release-a"), Some(20), &a)
+        );
+        assert!(subtitle_sync_label_key(None, Some(10), &a).is_none());
+    }
 
     /// Jellyfin's tickless subtitle route (`.../Subtitles/{index}/Stream.{format}`,
     /// no start-position-ticks segment) must dispatch to the same handler as the

@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import pysubs2
 
-VERSION = "embedded-text-v4-alass-only"
+VERSION = "embedded-text-v5-change-label"
 ROOT = Path(os.environ.get("ALIGN_RUNTIME", "/root/remux-alignment-runtime"))
 MAX_BYTES = 2_000_000
 MAX_CUES = 5000
@@ -205,6 +205,7 @@ class Engine:
                     cue.start, cue.end = proposed.start, proposed.end
                 candidate=timed
             report=structural_validation(original,candidate)
+            report["timing_changed"] = any((a.start,a.end)!=(b.start,b.end) for a,b in zip(original,candidate))
             result={"version":VERSION,"key":key,"report":report}
             if report['accepted']:
                 result['subtitle']=candidate.to_string('srt', keep_ssa_tags=True)
