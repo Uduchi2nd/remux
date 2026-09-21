@@ -575,6 +575,12 @@ fn default_torrent_http_port() -> u16 {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Config {
+    /// Optional private subtitle alignment worker. Disabled unless configured.
+    #[serde(default)]
+    pub subtitle_alignment_url: Option<String>,
+    /// Bearer token file, so secrets never appear in serialized configuration.
+    #[serde(default)]
+    pub subtitle_alignment_token_file: Option<std::path::PathBuf>,
     #[serde(default = "default_data_dir")]
     pub data_dir: std::path::PathBuf,
     /// `None` means derive from `data_dir` — call `resolve()` after loading.
@@ -733,6 +739,8 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            subtitle_alignment_url: None,
+            subtitle_alignment_token_file: None,
             data_dir: default_data_dir(),
             database_url: None,
             torrent_data_dir: None,
