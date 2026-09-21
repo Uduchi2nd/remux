@@ -170,3 +170,7 @@ reference, including points near minutes 11 and 34.
 ## Broader quality and latency follow-up
 
 See [QUALITY.md](QUALITY.md) for the four-title, full-timeline recovery matrix, false negatives, exact-dialogue fast path, formatting fix, and remaining cold-start costs. Worker v3 preserves the existing E12 correction; it does not promise perfect alignment or instant cross-language matching.
+
+## Reviewed reference timing exceptions
+
+See [REFERENCE-OFFSET-E12.md](REFERENCE-OFFSET-E12.md). A known embedded track can itself be mistimed. Worker v5 supports exact parsed-track fingerprints in `reference-timing-overrides.json` under ALIGN_RUNTIME, applied before ALASS and included in its cache key. The shipped E12 entry corrects a demonstrated 15-second reference delay. Install the JSON alongside runtime data and restart Remux after changes. No speech/model inference runs in production; this does not automatically validate all embedded tracks against audio.

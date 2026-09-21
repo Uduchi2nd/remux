@@ -1,5 +1,7 @@
 # ALASS-only production mode — 2026-09-21
 
+Audio validation later disproved the assumption that the E12 Chinese reference was correctly timed. See REFERENCE-OFFSET-E12.md for the v5 fix; old reference-relative accuracy numbers below are not audio accuracy.
+
 Current delivery behavior is documented in README.md and SYNCHRONOUS-DELIVERY.md.
 The dated investigations below describe the earlier immediate-original behavior.
 

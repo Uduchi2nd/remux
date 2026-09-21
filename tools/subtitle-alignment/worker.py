@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import pysubs2
 
-VERSION = "embedded-text-v4-alass-only"
+VERSION = "embedded-text-v5-reference-offset"
 ROOT = Path(os.environ.get("ALIGN_RUNTIME", "/root/remux-alignment-runtime"))
 MAX_BYTES = 2_000_000
 MAX_CUES = 5000
@@ -182,12 +182,29 @@ class Engine:
 
     def align(self, external, reference):
         external, reference = normalize(external), normalize(reference)
-        key = hashlib.sha256((VERSION+'\0'+external+'\0'+reference).encode()).hexdigest()
+        # Exact track fingerprint: reviewed offsets never spill to other releases.
+        ref = parse(reference)
+        fingerprint = hashlib.sha256(json.dumps(
+            [[s.start, s.end, s.text] for s in ref], ensure_ascii=False,
+            separators=(',', ':')).encode()).hexdigest()
+        overrides_path = ROOT / 'reference-timing-overrides.json'
+        overrides = json.loads(overrides_path.read_text()) if overrides_path.exists() else {}
+        if not isinstance(overrides, dict):
+            raise ValueError('invalid reference timing overrides')
+        shift = overrides.get(fingerprint, 0)
+        if type(shift) is not int or abs(shift) > 120000:
+            raise ValueError('invalid reference offset')
+        if shift:
+            for cue in ref:
+                cue.start += shift; cue.end += shift
+            if any(c.start < 0 or c.end <= c.start for c in ref):
+                raise ValueError('reference offset produces invalid times')
+        key = hashlib.sha256((VERSION+'\0'+external+'\0'+reference+'\0'+str(shift)).encode()).hexdigest()
         cached = ROOT / "cache" / (key+'.json')
         with self.lock:
             if cached.exists() and time.time()-cached.stat().st_mtime < 14*86400:
                 return json.loads(cached.read_text())
-            original, ref = parse(external), parse(reference)
+            original = parse(external)
             with tempfile.TemporaryDirectory(dir=ROOT) as temp:
                 p=Path(temp)
                 original.save(str(p/'external.srt'), keep_ssa_tags=True)
@@ -205,6 +222,7 @@ class Engine:
                     cue.start, cue.end = proposed.start, proposed.end
                 candidate=timed
             report=structural_validation(original,candidate)
+            report["reference_offset_ms"] = shift
             result={"version":VERSION,"key":key,"report":report}
             if report['accepted']:
                 result['subtitle']=candidate.to_string('srt', keep_ssa_tags=True)
