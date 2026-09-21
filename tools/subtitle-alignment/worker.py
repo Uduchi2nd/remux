@@ -1,5 +1,7 @@
 """Private subtitle-only alignment worker. No media URLs or cloud inference."""
 import hashlib
+from collections import Counter, OrderedDict
+import copy
 import hmac
 import json
 import os
@@ -15,7 +17,7 @@ import onnxruntime as ort
 import pysubs2
 from tokenizers import Tokenizer
 
-VERSION = "embedded-text-v2"
+VERSION = "embedded-text-v3"
 ROOT = Path(os.environ.get("ALIGN_RUNTIME", "/root/remux-alignment-runtime"))
 MAX_BYTES = 2_000_000
 MAX_CUES = 5000
@@ -44,7 +46,8 @@ class Encoder:
     def __init__(self):
         self.tokenizer = Tokenizer.from_file(str(ROOT / "model/tokenizer.json"))
         self.tokenizer.enable_truncation(max_length=128)
-        self.tokenizer.enable_padding()
+        self.tokenizer.no_padding()
+        self.cache = OrderedDict()
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 2
         opts.inter_op_num_threads = 1
@@ -55,19 +58,65 @@ class Encoder:
         # Context disambiguates short dialogue such as 'yes' or 'Mr. Pei'.
         texts = [" ".join(s.plaintext for s in subs[max(0, i-1):i+2])
                  for i in range(len(subs))]
+        key = hashlib.sha256(json.dumps(texts, ensure_ascii=False).encode()).hexdigest()
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        encoded = self.tokenizer.encode_batch(texts)
+        # Similar lengths in each batch avoid running attention on padding.
+        order = sorted(range(len(texts)), key=lambda i: len(encoded[i].ids))
         vectors = []
         names = {x.name for x in self.session.get_inputs()}
         for start in range(0, len(texts), 32):
-            batch = self.tokenizer.encode_batch(texts[start:start+32])
-            feed = {"input_ids": np.array([x.ids for x in batch], dtype=np.int64),
-                    "attention_mask": np.array([x.attention_mask for x in batch], dtype=np.int64),
-                    "token_type_ids": np.array([x.type_ids for x in batch], dtype=np.int64)}
+            batch = [encoded[i] for i in order[start:start+32]]
+            width = max(len(x.ids) for x in batch)
+            feed = {"input_ids": np.array([x.ids + [0]*(width-len(x.ids)) for x in batch], dtype=np.int64),
+                    "attention_mask": np.array([x.attention_mask + [0]*(width-len(x.ids)) for x in batch], dtype=np.int64),
+                    "token_type_ids": np.array([x.type_ids + [0]*(width-len(x.ids)) for x in batch], dtype=np.int64)}
             output = self.session.run(None, {k:v for k,v in feed.items() if k in names})[0]
             mask = feed["attention_mask"][..., None]
             pooled = (output * mask).sum(1) / np.maximum(mask.sum(1), 1)
             pooled /= np.maximum(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-9)
             vectors.append(pooled.astype(np.float32))
-        return np.concatenate(vectors)
+        result = np.concatenate(vectors)[np.argsort(order)]
+        self.cache[key] = result
+        while len(self.cache) > 6:
+            self.cache.popitem(last=False)
+        return result
+
+
+def exact_validation(original, reference, candidate):
+    """Fast, conservative gate for substantially identical dialogue editions."""
+    if len(candidate) != len(original) or any(a.text != b.text for a,b in zip(original,candidate)):
+        return None
+    if any(s.start < 0 or s.end <= s.start for s in candidate):
+        return None
+    if any(a.start > b.start for a,b in zip(candidate,candidate[1:])):
+        return None
+    # Only whitespace is normalized; fuzzy matches require semantic validation.
+    ext = [' '.join(s.plaintext.split()) for s in original]
+    ref = [' '.join(s.plaintext.split()) for s in reference]
+    ec, rc = Counter(ext), Counter(ref)
+    lookup = {text:i for i,text in enumerate(ref) if rc[text] == 1}
+    anchors = [(i,lookup[text]) for i,text in enumerate(ext)
+               if len(text) >= 12 and ec[text] == 1 and text in lookup]
+    if len(anchors) < max(40, len(original)*.6):
+        return None
+    good = [abs(candidate[i].start-reference[j].start) <= 250
+            and abs(candidate[i].end-reference[j].end) <= 500 for i,j in anchors]
+    bins = []
+    duration = max(s.end for s in original)
+    for n in range(10):
+        ids = [k for k,(i,j) in enumerate(anchors)
+               if n/10 <= original[i].start/duration < (n+1)/10]
+        bins.append(float(np.mean([good[k] for k in ids])) if len(ids) >= 3 else None)
+    if np.mean(good) < .99 or sum(x is not None for x in bins) < 9:
+        return None
+    if any(x is not None and x < .95 for x in bins):
+        return None
+    return {"accepted": True, "reason": "exact dialogue validated", "method": "exact",
+            "anchors": len(anchors), "anchor_fraction": round(len(anchors)/len(original),3),
+            "within_250ms": round(float(np.mean(good)),3), "coverage_bins": bins}
 
 
 def validate(original, reference, candidate, similarities):
@@ -129,16 +178,28 @@ class Engine:
             original, ref = parse(external), parse(reference)
             with tempfile.TemporaryDirectory(dir=ROOT) as temp:
                 p=Path(temp)
-                original.save(str(p/'external.srt'))
+                original.save(str(p/'external.srt'), keep_ssa_tags=True)
                 ref.save(str(p/'reference.srt'))
                 subprocess.run([str(ROOT/'alass'),str(p/'reference.srt'),str(p/'external.srt'),str(p/'result.srt')],
                                check=True,timeout=90,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 candidate=pysubs2.load(str(p/'result.srt'))
-            similarities=self.encoder.encode(original) @ self.encoder.encode(ref).T
-            report=validate(original,ref,candidate,similarities)
+                # ALASS supplies timestamps; the original supplies all dialogue.
+                # Validate its serialized cue mapping before copying any times.
+                serialized=pysubs2.load(str(p/'external.srt'))
+                if len(candidate)!=len(original) or any(a.text!=b.text for a,b in zip(serialized,candidate)):
+                    raise ValueError('alignment changed cue mapping')
+                timed=copy.deepcopy(original)
+                for cue, proposed in zip(timed,candidate):
+                    cue.start, cue.end = proposed.start, proposed.end
+                candidate=timed
+            report=exact_validation(original,ref,candidate)
+            if report is None:
+                similarities=self.encoder.encode(original) @ self.encoder.encode(ref).T
+                report=validate(original,ref,candidate,similarities)
+                report['method']='semantic'
             result={"version":VERSION,"key":key,"report":report}
             if report['accepted']:
-                result['subtitle']=candidate.to_string('srt')
+                result['subtitle']=candidate.to_string('srt', keep_ssa_tags=True)
             staging=cached.with_suffix('.tmp')
             staging.write_text(json.dumps(result));staging.replace(cached)
             # Bounded cache: keep at most 200 results and expire after 14 days.

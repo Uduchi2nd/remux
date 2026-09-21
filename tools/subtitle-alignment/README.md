@@ -154,3 +154,7 @@ A fresh physical iPad Infuse session played the explicitly selected Usenet relea
 and rendered Vietnamese subtitles. Precise audio/lip-sync was not measured from
 the remote screen; quantitative timing verification is against the embedded text
 reference, including points near minutes 11 and 34.
+
+## Broader quality and latency follow-up
+
+See [QUALITY.md](QUALITY.md) for the four-title, full-timeline recovery matrix, false negatives, exact-dialogue fast path, formatting fix, and remaining cold-start costs. Worker v3 preserves the existing E12 correction; it does not promise perfect alignment or instant cross-language matching.
