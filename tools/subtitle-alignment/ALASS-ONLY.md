@@ -29,3 +29,20 @@ Live worker validation: original E12 pair processed uncached in 1.23 seconds. `/
 Production remux SHA256 `db358ae4227324ad688dd09eedb7b2e02e220f1a759b419d9ecb6eff15c89fd0`; worker SHA256 `26054fce79036a7f0194718d66e32413ccc9b9068d1e26e5d510096eb7f1146c`. Thirteen targeted Rust tests and 15 worker tests passed. Live E11 source containing embedded Vietnamese returned `embedded-language` and byte-identical original subtitles. E12 missing Vietnamese returned the corrected result in SRT/VTT/Jellyfin JSON, all 1,070 cue texts preserved, original bypass works, three reference anchors 8/10/10 ms. Remux and worker are healthy.
 
 Rollback assets: binary `/root/remux-patch/remux-pre-alass-only-v4` on nimo (outside the full LXC), worker `/opt/remux-subtitle-alignment/worker.py.pre-v4-20260921`. Stop remux, restore binary into LXC111 `/opt/remux/remux-server-patched` with mode 755, restore worker, restart its service, and recreate remux with the existing compose file. This restores v3 semantic behavior; disabling alignment entirely is a separate option using the configuration described in README.
+
+## E12 Vidhub follow-up — 2026-09-21 UTC
+
+Report: the Usenet E12 Vietnamese subtitle was out of sync around 07:18. Examined the complete preserved external/reference/aligned files and a real Vidhub session. No algorithm or deployment change was made for this investigation; production remains v4 ALASS-only with the model disabled.
+
+- ALASS adds 15.079 seconds to the first 389 cues and 33.000 seconds from cue 389 (original start 964.140 seconds). All 1,070 texts remain unchanged. These are two timing sections, not a guarantee of full-episode semantic accuracy.
+- At 07:18, corrected Vietnamese cue 145 spans 437.670–439.699 seconds; its corresponding embedded Chinese cue spans 438.061–439.700. The corrected start is 391 ms early; the end differs by 1 ms. Original Vietnamese starts at 422.591 seconds, about 15.47 seconds before the reference.
+- Before reopening Vidhub, a visible cue appeared to match the original timeline near 11:43, but screenshot/check-in latency prevents treating that as definitive proof of the previous file.
+- Closed and reopened Vidhub. A sanitized server trace captured its external subtitle GET followed by X-Remux-Subtitle-Alignment: aligned. No credentials or signed URLs were retained in the trace.
+- Paused fresh playback at server-reported 1145.989 seconds. The visible Vietnamese cue is at 1145.580–1146.300 in the corrected file and 1112.580–1113.300 in the original. Embedded reference: 1145.579–1146.299. This confirms the fresh player was displaying corrected timing at that point, within 1 ms of the embedded reference. This is a text-timeline check, not a measured audio/lip-sync test.
+- The iPad locked before a fresh visual seek to 07:18 could be completed. Do not claim that visual check or whole-episode audio verification passed.
+
+### Known first-request delivery limitation
+
+`alignment::resolve` returns original bytes with `pending` while its background job runs. An already loaded subtitle is not replaced in the player when that job completes. Even private/no-store HTTP headers cannot replace an in-memory player track. A fresh subtitle request after completion returns the corrected file; reopening Vidhub was verified to do this. This remains unresolved in code and can look like ALASS failed although the corrected file is ready.
+
+Do not re-enable the language model to fix this delivery issue. A follow-up should evaluate a bounded wait for fast/cached-reference alignment and a client-compatible way to refresh/version subtitle delivery, without introducing long startup stalls or mixing different release timelines. Full cold reference extraction can still be slow, so a short wait alone does not solve every first-play case.
