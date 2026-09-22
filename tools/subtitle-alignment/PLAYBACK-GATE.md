@@ -36,3 +36,11 @@ Rollback is removing SUBTITLE_ALIGNMENT_GATE_BASE_URL and recreating Remux, or r
 - Backups on nimo: `/root/remux-patch/remux-pre-playback-gate` and `/root/remux-patch/compose-pre-playback-gate.yml`.
 
 The gate guarantees server-side preparation before a new gated playback response, not that a client has selected/rendered the track, or that the reference itself matches audio. Refresh client metadata to replace previously cached direct provider URLs.
+
+
+## Infuse constructed subtitle URLs after source fallback (2026-09-22)
+Observed an E18 PlaybackInfo probe fail on source 92b139c6 and fall back to TorBox 7a16655f. Infuse constructed its subtitle URL using the advertised episode alias, rather than the explicit DeliveryUrl. The episode-alias route for subtitle index 4 returned 404 `subtitle stream not found`; the actual TorBox-source route returned 200 with 1,012 aligned Vietnamese cues. Video first-byte requests through the readiness gate and provider redirects succeeded. E16/E17 direct first-byte and subtitle DeliveryUrl checks had also succeeded, so these alone did not verify client behavior.
+
+Fix: PlaybackInfo records the source actually probed for each advertised and delivery source ID, scoped by authenticated device and item, with a six-hour TTL. Subtitle endpoints resolve this mapping before selecting embedded/addon tracks or alignment input. Sidecar route tables remain keyed by the originally advertised identity. Subsequent PlaybackInfo replaces the mapping, avoiding stale fallback selection when switching sources. This does not alter the subtitle gate or proxy video bytes. Clients must request PlaybackInfo again after deployment to populate the mapping; old sessions and genuinely unavailable upstream subtitles are not repaired by this mapping.
+
+Regression coverage verifies alias resolution, device/item isolation, and replacement on subsequent selection. Live verification is recorded below after deployment.

@@ -64,6 +64,9 @@ use axum_anyhow::ApiResult as Result;
 struct SourceExtras {
     /// The source id its DeliveryUrls were built with, and its sidecar routes.
     subtitle_routes: (Uuid, Vec<SidecarSubtitleRoute>),
+    /// The database source that was actually probed; advertised aliases can
+    /// differ for auto-play and clients that use the item id as source id.
+    effective_source_id: Uuid,
     /// Set when the source is a stream-group representative — group order is
     /// an explicit, admin-authored priority (drag-and-drop in the dashboard),
     /// not something a device-capability sort should second-guess.
@@ -824,6 +827,7 @@ async fn items_playbackinfo_inner(
 
         source_extras.push(SourceExtras {
             subtitle_routes: (subtitle_source_id, routes),
+            effective_source_id: effective_stream.id,
             group_id: stream.group_id,
             allow_subtitle_extraction,
             subtitle_prefetch,
@@ -977,6 +981,19 @@ async fn items_playbackinfo_inner(
         .zip(source_extras)
     {
         let (delivery_source_id, routes) = extras.subtitle_routes;
+        // Clients may construct subtitle URLs from the advertised alias instead
+        // of DeliveryUrl. Pin both identities to the source actually probed.
+        for alias in [source.id, delivery_source_id] {
+            super::subtitles::save_subtitle_source(
+                &state.ctx,
+                &session
+                    .device
+                    .id,
+                id,
+                alias,
+                extras.effective_source_id,
+            );
+        }
         // DeliveryUrl contains the source ID from apply_subtitle_delivery, while
         // some clients construct the route from the final MediaSourceInfo ID.
         // Cache both keys when auto-play rewrites the first source ID.
