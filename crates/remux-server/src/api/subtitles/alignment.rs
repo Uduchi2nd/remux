@@ -33,7 +33,7 @@ struct WorkerReport {
     timing_changed: bool,
 }
 
-fn text_codec(codec: Option<&str>) -> bool {
+pub(super) fn text_codec(codec: Option<&str>) -> bool {
     matches!(
         codec
             .unwrap_or("")
@@ -55,7 +55,7 @@ fn cache_key(source: Uuid, external: &[u8]) -> String {
     format!("subtitle-alignment-v4:{}", Uuid::new_v5(&source, external))
 }
 
-fn alignment_skip_reason(
+pub(super) fn alignment_skip_reason(
     language: Option<&str>,
     streams: &[api::MediaStream],
 ) -> Option<&'static str> {

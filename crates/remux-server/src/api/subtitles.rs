@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 mod alignment;
+pub(crate) mod gate;
 
 #[derive(Default, serde::Deserialize)]
 pub struct SubtitleOptions {
@@ -622,6 +623,14 @@ async fn fetch_external_subtitle_bytes(
     state: &AppState,
     descriptor: &crate::stream::StreamDescriptor,
 ) -> anyhow::Result<axum::body::Bytes> {
+    let cache_key = gate::raw_key(descriptor);
+    if let Some(bytes) = state
+        .ctx
+        .store
+        .get::<axum::body::Bytes>(&cache_key)
+    {
+        return Ok((*bytes).clone());
+    }
     let resp = match descriptor {
         crate::stream::StreamDescriptor::Opendal { addon_id, .. } => {
             let addon = state
@@ -651,9 +660,21 @@ async fn fetch_external_subtitle_bytes(
     {
         return Err(anyhow!("upstream subtitle status {}", resp.status()));
     }
-    axum::body::to_bytes(resp.into_body(), 2_000_000)
+    let bytes = axum::body::to_bytes(resp.into_body(), 2_000_000)
         .await
-        .map_err(|e| anyhow!("read subtitle bytes: {e}"))
+        .map_err(|_| anyhow!("subtitle read failed"))?;
+    if !gate::valid_subtitle(&bytes) {
+        return Err(anyhow!("upstream returned no valid subtitle cues"));
+    }
+    state
+        .ctx
+        .store
+        .save(
+            cache_key,
+            bytes.clone(),
+            std::time::Duration::from_secs(1800),
+        );
+    Ok(bytes)
 }
 
 fn external_subtitle_response(
@@ -690,8 +711,23 @@ async fn aligned_external_response(
     format: &str,
     bypass: bool,
 ) -> Response<Body> {
-    let (bytes, status) =
-        alignment::resolve(state, source, bytes, language, format, bypass).await;
+    let (bytes, status) = if !bypass && gate::required(state, source, language) {
+        match gate::resolve_ready(state, source, bytes, language, format).await {
+            Ok(result) => result,
+            Err(_) => return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    ("X-Remux-Subtitle-Alignment", "not-ready"),
+                    ("Cache-Control", "private, no-store"),
+                    ("Retry-After", "5"),
+                ],
+                "Subtitle alignment is not ready; playback is blocked. Retry later.",
+            )
+                .into_response(),
+        }
+    } else {
+        alignment::resolve(state, source, bytes, language, format, bypass).await
+    };
     if !bypass {
         let source_info = api::MediaSourceInfo::from(source.clone());
         // Item metadata exposes a redirectable source as its remote HTTP URL,
@@ -1601,6 +1637,9 @@ fn append_external_subtitles_inner(
             }
             source.media_streams.push(stream);
         }
+        if let Some(ctx) = ctx {
+            gate::advertise(ctx, source, item_id, api_key);
+        }
     }
 }
 
@@ -1666,6 +1705,7 @@ pub(crate) async fn inject_external_subtitles(
             }
             source.media_streams.push(stream);
         }
+        gate::advertise(ctx, source, item_id, api_key);
     }
 }
 
