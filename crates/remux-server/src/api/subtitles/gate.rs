@@ -1,0 +1,340 @@
+//! Playback waits for eligible external subtitle alignment before video delivery.
+use super::{alignment, lang_to_two_letter};
+use crate::{AppContext, AppState, api, db};
+use std::time::Duration;
+use uuid::Uuid;
+
+pub(super) fn raw_key(descriptor: &crate::stream::StreamDescriptor) -> String {
+    let mut value = serde_json::to_value(descriptor).unwrap_or_default();
+    value.sort_all_objects();
+    format!(
+        "subtitle-valid-raw:{}",
+        Uuid::new_v5(
+            &Uuid::nil(),
+            value
+                .to_string()
+                .as_bytes()
+        )
+    )
+}
+
+pub(super) fn valid_subtitle(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if text
+        .trim_start()
+        .starts_with(['{', '<'])
+    {
+        return false;
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&crate::conversions::srt_to_jellyfin_json(text))
+            .unwrap_or_default();
+    parsed["TrackEvents"]
+        .as_array()
+        .is_some_and(|events| {
+            events
+                .iter()
+                .any(|e| {
+                    e["Text"]
+                        .as_str()
+                        .is_some_and(|t| {
+                            !t.trim()
+                                .is_empty()
+                        })
+                        && e["StartPositionTicks"]
+                            .as_i64()
+                            .zip(e["EndPositionTicks"].as_i64())
+                            .is_some_and(|(a, b)| a >= 0 && b > a)
+                })
+        })
+        || text
+            .lines()
+            .any(|line| {
+                line.starts_with("Dialogue:")
+                    && line
+                        .split(',')
+                        .count()
+                        >= 10
+            })
+}
+
+fn has_reference(streams: &[api::MediaStream]) -> bool {
+    streams
+        .iter()
+        .any(|s| {
+            matches!(s.type_, Some(api::MediaStreamType::Subtitle))
+                && !s.is_external
+                && !s.is_forced
+                && alignment::text_codec(
+                    s.codec
+                        .as_deref(),
+                )
+        })
+}
+fn eligible(streams: &[api::MediaStream], language: Option<&str>) -> bool {
+    has_reference(streams)
+        && alignment::alignment_skip_reason(language, streams).is_none()
+}
+
+pub(super) fn required(
+    state: &AppState,
+    source: &db::Media,
+    language: Option<&str>,
+) -> bool {
+    state
+        .ctx
+        .config
+        .subtitle_alignment_gate_base_url
+        .is_some()
+        && source
+            .probe_data
+            .as_ref()
+            .is_some_and(|p| eligible(&p.media_streams, language))
+}
+
+pub(super) async fn resolve_ready(
+    state: &AppState,
+    source: &db::Media,
+    bytes: axum::body::Bytes,
+    language: Option<&str>,
+    format: &str,
+) -> anyhow::Result<(axum::body::Bytes, &'static str)> {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let (output, status) = alignment::resolve(
+                state,
+                source,
+                bytes.clone(),
+                language,
+                format,
+                false,
+            )
+            .await;
+            match status {
+                "aligned" | "unchanged" => return Ok((output, status)),
+                "pending" | "wait-timeout" => {
+                    tokio::time::sleep(Duration::from_millis(100)).await
+                }
+                _ => return Err(anyhow::anyhow!("subtitle alignment unavailable")),
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("subtitle alignment timed out"))?
+}
+
+pub(crate) fn advertise(
+    ctx: &AppContext,
+    source: &mut api::MediaSourceInfo,
+    item: Uuid,
+    token: &str,
+) {
+    let Some(base) = &ctx
+        .config
+        .subtitle_alignment_gate_base_url
+    else {
+        return;
+    };
+    if !source
+        .media_streams
+        .iter()
+        .any(|s| {
+            s.is_external
+                && eligible(
+                    &source.media_streams,
+                    s.language
+                        .as_deref(),
+                )
+        })
+    {
+        return;
+    }
+    source.path = Some(format!(
+        "{}/remux/subtitle-ready/{item}/{}/stream?ApiKey={token}",
+        base.trim_end_matches('/'),
+        source.id
+    ));
+    source.is_remote = true;
+    source.protocol = api::MediaProtocol::Http;
+}
+
+pub(crate) async fn ensure_ready(
+    state: &AppState,
+    source: &db::Media,
+    item: Uuid,
+    user: Option<Uuid>,
+) -> anyhow::Result<()> {
+    if state
+        .ctx
+        .config
+        .subtitle_alignment_gate_base_url
+        .is_none()
+    {
+        return Ok(());
+    }
+    let Some(probe) = source
+        .probe_data
+        .as_ref()
+    else {
+        return Ok(());
+    };
+    if !has_reference(&probe.media_streams) {
+        return Ok(());
+    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut media = db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &item,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("subtitle item unavailable"))?;
+        let subs = state
+            .ctx
+            .addons
+            .fetch_subtitles(
+                &mut media,
+                &state
+                    .ctx
+                    .db,
+                false,
+                user,
+            )
+            .await;
+        let settings = db::Settings::get_config_or_default(
+            &state
+                .ctx
+                .db,
+        )
+        .await;
+        let source_info = api::MediaSourceInfo::from(source.clone());
+        let mut subs: Vec<_> = super::scored_external_subtitles(
+            &subs,
+            &settings
+                .subtitle_languages
+                .unwrap_or_default(),
+            &source_info.name,
+            &source_info.path,
+        )
+        .into_iter()
+        .cloned()
+        .collect();
+        if let Some(torrent) = state
+            .ctx
+            .torrent
+            .read()
+            .await
+            .clone()
+        {
+            if let Some(info) = source
+                .stream_info
+                .as_ref()
+            {
+                subs.extend(info.subtitle_sidecars(&torrent));
+            }
+        }
+        for language in ["vi", "en"] {
+            if !eligible(&probe.media_streams, Some(language)) {
+                continue;
+            }
+            let candidates: Vec<_> = subs
+                .iter()
+                .filter(|s| {
+                    s.lang
+                        .as_deref()
+                        .and_then(lang_to_two_letter)
+                        .as_deref()
+                        == Some(language)
+                        && s.url
+                            .is_some()
+                })
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            // Prepare every advertised matching track: a player may select any of them.
+            for sub in candidates {
+                let descriptor = sub
+                    .url
+                    .as_ref()
+                    .unwrap();
+                let bytes =
+                    super::fetch_external_subtitle_bytes(state, descriptor).await?;
+                loop {
+                    let response = super::aligned_external_response(
+                        state,
+                        source,
+                        descriptor,
+                        bytes.clone(),
+                        sub.lang
+                            .as_deref(),
+                        "vtt",
+                        false,
+                    )
+                    .await;
+                    let status = response
+                        .headers()
+                        .get("X-Remux-Subtitle-Alignment")
+                        .and_then(|v| {
+                            v.to_str()
+                                .ok()
+                        })
+                        .unwrap_or("unavailable");
+                    match status {
+                        "aligned" | "unchanged" => break,
+                        "pending" | "wait-timeout" => {
+                            tokio::time::sleep(Duration::from_millis(100)).await
+                        }
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "external subtitle alignment is not ready"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("subtitle preparation exceeded 60 seconds; retry playback")
+    })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejects_error_and_empty_payloads() {
+        for data in [
+            b"WEBVTT\n\n".as_slice(),
+            br##"{"error":"#75 Bad Request"}"##,
+            b"<html>error</html>",
+            b"1\n00:00:02,000 --> 00:00:01,000\nbad\n",
+        ] {
+            assert!(!valid_subtitle(data));
+        }
+        assert!(valid_subtitle(b"1\n00:00:01,000 --> 00:00:02,000\nHello\n"));
+        assert!(valid_subtitle(
+            b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n"
+        ));
+    }
+    #[test]
+    fn only_missing_target_language_with_text_reference_requires_gate() {
+        let mut reference = api::MediaStream {
+            type_: Some(api::MediaStreamType::Subtitle),
+            codec: Some("srt".into()),
+            language: Some("eng".into()),
+            ..Default::default()
+        };
+        assert!(eligible(&[reference.clone()], Some("vie")));
+        assert!(!eligible(&[reference.clone()], Some("eng")));
+        assert!(!eligible(&[reference.clone()], Some("fra")));
+        reference.is_forced = true;
+        assert!(!eligible(&[reference], Some("vie")));
+    }
+}

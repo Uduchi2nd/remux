@@ -585,6 +585,9 @@ pub struct Config {
     /// Maximum subtitle-request wait, including queue and reference extraction.
     #[serde(default = "default_subtitle_alignment_wait_seconds")]
     pub subtitle_alignment_wait_seconds: u64,
+    /// Public Remux URL enabling playback gating for subtitle alignment.
+    #[serde(default)]
+    pub subtitle_alignment_gate_base_url: Option<String>,
     /// Bearer token file, so secrets never appear in serialized configuration.
     #[serde(default)]
     pub subtitle_alignment_token_file: Option<std::path::PathBuf>,
@@ -748,6 +751,7 @@ impl Default for Config {
         Self {
             subtitle_alignment_url: None,
             subtitle_alignment_wait_seconds: default_subtitle_alignment_wait_seconds(),
+            subtitle_alignment_gate_base_url: None,
             subtitle_alignment_token_file: None,
             data_dir: default_data_dir(),
             database_url: None,

@@ -315,6 +315,22 @@ async fn items_playbackinfo_inner(
         effective_stream,
     } in probed.results
     {
+        if media_sources.is_empty() {
+            super::subtitles::gate::ensure_ready(
+                &state,
+                &effective_stream,
+                id,
+                Some(
+                    session
+                        .user
+                        .id,
+                ),
+            )
+            .await
+            .context_bad_gateway(
+                "Playback blocked: external subtitles are not ready",
+            )?;
+        }
         // Metadata-only torrent probes may not know the container duration yet.
         // Keep the authoritative Movie/Episode duration in PlaybackInfo so
         // clients do not treat a normal VOD source as an indefinite stream.
@@ -900,6 +916,31 @@ pub async fn audio_stream_by_container(
     videos_stream_inner(headers, state, None, id, q).await
 }
 
+/// Authenticated metadata URL for clients that skip PlaybackInfo.
+#[get("/remux/subtitle-ready/{id}/{source_id}/stream")]
+pub async fn subtitle_ready_stream(
+    headers: headers::HeaderMap,
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+    Path((id, source_id)): Path<(Uuid, Uuid)>,
+    Query(mut q): Query<api::VideoStreamQuery>,
+) -> Result<impl IntoResponse> {
+    q.media_source_id = Some(source_id);
+    q.static_ = Some(true);
+    videos_stream_inner(
+        headers,
+        state,
+        Some(
+            session
+                .user
+                .id,
+        ),
+        id,
+        q,
+    )
+    .await
+}
+
 #[get("/videos/{id}/stream")]
 pub async fn videos_stream(
     headers: headers::HeaderMap,
@@ -1046,6 +1087,12 @@ async fn videos_stream_inner(
             return Ok(no_streams_response().into_response());
         }
     };
+    if let Err(error) =
+        super::subtitles::gate::ensure_ready(&state, &media, id, user_id).await
+    {
+        tracing::warn!(item = %id, "playback blocked by subtitle readiness: {error}");
+        return Ok((http::StatusCode::SERVICE_UNAVAILABLE, [("Retry-After", "5"), ("Cache-Control", "no-store")], "Playback blocked: external subtitles are not ready. Retry after the subtitle source recovers.").into_response());
+    }
     let Some(si) = media
         .stream_info
         .clone()
