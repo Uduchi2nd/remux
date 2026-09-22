@@ -319,6 +319,173 @@ impl StreamDescriptor {
     }
 }
 
+/// A stream is hidden from the default source ordering only after an upstream
+/// HTTP HEAD has positively confirmed that it no longer exists. Cache recent
+/// observations so opening an item repeatedly does not repeat the request.
+const CONFIRMED_MISSING_TTL: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+const OTHER_HEAD_RESULT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+static STREAM_HEAD_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(Uuid, u64), (std::time::Instant, bool)>,
+    >,
+> = std::sync::LazyLock::new(
+    || std::sync::Mutex::new(std::collections::HashMap::new()),
+);
+
+/// Returns true only when the stream has a cached or freshly confirmed 404/410.
+/// Timeouts, auth failures, rate limits, and server errors remain eligible for
+/// playback because they may be transient or client-specific.
+pub async fn stream_is_confirmed_missing(id: Uuid, info: &StreamInfo) -> bool {
+    let StreamDescriptor::Http {
+        url,
+        request_headers,
+        ..
+    } = &info.descriptor
+    else {
+        return false;
+    };
+
+    // Include the URL identity without retaining signed URLs or tokens in the
+    // process-local cache. A refreshed URL for the same stream ID gets checked.
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut hasher);
+    let cache_key = (id, hasher.finish());
+    let now = std::time::Instant::now();
+    if let Ok(mut cache) = STREAM_HEAD_CACHE.lock() {
+        cache.retain(|_, (expires, _)| *expires > now);
+        if let Some((_, missing)) = cache.get(&cache_key) {
+            return *missing;
+        }
+    }
+
+    let request = request_headers
+        .iter()
+        .fold(HEAD_CLIENT.head(url), |request, (name, value)| {
+            request.header(name.as_str(), value.as_str())
+        });
+    if let Ok(Ok(response)) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), request.send()).await
+    {
+        let missing = status_confirms_missing(response.status());
+        let ttl = if missing {
+            CONFIRMED_MISSING_TTL
+        } else {
+            OTHER_HEAD_RESULT_TTL
+        };
+        if let Ok(mut cache) = STREAM_HEAD_CACHE.lock() {
+            cache.insert(cache_key, (now + ttl, missing));
+        }
+        return missing;
+    }
+    false
+}
+
+/// Remove confirmed-gone HTTP streams from the default source ordering, but
+/// retain the originals if no fallback remains. Explicit source requests are
+/// handled by callers and intentionally bypass this helper.
+pub async fn filter_confirmed_missing_default_sources(
+    mut sources: Vec<crate::db::Media>,
+) -> Vec<crate::db::Media> {
+    const PREFLIGHT_LIMIT: usize = 3;
+    if sources.len() < 2 {
+        return sources;
+    }
+
+    let mut missing = std::collections::HashSet::new();
+    for source in sources
+        .iter()
+        .take(PREFLIGHT_LIMIT)
+    {
+        let Some(info) = source
+            .stream_info
+            .as_ref()
+        else {
+            break;
+        };
+        if stream_is_confirmed_missing(source.id, info).await {
+            missing.insert(source.id);
+        } else {
+            // Unknown or healthy means this is the first safe default. Do not
+            // spend time checking lower-priority alternatives.
+            break;
+        }
+    }
+
+    let original_len = sources.len();
+    sources = retain_missing_with_fallback(sources, &missing);
+    if sources.len() != original_len {
+        tracing::info!(
+            removed = original_len - sources.len(),
+            "skipping confirmed missing default streams"
+        );
+    }
+    sources
+}
+
+fn retain_missing_with_fallback(
+    mut sources: Vec<crate::db::Media>,
+    missing: &std::collections::HashSet<Uuid>,
+) -> Vec<crate::db::Media> {
+    // If every source is gone, keep the original list as a last resort.
+    if missing.is_empty() || missing.len() >= sources.len() {
+        return sources;
+    }
+    sources.retain(|source| !missing.contains(&source.id));
+    sources
+}
+
+fn status_confirms_missing(status: http::StatusCode) -> bool {
+    status == http::StatusCode::NOT_FOUND || status == http::StatusCode::GONE
+}
+
+#[cfg(test)]
+mod confirmed_missing_tests {
+    use super::{retain_missing_with_fallback, status_confirms_missing};
+    use crate::db::Media;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    #[test]
+    fn only_not_found_and_gone_confirm_missing() {
+        assert!(status_confirms_missing(http::StatusCode::NOT_FOUND));
+        assert!(status_confirms_missing(http::StatusCode::GONE));
+        for status in [
+            http::StatusCode::OK,
+            http::StatusCode::PARTIAL_CONTENT,
+            http::StatusCode::UNAUTHORIZED,
+            http::StatusCode::FORBIDDEN,
+            http::StatusCode::TOO_MANY_REQUESTS,
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(!status_confirms_missing(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn skips_confirmed_gone_sources_only_when_a_fallback_remains() {
+        let first = Media {
+            id: Uuid::new_v4(),
+            ..Default::default()
+        };
+        let second = Media {
+            id: Uuid::new_v4(),
+            ..Default::default()
+        };
+        let missing = HashSet::from([first.id]);
+
+        let kept =
+            retain_missing_with_fallback(vec![first.clone(), second.clone()], &missing);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, second.id);
+
+        let last_resort = retain_missing_with_fallback(vec![first.clone()], &missing);
+        assert_eq!(last_resort.len(), 1);
+        assert_eq!(last_resort[0].id, first.id);
+    }
+}
+
 /// Combined stream descriptor and provider metadata stored in `db::Media.stream_info`.
 ///
 /// Replaces the old split between `db::Media.url` (transport) and

@@ -118,7 +118,7 @@ impl StreamService {
                     .db,
             )
             .await?;
-        let raw = if db_streams.is_empty() {
+        let mut raw = if db_streams.is_empty() {
             // Root item can be the stream itself (e.g. locally-imported files)
             // but only when it carries a URL. Addon content uses the root as a
             // container — falling back to it when the addon returned no streams
@@ -134,6 +134,18 @@ impl StreamService {
         } else {
             db_streams
         };
+
+        let explicit_stream_request = self
+            .requested_id
+            .is_some_and(|requested| {
+                requested != self.item_id
+                    && raw
+                        .iter()
+                        .any(|stream| stream.id == requested)
+            });
+        if !explicit_stream_request {
+            raw = crate::stream::filter_confirmed_missing_default_sources(raw).await;
+        }
 
         let streams = db::StreamGroup::filter_sources(
             &self
@@ -251,6 +263,12 @@ impl StreamService {
                 // as auto-play and fall through to preference / first source.
                 let specific_stream =
                     requested_id.filter(|&sid| sid != item_id && sid != media_id);
+                let sources = if specific_stream.is_none() {
+                    crate::stream::filter_confirmed_missing_default_sources(sources)
+                        .await
+                } else {
+                    sources
+                };
                 if let Some(sid) = specific_stream {
                     sources
                         .into_iter()

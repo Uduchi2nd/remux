@@ -1703,13 +1703,20 @@ async fn item_for_user(
     } else if want_streams
         && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
     {
-        let raw = media
+        let mut raw = media
             .streams(
                 &state
                     .ctx
                     .db,
             )
             .await?;
+        // The first source is the implicit choice in many players. Check only
+        // its short fallback chain, and only for definitive HTTP 404/410s, so
+        // one dead debrid URL does not make the whole episode appear broken.
+        // Explicitly selected groups remain available for retry.
+        if requested_group.is_none() {
+            raw = crate::stream::filter_confirmed_missing_default_sources(raw).await;
+        }
         let grouped = db::StreamGroup::filter_sources(
             &state
                 .ctx
