@@ -397,6 +397,33 @@ pub(crate) struct SidecarSubtitleRoute {
     pub(crate) subtitle: crate::addons::SubtitleInfo,
 }
 
+pub(crate) fn save_subtitle_source(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    alias: Uuid,
+    actual: Uuid,
+) {
+    ctx.store
+        .save(
+            format!("subtitle-source:{device_id}:{item_id}:{alias}"),
+            actual,
+            std::time::Duration::from_secs(6 * 60 * 60),
+        );
+}
+
+fn resolve_subtitle_source(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    alias: Uuid,
+) -> Uuid {
+    ctx.store
+        .get::<Uuid>(&format!("subtitle-source:{device_id}:{item_id}:{alias}"))
+        .map(|id| *id)
+        .unwrap_or(alias)
+}
+
 fn sidecar_subtitle_routes_key(
     device_id: &str,
     item_id: Uuid,
@@ -548,13 +575,22 @@ async fn subtitles_stream_inner(
     format: String,
     bypass: bool,
 ) -> Result<impl IntoResponse> {
+    let advertised_source_id = media_source_id;
+    let media_source_id = resolve_subtitle_source(
+        &state.ctx,
+        &session
+            .device
+            .id,
+        item_id,
+        advertised_source_id,
+    );
     let sidecar_routes = load_sidecar_subtitle_routes(
         &state.ctx,
         &session
             .device
             .id,
         item_id,
-        media_source_id,
+        advertised_source_id,
     );
     if let Some(response) = sidecar_subtitle_response(
         &state,
@@ -1179,6 +1215,24 @@ mod tests {
     use http::header::HeaderValue;
 
     use crate::integration_test::{auth_header_with_token, authenticated_server};
+    #[tokio::test]
+    async fn subtitle_alias_follows_probed_source_and_is_device_scoped() {
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let item = Uuid::new_v4();
+        let actual = Uuid::new_v4();
+        save_subtitle_source(ctx, "player-a", item, item, actual);
+        assert_eq!(resolve_subtitle_source(ctx, "player-a", item, item), actual);
+        assert_eq!(resolve_subtitle_source(ctx, "player-b", item, item), item);
+        assert_eq!(
+            resolve_subtitle_source(ctx, "player-a", Uuid::new_v4(), item),
+            item
+        );
+        // A subsequent selection must replace the previous fallback mapping.
+        save_subtitle_source(ctx, "player-a", item, item, item);
+        assert_eq!(resolve_subtitle_source(ctx, "player-a", item, item), item);
+    }
+
     #[test]
     fn auto_synced_label_preserves_language_extension_and_is_idempotent() {
         let mut stream = api::MediaStream {

@@ -563,7 +563,7 @@ async fn items_playbackinfo_inner(
             }
         }
 
-        sidecar_subtitle_routes.push((subtitle_source_id, routes));
+        sidecar_subtitle_routes.push((subtitle_source_id, effective_stream.id, routes));
         media_sources.push(source);
     }
 
@@ -624,10 +624,23 @@ async fn items_playbackinfo_inner(
         media_sources[0].e_tag = id;
     }
 
-    for (source, (delivery_source_id, routes)) in media_sources
+    for (source, (delivery_source_id, effective_source_id, routes)) in media_sources
         .iter()
         .zip(sidecar_subtitle_routes)
     {
+        // Clients may construct subtitle URLs from the advertised alias instead
+        // of DeliveryUrl. Pin both identities to the source actually probed.
+        for alias in [source.id, delivery_source_id] {
+            super::subtitles::save_subtitle_source(
+                &state.ctx,
+                &session
+                    .device
+                    .id,
+                id,
+                alias,
+                effective_source_id,
+            );
+        }
         // DeliveryUrl contains the source ID from apply_subtitle_delivery, while
         // some clients construct the route from the final MediaSourceInfo ID.
         // Cache both keys when auto-play rewrites the first source ID.
