@@ -141,3 +141,11 @@ Current ALASS-only behavior, measured latency, and rollback are documented in [A
 ## Bounded synchronous subtitle delivery — 2026-09-21
 
 See tools/subtitle-alignment/SYNCHRONOUS-DELIVERY.md. Retire this part only when upstream serves a completed correction on a cold result-cache request (including concurrent requests), preserves originals on failure, and bounds waiting. Matching quality and subtitle delivery are separate acceptance checks. Long reference extraction can still exceed the request budget.
+
+## Confirmed-dead stream fallback — 2026-09-22
+
+Reproduced No Pain No Gain S1E18 in VidHub: the first/default Sootio 2160p source failed with a network playback error, while the next Torrentio 2160p version played in Remux Web. The source list still placed Sootio first. This points to one unavailable provider URL rather than an episode-wide playback failure.
+
+The fork now preflights only the first three default HTTP source candidates with HEAD, stopping at the first source that is not confirmed missing. It removes a candidate from the default episode/movie source list only when the final response is HTTP 404 or 410, and caches that result for ten minutes. Other received HTTP statuses are cached for 30 seconds to avoid repeating HEAD checks when a client refetches the item; network/timeouts are not cached. It does not fetch media bytes. Timeouts, 401/403, 429 and 5xx remain visible. Explicitly requested stream groups bypass this filter, and if every checked candidate is missing the original source list is retained as a last resort. After the missing-result cache expires, a provider source can reappear automatically.
+
+The filter runs before stream grouping and in Remux's central default PlaybackInfo selection, so clients that refetch PlaybackInfo do not silently select the same dead first source. Explicit source-ID requests still bypass the filter. This is a limited fallback check: it does not prove that a source returning HTTP 200 will decode or remain complete, and providers that mishandle HEAD keep their source visible. Physical VidHub playback reproduced the failure, but this code change has not been built or deployed yet. Validate the returned MediaSources ordering and retest E18 on VidHub before treating the issue as resolved.
