@@ -337,4 +337,67 @@ mod tests {
         reference.is_forced = true;
         assert!(!eligible(&[reference], Some("vie")));
     }
+    #[tokio::test]
+    async fn unavailable_alignment_never_returns_original_subtitle() {
+        let (_, guard) =
+            crate::integration_test::new_test_server_with_config(crate::Config {
+                database_url: Some("sqlite::memory:".into()),
+                torrent_http_port: None,
+                disable_dht: true,
+                subtitle_alignment_gate_base_url: Some("https://example.test".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = AppState {
+            ctx: guard
+                .0
+                .clone(),
+            tasks: crate::tasks::TaskService::new(
+                guard
+                    .0
+                    .clone(),
+            )
+            .await
+            .unwrap(),
+        };
+        let source = db::Media {
+            probe_data: Some(api::MediaSourceInfo {
+                media_streams: vec![api::MediaStream {
+                    type_: Some(api::MediaStreamType::Subtitle),
+                    codec: Some("srt".into()),
+                    language: Some("eng".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = super::super::aligned_external_response(
+            &state,
+            &source,
+            &crate::stream::StreamDescriptor::Local("unused.srt".into()),
+            axum::body::Bytes::from_static(
+                b"1\n00:00:01,000 --> 00:00:02,000\nOriginal text\n",
+            ),
+            Some("vie"),
+            "vtt",
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()["X-Remux-Subtitle-Alignment"],
+            "not-ready"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("Original text"));
+        assert!(
+            ensure_ready(&state, &source, Uuid::new_v4(), None)
+                .await
+                .is_err()
+        );
+    }
 }

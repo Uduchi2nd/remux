@@ -176,3 +176,7 @@ Reference accuracy is an assumption: embedded text can itself be mistimed relati
 ## Subtitle naming
 
 See [SUBTITLE-LABELS.md](SUBTITLE-LABELS.md). Confirmed timing changes get `[Auto-synced]` in subsequent subtitle metadata titles and filenames; this indicates an adjustment, not independent audio verification. Existing player menus may need a metadata refresh or playback reopen.
+
+## Playback readiness gate
+
+See [PLAYBACK-GATE.md](PLAYBACK-GATE.md) for the optional server-side gate, strict subtitle waits, invalid-payload rejection, and direct-play compatibility limits. When enabled, eligible requests fail instead of returning the original subtitle after the ordinary wait budget.
