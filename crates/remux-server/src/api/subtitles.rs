@@ -317,6 +317,8 @@ async fn aligned_external_response(
     source: &db::Media,
     item_id: Uuid,
     subtitle_id: Option<&str>,
+    source_alias: Option<Uuid>,
+    stream_index: Option<i64>,
     descriptor: &crate::stream::StreamDescriptor,
     bytes: axum::body::Bytes,
     language: Option<&str>,
@@ -377,6 +379,30 @@ async fn aligned_external_response(
                 subtitle_id,
                 language,
             ) {
+                state
+                    .ctx
+                    .store
+                    .save(
+                        key,
+                        status == "aligned",
+                        std::time::Duration::from_secs(24 * 3600),
+                    );
+            }
+        }
+        if let Some(stream_index) = stream_index {
+            let mut source_ids = vec![source_info.id, source.id];
+            if let Some(alias) = source_alias {
+                source_ids.push(alias);
+            }
+            source_ids.sort_unstable();
+            source_ids.dedup();
+            for source_id in source_ids {
+                let key = subtitle_sync_track_index_key(
+                    item_id,
+                    source_id,
+                    stream_index,
+                    language,
+                );
                 state
                     .ctx
                     .store
@@ -567,6 +593,8 @@ async fn sidecar_subtitle_response(
                                         .subtitle
                                         .id,
                                 ),
+                                Some(media_source_id),
+                                Some(stream_index),
                                 descriptor,
                                 bytes,
                                 route
@@ -730,6 +758,8 @@ async fn subtitles_stream_inner(
                                     source,
                                     item_id,
                                     Some(&sub.id),
+                                    Some(media_source_id),
+                                    Some(stream_index),
                                     descriptor,
                                     bytes,
                                     sub.lang
@@ -1130,6 +1160,28 @@ fn subtitle_sync_track_label_key(
     ))
 }
 
+fn subtitle_sync_track_index_key(
+    item_id: Uuid,
+    source_id: Uuid,
+    stream_index: i64,
+    language: Option<&str>,
+) -> String {
+    let mut identity = serde_json::json!({
+        "item": item_id,
+        "source": source_id,
+        "stream_index": stream_index,
+        "language": language.map(str::trim).map(str::to_ascii_lowercase),
+    });
+    identity.sort_all_objects();
+    format!(
+        "subtitle-sync-index:{}",
+        Uuid::new_v5(
+            &Uuid::nil(),
+            &serde_json::to_vec(&identity).unwrap_or_default()
+        )
+    )
+}
+
 pub(crate) fn apply_subtitle_sync_label(
     ctx: &crate::AppContext,
     item_id: Uuid,
@@ -1149,19 +1201,30 @@ pub(crate) fn apply_subtitle_sync_label(
     {
         return;
     }
-    let changed = subtitle_sync_track_label_key(
-        item_id,
-        source,
-        subtitle_id,
-        stream
-            .language
-            .as_deref(),
-    )
-    .and_then(|key| {
-        ctx.store
-            .get::<bool>(&key)
-    })
-    .is_some_and(|value| *value)
+    let changed = ctx
+        .store
+        .get::<bool>(&subtitle_sync_track_index_key(
+            item_id,
+            source.id,
+            stream.index,
+            stream
+                .language
+                .as_deref(),
+        ))
+        .is_some_and(|value| *value)
+        || subtitle_sync_track_label_key(
+            item_id,
+            source,
+            subtitle_id,
+            stream
+                .language
+                .as_deref(),
+        )
+        .and_then(|key| {
+            ctx.store
+                .get::<bool>(&key)
+        })
+        .is_some_and(|value| *value)
         || subtitle_sync_label_key(
             source
                 .path
