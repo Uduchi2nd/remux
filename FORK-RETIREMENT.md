@@ -176,3 +176,8 @@ The playback path change in `87ae4a9f` closes the subtitle-ready gate race for t
 
 A scrub/seek attempt from the player overlay did not yield a reliable visible timestamp jump, so seek/resume is not accepted by this test. Infuse was brought forward during the same iPad session, but its existing mini-player state did not provide a clean, independently selected E18 test; do not count that as an Infuse acceptance. Repeat a deliberate mid-episode seek in VidHub and a fresh E18 start in Infuse before claiming full client-matrix success.
 
+
+
+### VidHub second-episode smoke test — 2026-09-22
+
+After the E18 test, VidHub resumed No Pain No Gain S1E1 Episode 16 from the home Resume Playback row (displayed progress 12:18 of 44:00). Playback continued through several scenes for more than a minute without an error. The source label disappeared with the player controls, so this is an episode-level smoke test only; it does not identify which provider/source played or prove full-episode completion. The test playback was stopped after observation.
