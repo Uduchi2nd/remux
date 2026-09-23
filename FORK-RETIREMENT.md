@@ -164,3 +164,15 @@ Commit `6640ec0e` changes the static playback route: for redirect-enabled extern
 
 Retirement check: run the focused redirect handler test, rebuild/deploy the fork, and on iPad test the first Torrentio/TorBox E18 source in VidHub and Infuse. Verify the route's `Location` goes directly to the CDN (not the Torrentio resolver), first-byte/range responses succeed, playback starts, and seeking works. This change is a redirect-chain reduction, not a deep check for missing middle file pieces; the current default source health filter still only confirms 404/410 with HEAD and cannot prove full-file completeness.
 
+
+
+### Episode 18 iOS playback acceptance — 2026-09-22
+
+After deploying commit `87ae4a9f` (live server SHA256 `59b24593ba9da4782b810b1aa1aef16231eb4623658fad0a0a64e5a33c529ba1`), verified the active Remux binary hash and healthy endpoint on Nimo LXC 111.
+
+On the unlocked iPad, freshly opened No Pain No Gain S1E18 in VidHub and selected the first/default TorBox/Torrentio source. It started after the app's loading screen, showed Vietnamese subtitles, and continued playing through multiple scenes for over two minutes. The player overlay identified “No Pain No Gain Season 1 Episode 18 - Episode 18” and the source label “[TB⚡] Torrent…”. This is the first successful physical VidHub playback of the first TorBox/Torrentio E18 source after the failure.
+
+The playback path change in `87ae4a9f` closes the subtitle-ready gate race for the first source: after Remux has verified readiness, PlaybackInfo advertises the validated final public CDN URL directly. It avoids making VidHub follow the Remux → Torrentio → TorBox API → CDN redirect chain. Later alternate sources retain the subtitle-ready route and readiness behavior. Video bytes remain CDN-to-client; this does not relay the movie through Nimo or the seedbox. The signed CDN target is runtime-only and must not be logged or saved in this note.
+
+A scrub/seek attempt from the player overlay did not yield a reliable visible timestamp jump, so seek/resume is not accepted by this test. Infuse was brought forward during the same iPad session, but its existing mini-player state did not provide a clean, independently selected E18 test; do not count that as an Infuse acceptance. Repeat a deliberate mid-episode seek in VidHub and a fresh E18 start in Infuse before claiming full client-matrix success.
+
