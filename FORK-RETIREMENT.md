@@ -2,6 +2,10 @@
 
 Last reviewed: 2026-09-20. This is a retirement plan, not a claim that stock upstream now passes.
 
+Background preparation, cache freshness, durable jobs, subtitle processing ownership, rollout tests, and their upstream retirement criteria are designed in [BACKGROUND-PREPARATION-DESIGN.md](BACKGROUND-PREPARATION-DESIGN.md). This is a proposal only; it does not describe deployed behavior.
+
+Local implementation is in progress: stream-list job queue and seven-day aligned-subtitle disk cache are not deployed. Remaining provider-specific background checks and verification gaps are listed in the design document.
+
 ## Ownership and source of truth
 
 - Upstream: https://github.com/lostb1t/remux

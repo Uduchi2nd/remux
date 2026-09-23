@@ -1,6 +1,7 @@
 //! Optional subtitle-only worker integration. The video delivery path is untouched.
 use std::time::Duration;
 
+use anyhow::anyhow;
 use axum::body::Bytes;
 use serde::Deserialize;
 use tokio::sync::Semaphore;
@@ -9,7 +10,11 @@ use uuid::Uuid;
 use crate::{AppState, api, db};
 
 const MAX_SUBTITLE_BYTES: usize = 2_000_000;
-const CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
+const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+const MAX_PERSISTED_ALIGNMENT_FILES: usize = 128;
+static ALIGNMENT_CACHE_LAST_PRUNE: std::sync::LazyLock<
+    std::sync::Mutex<Option<std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 static JOB_SLOT: Semaphore = Semaphore::const_new(1);
 
 #[derive(Clone)]
@@ -31,6 +36,123 @@ struct WorkerReport {
     accepted: bool,
     #[serde(default)]
     timing_changed: bool,
+}
+
+#[derive(serde::Serialize, Deserialize)]
+struct PersistedAlignment {
+    created_at_unix: u64,
+    timing_changed: bool,
+    subtitle: String,
+}
+
+fn persisted_result_path(data_dir: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
+    let id = key.strip_prefix("subtitle-alignment-v4:")?;
+    if id.len() != 36 || !id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return None;
+    }
+    Some(data_dir.join("subtitle-alignment-results").join(format!("{id}.json")))
+}
+
+async fn load_persisted_alignment(
+    data_dir: &std::path::Path,
+    key: &str,
+) -> Option<(Outcome, Duration)> {
+    let path = persisted_result_path(data_dir, key)?;
+    let should_prune = if let Ok(mut last_prune) = ALIGNMENT_CACHE_LAST_PRUNE.lock() {
+        let now = std::time::Instant::now();
+        let due = last_prune.is_none_or(|last| {
+            now.duration_since(last) >= Duration::from_secs(6 * 3600)
+        });
+        if due {
+            *last_prune = Some(now);
+        }
+        due
+    } else {
+        false
+    };
+    if should_prune {
+        if let Some(dir) = path.parent() {
+            prune_alignment_cache(dir).await;
+        }
+    }
+    let bytes = tokio::fs::read(&path).await.ok()?;
+    let cached: PersistedAlignment = serde_json::from_slice(&bytes).ok()?;
+    if cached.subtitle.trim().is_empty() || cached.subtitle.len() > MAX_SUBTITLE_BYTES {
+        let _ = tokio::fs::remove_file(path).await;
+        return None;
+    }
+    let age = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH + Duration::from_secs(cached.created_at_unix))
+        .unwrap_or_default();
+    if age >= CACHE_TTL {
+        let _ = tokio::fs::remove_file(path).await;
+        return None;
+    }
+    Some((Outcome::Ready(cached.subtitle, cached.timing_changed), CACHE_TTL - age))
+}
+
+async fn persist_alignment(
+    data_dir: &std::path::Path,
+    key: &str,
+    subtitle: &str,
+    timing_changed: bool,
+) -> anyhow::Result<()> {
+    if subtitle.trim().is_empty() || subtitle.len() > MAX_SUBTITLE_BYTES {
+        anyhow::bail!("refusing to persist empty or oversized aligned subtitle");
+    }
+    let path = persisted_result_path(data_dir, key)
+        .ok_or_else(|| anyhow!("invalid subtitle alignment cache key"))?;
+    let dir = path.parent().expect("alignment result path has parent");
+    tokio::fs::create_dir_all(dir).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let body = serde_json::to_vec(&PersistedAlignment {
+        created_at_unix: now,
+        timing_changed,
+        subtitle: subtitle.to_owned(),
+    })?;
+    let staging = dir.join(format!(".{}.{}.tmp", Uuid::new_v4(), now));
+    tokio::fs::write(&staging, body).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tokio::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    tokio::fs::rename(&staging, &path).await?;
+    prune_alignment_cache(dir).await;
+    Ok(())
+}
+
+async fn prune_alignment_cache(dir: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    let mut files = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+        if !metadata.is_file() || entry.path().extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if modified.elapsed().unwrap_or_default() >= CACHE_TTL {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        } else {
+            files.push((modified, entry.path()));
+        }
+    }
+    files.sort_by_key(|(modified, _)| *modified);
+    let excess = files.len().saturating_sub(MAX_PERSISTED_ALIGNMENT_FILES);
+    for (_, path) in files.into_iter().take(excess) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
 }
 
 pub(super) fn text_codec(codec: Option<&str>) -> bool {
@@ -320,6 +442,14 @@ pub(super) async fn resolve(
         return (original, "unavailable");
     };
     let key = cache_key(source_key, &original);
+    if let Some((cached, ttl)) = load_persisted_alignment(&config.data_dir, &key).await {
+        let weight = match &cached {
+            Outcome::Ready(text, _) => text.len() as u32 + 256,
+            _ => 256,
+        };
+        state.ctx.store.save_with_weight(key.clone(), cached.clone(), weight, ttl);
+        return result(&cached, original);
+    }
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs(
             config
@@ -491,10 +621,11 @@ pub(super) async fn resolve(
         .ok()
         .flatten()
         .unwrap_or(Outcome::Unavailable);
-        let ttl = if matches!(outcome, Outcome::Unavailable) {
-            Duration::from_secs(600)
-        } else {
-            CACHE_TTL
+        let ttl = match &outcome {
+            Outcome::Ready(..) => CACHE_TTL,
+            Outcome::Rejected => Duration::from_secs(300),
+            Outcome::Unavailable => Duration::from_secs(600),
+            Outcome::Pending => Duration::from_secs(900),
         };
         tracing::info!(cache_key = %key, aligned = matches!(outcome, Outcome::Ready(..)),
             "subtitle alignment job finished");
@@ -502,6 +633,18 @@ pub(super) async fn resolve(
             Outcome::Ready(text, _) => text.len() as u32 + 256,
             _ => 256,
         };
+        if let Outcome::Ready(text, timing_changed) = &outcome {
+            if let Err(error) = persist_alignment(
+                &state.ctx.config.data_dir,
+                &key,
+                text,
+                *timing_changed,
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "failed to persist aligned subtitle result");
+            }
+        }
         state
             .ctx
             .store
