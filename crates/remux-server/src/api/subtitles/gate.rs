@@ -269,6 +269,8 @@ pub(crate) async fn ensure_ready(
                         source,
                         item,
                         Some(&sub.id),
+                        None,
+                        None,
                         descriptor,
                         bytes.clone(),
                         sub.lang
@@ -379,6 +381,8 @@ mod tests {
             &state,
             &source,
             Uuid::new_v4(),
+            None,
+            None,
             None,
             &crate::stream::StreamDescriptor::Local("unused.srt".into()),
             axum::body::Bytes::from_static(

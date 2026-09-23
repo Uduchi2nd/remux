@@ -14,11 +14,10 @@ reference, same-language skip and disabled alignment do not mark a subtitle.
 Original-bypass requests do not erase the normal delivery's last-known state.
 
 The label is a last-observed result kept for 24h in the bounded in-memory store.
-It is keyed by item, source path, duration and the addon's stable subtitle ID, so
-signed URL renewal keeps the marker attached to the same advertised track. An
-exact descriptor key remains as a fallback for older callers. A provider replacing
-subtitle contents while reusing its ID is discovered on the next subtitle request.
-Restart clears labels.
+It follows the advertised item, MediaSourceId, subtitle index and language across
+signed URL renewal. The addon's stable subtitle ID and exact descriptor keys remain
+as fallbacks. A provider replacing subtitle contents under the same track identity
+is discovered on the next subtitle request. Restart clears labels.
 
 Menus are normally fetched before the subtitle file. Remux cannot rename a menu
 already held by a player; reopen playback or refresh metadata after the first
