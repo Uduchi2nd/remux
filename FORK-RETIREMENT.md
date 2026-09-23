@@ -185,3 +185,9 @@ A scrub/seek attempt from the player overlay did not yield a reliable visible ti
 ### VidHub second-episode smoke test — 2026-09-22
 
 After the E18 test, VidHub resumed No Pain No Gain S1E1 Episode 16 from the home Resume Playback row (displayed progress 12:18 of 44:00). Playback continued through several scenes for more than a minute without an error. The source label disappeared with the player controls, so this is an episode-level smoke test only; it does not identify which provider/source played or prove full-episode completion. The test playback was stopped after observation.
+
+### Background stream-prefill priority — 2026-09-23
+
+During No Pain No Gain S1E18 playback, the live SQLite queue showed E18 at priority 100, E19 at 100, E20–E22 at 80, and recently played episodes at 40. E18/E19 stream lists had refreshed around 08:51 UTC and were still fresh at the 08:54 UTC inspection; their next refreshes were scheduled for about 09:04–05 UTC. The E19 tie came from the previous monotonic `MAX` upsert retaining a higher old priority.
+
+The queue now assigns E19 (the next episode) priority 200, ahead of the current episode (100), following upcoming episodes (80), and recent history (40). Duplicate enqueue targets keep the highest priority within one playback event; a later playback event replaces stale priority values. This update changes stream-list cache refresh order only. It does not pre-align subtitles or run full Usenet article scans in the background.
