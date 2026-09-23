@@ -588,6 +588,7 @@ async fn items_playbackinfo_inner(
                     .user
                     .id,
             ),
+            true,
         )
         .await;
     }
@@ -1117,7 +1118,9 @@ async fn videos_stream_inner(
         );
         return Ok(no_streams_response().into_response());
     };
-    let descriptor = si.descriptor.clone();
+    let descriptor = si
+        .descriptor
+        .clone();
     let playback_id = q
         .play_session_id
         .clone()
@@ -1207,7 +1210,9 @@ async fn videos_stream_inner(
                 let redirect_url = crate::stream::redirected_client_url(media.id, &si)
                     .await
                     .unwrap_or_else(|| url.clone());
-                return Ok(axum::response::Redirect::temporary(&redirect_url).into_response());
+                return Ok(
+                    axum::response::Redirect::temporary(&redirect_url).into_response()
+                );
             }
         }
 

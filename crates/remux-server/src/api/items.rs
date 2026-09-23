@@ -2274,6 +2274,7 @@ async fn item_for_user(
                             .user
                             .id,
                     ),
+                    false,
                 )
                 .await;
                 for source in sources.iter_mut() {
