@@ -21,9 +21,26 @@ pub struct SubtitleOptions {
     remux_original: bool,
 }
 
-const GOOD_TRACK_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+pub(super) const GOOD_TRACK_CACHE_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 const MAX_PERSISTED_GOOD_TRACKS: usize = 512;
+pub(super) const MAX_PERSISTED_ALIGNMENT_FILES: usize = 512;
+const MAX_PERSISTED_SUBTITLE_CACHE_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_GOOD_TRACK_BYTES: usize = 2_000_000;
+static PERSISTED_SUBTITLE_CACHE_PRUNE_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PersistedSubtitleCacheKind {
+    GoodTrack,
+    Alignment,
+}
+
+struct PersistedSubtitleCacheFile {
+    modified: std::time::SystemTime,
+    path: std::path::PathBuf,
+    bytes: u64,
+    kind: PersistedSubtitleCacheKind,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedGoodTrack {
@@ -134,34 +151,103 @@ async fn save_good_track(
         tokio::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600)).await?;
     }
     tokio::fs::rename(&staging, &path).await?;
-    prune_good_tracks(dir).await;
+    prune_persisted_subtitle_caches(&ctx.config.data_dir).await;
     Ok(())
 }
 
-async fn prune_good_tracks(dir: &std::path::Path) {
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return;
-    };
+pub(super) async fn prune_persisted_subtitle_caches(data_dir: &std::path::Path) {
+    let _guard = PERSISTED_SUBTITLE_CACHE_PRUNE_LOCK.lock().await;
     let mut files = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let Ok(metadata) = entry.metadata().await else {
+    for (directory, kind) in [
+        (
+            "subtitle-good-tracks",
+            PersistedSubtitleCacheKind::GoodTrack,
+        ),
+        (
+            "subtitle-alignment-results",
+            PersistedSubtitleCacheKind::Alignment,
+        ),
+    ] {
+        let Ok(mut entries) = tokio::fs::read_dir(data_dir.join(directory)).await else {
             continue;
         };
-        if !metadata.is_file() || entry.path().extension().is_none_or(|e| e != "json") {
-            continue;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+            let path = entry.path();
+            if !metadata.is_file() || path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+            if modified.elapsed().unwrap_or_default() >= GOOD_TRACK_CACHE_TTL {
+                let _ = tokio::fs::remove_file(path).await;
+            } else {
+                files.push(PersistedSubtitleCacheFile {
+                    modified,
+                    path,
+                    bytes: metadata.len(),
+                    kind,
+                });
+            }
         }
-        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-        if modified.elapsed().unwrap_or_default() >= GOOD_TRACK_CACHE_TTL {
-            let _ = tokio::fs::remove_file(entry.path()).await;
+    }
+
+    let files_to_remove = select_cache_files_to_prune(
+        files,
+        MAX_PERSISTED_SUBTITLE_CACHE_BYTES,
+        MAX_PERSISTED_GOOD_TRACKS,
+        MAX_PERSISTED_ALIGNMENT_FILES,
+    );
+    for file in files_to_remove {
+        let _ = tokio::fs::remove_file(file.path).await;
+    }
+}
+
+fn select_cache_files_to_prune(
+    mut files: Vec<PersistedSubtitleCacheFile>,
+    max_bytes: u64,
+    max_good_tracks: usize,
+    max_alignment_files: usize,
+) -> Vec<PersistedSubtitleCacheFile> {
+    files.sort_by_key(|file| file.modified);
+    let mut total_bytes: u64 = files.iter().map(|file| file.bytes).sum();
+    let mut good_track_count = files
+        .iter()
+        .filter(|file| file.kind == PersistedSubtitleCacheKind::GoodTrack)
+        .count();
+    let mut alignment_count = files
+        .iter()
+        .filter(|file| file.kind == PersistedSubtitleCacheKind::Alignment)
+        .count();
+    let mut pruned = Vec::new();
+
+    loop {
+        let index = if total_bytes > max_bytes {
+            (!files.is_empty()).then_some(0)
+        } else if good_track_count > max_good_tracks {
+            files
+                .iter()
+                .position(|file| file.kind == PersistedSubtitleCacheKind::GoodTrack)
+        } else if alignment_count > max_alignment_files {
+            files
+                .iter()
+                .position(|file| file.kind == PersistedSubtitleCacheKind::Alignment)
         } else {
-            files.push((modified, entry.path()));
+            None
+        };
+        let Some(index) = index else {
+            break;
+        };
+        let file = files.remove(index);
+        total_bytes = total_bytes.saturating_sub(file.bytes);
+        match file.kind {
+            PersistedSubtitleCacheKind::GoodTrack => good_track_count -= 1,
+            PersistedSubtitleCacheKind::Alignment => alignment_count -= 1,
         }
+        pruned.push(file);
     }
-    files.sort_by_key(|(modified, _)| *modified);
-    let excess = files.len().saturating_sub(MAX_PERSISTED_GOOD_TRACKS);
-    for (_, path) in files.into_iter().take(excess) {
-        let _ = tokio::fs::remove_file(path).await;
-    }
+    pruned
 }
 
 use crate::{
@@ -1863,6 +1949,51 @@ mod tests {
     use http::header::HeaderValue;
 
     use crate::integration_test::{auth_header_with_token, authenticated_server};
+
+    fn test_cache_file(
+        path: &str,
+        kind: PersistedSubtitleCacheKind,
+        bytes: u64,
+        modified_secs: u64,
+    ) -> PersistedSubtitleCacheFile {
+        PersistedSubtitleCacheFile {
+            modified: std::time::UNIX_EPOCH + Duration::from_secs(modified_secs),
+            path: path.into(),
+            bytes,
+            kind,
+        }
+    }
+
+    #[test]
+    fn persistent_subtitle_cache_prunes_oldest_for_total_bytes_and_per_cache_counts() {
+        assert_eq!(GOOD_TRACK_CACHE_TTL.as_secs(), 30 * 24 * 3600);
+        assert_eq!(MAX_PERSISTED_SUBTITLE_CACHE_BYTES, 200 * 1024 * 1024);
+        let pruned = select_cache_files_to_prune(
+            vec![
+                test_cache_file("old-good", PersistedSubtitleCacheKind::GoodTrack, 80, 1),
+                test_cache_file("new-alignment", PersistedSubtitleCacheKind::Alignment, 50, 2),
+                test_cache_file("new-good", PersistedSubtitleCacheKind::GoodTrack, 50, 3),
+            ],
+            100,
+            10,
+            10,
+        );
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].path, std::path::PathBuf::from("old-good"));
+
+        let pruned = select_cache_files_to_prune(
+            vec![
+                test_cache_file("old-good", PersistedSubtitleCacheKind::GoodTrack, 1, 1),
+                test_cache_file("new-good", PersistedSubtitleCacheKind::GoodTrack, 1, 2),
+                test_cache_file("alignment", PersistedSubtitleCacheKind::Alignment, 1, 3),
+            ],
+            10,
+            1,
+            1,
+        );
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].path, std::path::PathBuf::from("old-good"));
+    }
 
     fn redirected_source(path: &str, origin: &str) -> api::MediaSourceInfo {
         api::MediaSourceInfo {
