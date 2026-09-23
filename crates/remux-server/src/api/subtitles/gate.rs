@@ -18,6 +18,19 @@ pub(super) fn raw_key(descriptor: &crate::stream::StreamDescriptor) -> String {
     )
 }
 
+pub(super) fn invalid_key(descriptor: &crate::stream::StreamDescriptor) -> String {
+    format!("subtitle-invalid-raw:{}", raw_key(descriptor).trim_start_matches("subtitle-valid-raw:"))
+}
+
+pub(super) fn known_invalid(
+    ctx: &AppContext,
+    descriptor: &crate::stream::StreamDescriptor,
+) -> bool {
+    ctx.store
+        .get::<bool>(&invalid_key(descriptor))
+        .is_some_and(|invalid| *invalid)
+}
+
 pub(super) fn valid_subtitle(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
@@ -261,8 +274,11 @@ pub(crate) async fn ensure_ready(
                     .url
                     .as_ref()
                     .unwrap();
-                let bytes =
-                    super::fetch_external_subtitle_bytes(state, descriptor).await?;
+                let bytes = match super::fetch_external_subtitle_bytes(state, descriptor).await {
+                    Ok(bytes) => bytes,
+                    Err(_) if known_invalid(&state.ctx, descriptor) => continue,
+                    Err(error) => return Err(error),
+                };
                 loop {
                     let response = super::aligned_external_response(
                         state,

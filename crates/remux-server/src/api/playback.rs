@@ -554,6 +554,15 @@ async fn items_playbackinfo_inner(
                             .id,
                         stream,
                     );
+                    super::subtitles::restore_persisted_subtitle_sync_label(
+                        &state.ctx,
+                        id,
+                        label_source.id,
+                        &route.subtitle.id,
+                        route.subtitle.lang.as_deref(),
+                        stream,
+                    )
+                    .await;
                 }
             }
         }
@@ -578,7 +587,7 @@ async fn items_playbackinfo_inner(
             .clone()
             .unwrap_or_default();
         inject_external_subtitles(
-            &state.ctx,
+            &state,
             sub_media,
             &mut media_sources,
             id,
