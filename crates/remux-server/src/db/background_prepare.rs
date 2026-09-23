@@ -14,6 +14,7 @@ pub struct StreamRefreshJob {
     pub media_id: Uuid,
     pub series_id: Option<Uuid>,
     pub attempts: i64,
+    pub priority: i64,
 }
 
 pub async fn enqueue_stream_refresh(
@@ -51,8 +52,8 @@ pub async fn claim_due_stream_refresh(db: &SqlitePool) -> Result<Option<StreamRe
     let mut tx = db.begin().await?;
     let now = Utc::now().naive_utc();
     let now_s = now.to_string();
-    let row = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, i64)>(
-        "SELECT user_id, media_id, series_id, attempts \
+    let row = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, i64, i64)>(
+        "SELECT user_id, media_id, series_id, attempts, priority \
          FROM background_stream_refresh_jobs \
          WHERE run_after <= ? AND (lease_until IS NULL OR lease_until <= ?) \
          ORDER BY priority DESC, run_after ASC LIMIT 1",
@@ -62,7 +63,7 @@ pub async fn claim_due_stream_refresh(db: &SqlitePool) -> Result<Option<StreamRe
     .fetch_optional(&mut *tx)
     .await?;
 
-    let Some((user_id, media_id, series_id, attempts)) = row else {
+    let Some((user_id, media_id, series_id, attempts, priority)) = row else {
         tx.commit().await?;
         return Ok(None);
     };
@@ -85,6 +86,7 @@ pub async fn claim_due_stream_refresh(db: &SqlitePool) -> Result<Option<StreamRe
         media_id,
         series_id,
         attempts,
+        priority,
     }))
 }
 
