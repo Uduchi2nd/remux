@@ -327,23 +327,31 @@ const CONFIRMED_MISSING_TTL: std::time::Duration =
 const OTHER_HEAD_RESULT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 static STREAM_HEAD_CACHE: std::sync::LazyLock<
     std::sync::Mutex<
-        std::collections::HashMap<(Uuid, u64), (std::time::Instant, bool)>,
+        std::collections::HashMap<(Uuid, u64), (std::time::Instant, bool, Option<String>)>,
     >,
 > = std::sync::LazyLock::new(
     || std::sync::Mutex::new(std::collections::HashMap::new()),
 );
 
-/// Returns true only when the stream has a cached or freshly confirmed 404/410.
-/// Timeouts, auth failures, rate limits, and server errors remain eligible for
-/// playback because they may be transient or client-specific.
-pub async fn stream_is_confirmed_missing(id: Uuid, info: &StreamInfo) -> bool {
+#[derive(Default)]
+struct HttpHeadResult {
+    confirmed_missing: bool,
+    redirected_url: Option<String>,
+}
+
+/// Probe an HTTP stream once and share the result between dead-source filtering
+/// and the PlaybackInfo URL rewrite. A server that redirects to a signed CDN
+/// URL can be handed that final URL directly, avoiding clients that fail while
+/// following the add-on-to-CDN redirect themselves. The media body remains
+/// client-to-CDN; Remux handles only a metadata-sized HEAD request.
+async fn check_http_stream(id: Uuid, info: &StreamInfo) -> HttpHeadResult {
     let StreamDescriptor::Http {
         url,
         request_headers,
         ..
     } = &info.descriptor
     else {
-        return false;
+        return HttpHeadResult::default();
     };
 
     // Include the URL identity without retaining signed URLs or tokens in the
@@ -354,9 +362,12 @@ pub async fn stream_is_confirmed_missing(id: Uuid, info: &StreamInfo) -> bool {
     let cache_key = (id, hasher.finish());
     let now = std::time::Instant::now();
     if let Ok(mut cache) = STREAM_HEAD_CACHE.lock() {
-        cache.retain(|_, (expires, _)| *expires > now);
-        if let Some((_, missing)) = cache.get(&cache_key) {
-            return *missing;
+        cache.retain(|_, (expires, _, _)| *expires > now);
+        if let Some((_, missing, redirected_url)) = cache.get(&cache_key) {
+            return HttpHeadResult {
+                confirmed_missing: *missing,
+                redirected_url: redirected_url.clone(),
+            };
         }
     }
 
@@ -369,17 +380,61 @@ pub async fn stream_is_confirmed_missing(id: Uuid, info: &StreamInfo) -> bool {
         tokio::time::timeout(std::time::Duration::from_secs(2), request.send()).await
     {
         let missing = status_confirms_missing(response.status());
+        let redirected_url = response
+            .status()
+            .is_success()
+            // The reqwest redirect client must not carry add-on supplied custom
+            // headers to a different origin. These signed CDN URLs need no
+            // request headers, so only rewrite header-free requests.
+            .then(|| {
+                request_headers
+                    .is_empty()
+                    .then(|| safe_redirect_target(url, response.url().as_str()))
+                    .flatten()
+            })
+            .flatten();
         let ttl = if missing {
             CONFIRMED_MISSING_TTL
         } else {
             OTHER_HEAD_RESULT_TTL
         };
         if let Ok(mut cache) = STREAM_HEAD_CACHE.lock() {
-            cache.insert(cache_key, (now + ttl, missing));
+            cache.insert(cache_key, (now + ttl, missing, redirected_url.clone()));
         }
-        return missing;
+        return HttpHeadResult {
+            confirmed_missing: missing,
+            redirected_url,
+        };
     }
-    false
+    HttpHeadResult::default()
+}
+
+fn safe_redirect_target(original_url: &str, redirected_url: &str) -> Option<String> {
+    let original = url::Url::parse(original_url).ok()?;
+    let redirected = url::Url::parse(redirected_url).ok()?;
+    if redirected == original
+        || !matches!(redirected.scheme(), "http" | "https")
+        || redirected
+            .host_str()
+            .is_none_or(crate::stream::is_internal_host)
+    {
+        return None;
+    }
+    Some(redirected.into())
+}
+
+/// Returns true only when the stream has a cached or freshly confirmed 404/410.
+/// Timeouts, auth failures, rate limits, and server errors remain eligible for
+/// playback because they may be transient or client-specific.
+pub async fn stream_is_confirmed_missing(id: Uuid, info: &StreamInfo) -> bool {
+    check_http_stream(id, info).await.confirmed_missing
+}
+
+/// Return a safe final URL after an HTTP redirect, if a successful HEAD probe
+/// has already resolved one. This keeps signed redirect targets in memory only
+/// and avoids repeating the HEAD during the same short playback-info window.
+pub async fn redirected_client_url(id: Uuid, info: &StreamInfo) -> Option<String> {
+    check_http_stream(id, info).await.redirected_url
 }
 
 /// Remove confirmed-gone HTTP streams from the default source ordering, but
@@ -442,7 +497,9 @@ fn status_confirms_missing(status: http::StatusCode) -> bool {
 
 #[cfg(test)]
 mod confirmed_missing_tests {
-    use super::{retain_missing_with_fallback, status_confirms_missing};
+    use super::{
+        retain_missing_with_fallback, safe_redirect_target, status_confirms_missing,
+    };
     use crate::db::Media;
     use std::collections::HashSet;
     use uuid::Uuid;
@@ -483,6 +540,33 @@ mod confirmed_missing_tests {
         let last_resort = retain_missing_with_fallback(vec![first.clone()], &missing);
         assert_eq!(last_resort.len(), 1);
         assert_eq!(last_resort[0].id, first.id);
+    }
+
+    #[test]
+    fn only_hands_clients_external_http_redirect_targets() {
+        assert_eq!(
+            safe_redirect_target(
+                "https://addon.example/stream",
+                "https://cdn.example/signed-file",
+            )
+            .as_deref(),
+            Some("https://cdn.example/signed-file"),
+        );
+        assert!(safe_redirect_target(
+            "https://addon.example/stream",
+            "https://addon.example/stream",
+        )
+        .is_none());
+        assert!(safe_redirect_target(
+            "https://addon.example/stream",
+            "http://127.0.0.1:8080/private",
+        )
+        .is_none());
+        assert!(safe_redirect_target(
+            "https://addon.example/stream",
+            "file:///private/file",
+        )
+        .is_none());
     }
 }
 

@@ -638,7 +638,19 @@ impl StreamService {
                     if !host_is_internal && redirects {
                         source.is_remote = true;
                         source.protocol = api::MediaProtocol::Http;
-                        source.path = Some(url.clone());
+                        // Some add-on URLs redirect to a signed CDN URL. Infuse
+                        // follows this chain, while VidHub can fail to open the
+                        // same source. The short HEAD probe is shared with dead
+                        // source filtering; handing the final URL to the client
+                        // avoids proxying any media bytes through Remux.
+                        source.path = Some(
+                            crate::stream::redirected_client_url(
+                                effective_stream.id,
+                                si,
+                            )
+                            .await
+                            .unwrap_or_else(|| url.clone()),
+                        );
                     }
                 }
             }
