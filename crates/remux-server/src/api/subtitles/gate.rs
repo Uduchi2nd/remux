@@ -267,6 +267,8 @@ pub(crate) async fn ensure_ready(
                     let response = super::aligned_external_response(
                         state,
                         source,
+                        item,
+                        Some(&sub.id),
                         descriptor,
                         bytes.clone(),
                         sub.lang
@@ -376,6 +378,8 @@ mod tests {
         let response = super::super::aligned_external_response(
             &state,
             &source,
+            Uuid::new_v4(),
+            None,
             &crate::stream::StreamDescriptor::Local("unused.srt".into()),
             axum::body::Bytes::from_static(
                 b"1\n00:00:01,000 --> 00:00:02,000\nOriginal text\n",

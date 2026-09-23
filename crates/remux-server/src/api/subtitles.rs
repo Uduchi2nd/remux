@@ -315,6 +315,8 @@ fn external_subtitle_response(
 async fn aligned_external_response(
     state: &AppState,
     source: &db::Media,
+    item_id: Uuid,
+    subtitle_id: Option<&str>,
     descriptor: &crate::stream::StreamDescriptor,
     bytes: axum::body::Bytes,
     language: Option<&str>,
@@ -358,6 +360,23 @@ async fn aligned_external_response(
             if let Some(key) =
                 subtitle_sync_label_key(path, source_info.run_time_ticks, descriptor)
             {
+                state
+                    .ctx
+                    .store
+                    .save(
+                        key,
+                        status == "aligned",
+                        std::time::Duration::from_secs(24 * 3600),
+                    );
+            }
+        }
+        if let Some(subtitle_id) = subtitle_id {
+            if let Some(key) = subtitle_sync_track_label_key(
+                item_id,
+                &source_info,
+                subtitle_id,
+                language,
+            ) {
                 state
                     .ctx
                     .store
@@ -542,6 +561,12 @@ async fn sidecar_subtitle_response(
                             aligned_external_response(
                                 state,
                                 &source,
+                                item_id,
+                                Some(
+                                    &route
+                                        .subtitle
+                                        .id,
+                                ),
                                 descriptor,
                                 bytes,
                                 route
@@ -703,6 +728,8 @@ async fn subtitles_stream_inner(
                                 return Ok(aligned_external_response(
                                     &state,
                                     source,
+                                    item_id,
+                                    Some(&sub.id),
                                     descriptor,
                                     bytes,
                                     sub.lang
@@ -1069,10 +1096,46 @@ fn subtitle_sync_label_key(
     ))
 }
 
+/// The descriptor-keyed label is exact but can miss when an addon renews a
+/// signed subtitle URL between PlaybackInfo and subtitle delivery. Subtitle IDs
+/// are stable across those URL renewals, so the second key follows the advertised
+/// track while remaining scoped to the item and source.
+fn subtitle_sync_track_label_key(
+    item_id: Uuid,
+    source: &api::MediaSourceInfo,
+    subtitle_id: &str,
+    language: Option<&str>,
+) -> Option<String> {
+    let path = source
+        .path
+        .as_deref()
+        .filter(|path| !path.is_empty())?;
+    if subtitle_id
+        .trim()
+        .is_empty()
+    {
+        return None;
+    }
+    let mut identity = serde_json::json!({
+        "item": item_id,
+        "path": path,
+        "duration": source.run_time_ticks,
+        "subtitle_id": subtitle_id,
+        "language": language,
+    });
+    identity.sort_all_objects();
+    Some(format!(
+        "subtitle-sync-track:{}",
+        Uuid::new_v5(&Uuid::nil(), &serde_json::to_vec(&identity).ok()?)
+    ))
+}
+
 pub(crate) fn apply_subtitle_sync_label(
     ctx: &crate::AppContext,
+    item_id: Uuid,
     source: &api::MediaSourceInfo,
     descriptor: &crate::stream::StreamDescriptor,
+    subtitle_id: &str,
     stream: &mut api::MediaStream,
 ) {
     if ctx
@@ -1086,18 +1149,31 @@ pub(crate) fn apply_subtitle_sync_label(
     {
         return;
     }
-    let changed = subtitle_sync_label_key(
-        source
-            .path
+    let changed = subtitle_sync_track_label_key(
+        item_id,
+        source,
+        subtitle_id,
+        stream
+            .language
             .as_deref(),
-        source.run_time_ticks,
-        descriptor,
     )
     .and_then(|key| {
         ctx.store
             .get::<bool>(&key)
     })
-    .is_some_and(|value| *value);
+    .is_some_and(|value| *value)
+        || subtitle_sync_label_key(
+            source
+                .path
+                .as_deref(),
+            source.run_time_ticks,
+            descriptor,
+        )
+        .and_then(|key| {
+            ctx.store
+                .get::<bool>(&key)
+        })
+        .is_some_and(|value| *value);
     if changed {
         mark_subtitle_auto_synced(stream);
     }
@@ -1272,7 +1348,14 @@ pub(crate) async fn inject_external_subtitles(
                 .url
                 .as_ref()
             {
-                apply_subtitle_sync_label(ctx, source, descriptor, &mut stream);
+                apply_subtitle_sync_label(
+                    ctx,
+                    item_id,
+                    source,
+                    descriptor,
+                    &sub.id,
+                    &mut stream,
+                );
             }
             if wants_default && i == 0 {
                 stream.is_default = Some(true);

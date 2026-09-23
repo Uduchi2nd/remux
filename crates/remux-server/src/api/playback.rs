@@ -546,8 +546,12 @@ async fn items_playbackinfo_inner(
                 {
                     super::subtitles::apply_subtitle_sync_label(
                         &state.ctx,
+                        id,
                         &label_source,
                         descriptor,
+                        &route
+                            .subtitle
+                            .id,
                         stream,
                     );
                 }
