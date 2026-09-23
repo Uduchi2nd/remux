@@ -32,12 +32,12 @@ The 15-minute value is both the target freshness window and the maximum normal r
 
 Record a small, privacy-conscious playback activity row when playback starts and periodically while it advances. On a start event:
 
-1. Enqueue preparation for the current episode/source at highest background priority. Playback itself is not held for background work.
-2. Resolve the next one to three *currently available* episodes in the same series using Jellyfin season/episode order and enqueue their listings and low-cost checks.
+1. Playback itself always wins and is not held for background work. Enqueue the next episode at the highest background priority as soon as playback starts.
+2. Resolve the next one to three *currently available* episodes in the same series using Jellyfin season/episode order and enqueue their listings and low-cost checks. The first next episode outranks the current-episode refresh, following episodes, and history refreshes.
 3. Refresh work for every episode the user played in the last seven days. Collapse duplicate requests across devices/users when the underlying data is user-independent; keep user-specific authorization and watch history separate.
 4. Do not crawl an entire library, prefetch whole video files, or queue work for every alternate source without a limit.
 
-The active request always wins. A practical queue order is: (1) work blocking a current playback request, (2) current episode background refresh, (3) next episode listings and cheap probes, (4) refresh recently played items, (5) expensive subtitle reference extraction. Set global and per-provider concurrency caps, a bounded queue, and per-item deduplication. On overload, discard/re-coalesce low-priority refresh work rather than delay playback.
+The active request always wins. A practical queue order is: (1) work blocking a current playback request, (2) the next episode's listing and cheap checks, (3) other upcoming episodes, (4) current-episode background refresh, (5) recently played items, (6) expensive subtitle reference extraction. Set global and per-provider concurrency caps, a bounded queue, and per-item deduplication. On overload, discard/re-coalesce low-priority refresh work rather than delay playback.
 
 ### Activity-based background cadence
 
@@ -145,13 +145,10 @@ Track code changes and deployed acceptance evidence in `FORK-RETIREMENT.md`. A c
 
 ## Current implementation status (2026-09-23)
 
-Implemented in the local working tree, pending compilation and live validation:
+The stream-list prefill queue is deployed on `remote-hls-sources` (commit `48fdc4f`). The live No Pain No Gain S1E18 session confirmed that stream-list refresh jobs are created for the current episode, the next three available episodes, and up to 100 episodes played by the same user in the series during the prior week. The worker completed an initial pass and kept 16 episode rows queued for their 12–14 minute refresh window. Each refresh updates the library cache; it does not download media bytes.
 
-- Configurable stream-list freshness, default 15 minutes, and a durable SQLite queue for stream-list refreshes.
-- Playback-start enqueueing for the current episode, next three available episodes, and up to 100 episodes the same user played in the series over the last seven days. The single worker spaces work by two seconds, refreshes warm active-series entries around minutes 12–14, and stops cycling after 24 hours without activity.
-- Empty addon responses refresh the cache timestamp while retaining last-known-good stream rows. Transient errors back off; inactive-series jobs are removed.
-- Successful non-empty aligned subtitle outputs are written atomically under the Remux data directory and retained for seven days, capped at 128 result files. Empty/rejected output is not persisted; rejected and unavailable results use short in-memory negative-cache windows.
+Queue priority policy: the next episode is priority 200, current episode 100, the following two upcoming episodes 80, and other recent episodes 40. Duplicate targets within one playback event keep the highest applicable priority. A later playback event replaces stale queue priority values, so a former “next episode” does not keep its boost indefinitely. Playback-start enqueueing does not block playback; queue work is spaced by two seconds, and active-series refreshes stop after 24 hours without activity.
 
-Still not implemented: background redirect resolution, automatic pre-alignment of next-episode subtitles, persistent resumable Usenet article coverage, and background 100% Usenet existence scans. Remux has NZB identifiers in source metadata but no supported article-check client/API. The 30% playback triage currently belongs to UsenetStreamer. The full-scan feature needs a supported UsenetStreamer/NzbDAV job interface that reports per-file progress and can resume; do not probe undocumented routes or claim 100% based on the current 30% check.
+Stream-list freshness defaults to 15 minutes. Empty addon responses retain last-known-good stream rows; transient errors back off. Successful non-empty aligned subtitle results are stored atomically under the Remux data directory for seven days, capped at 128 result files; empty or rejected results are not persisted.
 
-The foreground stream-list TTL change, queue fairness, signed-URL expiry behavior, subtitle-cache privacy/cleanup, full tests and real-client playback still need validation before deployment. This branch has existing user edits; build/deploy tooling requires a clean tracked tree, so do not commit or deploy until those edits are reviewed and intentionally included or saved separately.
+Still not implemented: background refresh of resolved redirect targets, automatic pre-alignment of next-episode subtitles, persistent resumable Usenet article coverage, and background 100% Usenet existence scans. The current 30% playback triage belongs to UsenetStreamer; a complete background scan needs a supported per-file progress API. The live priority change and refresh timing should continue to be observed under real episode playback.
