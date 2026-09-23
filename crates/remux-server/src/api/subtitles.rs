@@ -1575,8 +1575,62 @@ fn mark_subtitle_auto_synced(stream: &mut api::MediaStream) {
     }
 }
 
-/// Add prefetched subtitles to PlaybackInfo sources. The context-aware entry
-/// point also labels tracks that a previous request successfully auto-synced.
+/// Keep the readiness gate away from a validated direct CDN redirect when
+/// PlaybackInfo already waited for the first source. Other versions use the
+/// gate so they are checked on demand before playback starts.
+fn has_verified_external_redirect(source: &api::MediaSourceInfo) -> bool {
+    if !source.is_remote || !matches!(source.protocol, api::MediaProtocol::Http) {
+        return false;
+    }
+    let Some(path) = source.path.as_deref() else {
+        return false;
+    };
+    let Some(origin) = source
+        .remux
+        .as_ref()
+        .and_then(|r| r.provider_info.as_ref())
+        .and_then(|p| p.get("descriptor"))
+        .and_then(|d| d.get("Http"))
+        .and_then(|h| h.get("url"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    if path == origin {
+        return false;
+    }
+    url::Url::parse(path).ok().is_some_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url
+                .host_str()
+                .is_some_and(|host| !crate::stream::is_internal_host(host))
+    })
+}
+
+fn advertise_subtitle_gate(
+    ctx: &crate::AppContext,
+    source: &mut api::MediaSourceInfo,
+    item_id: Uuid,
+    api_key: &str,
+    index: usize,
+    release_ready_first_redirect: bool,
+) {
+    if should_preserve_ready_redirect(source, index, release_ready_first_redirect) {
+        return;
+    }
+    gate::advertise(ctx, source, item_id, api_key);
+}
+
+fn should_preserve_ready_redirect(
+    source: &api::MediaSourceInfo,
+    index: usize,
+    release_ready_first_redirect: bool,
+) -> bool {
+    release_ready_first_redirect && index == 0 && has_verified_external_redirect(source)
+}
+
+/// Add prefetched subtitles to PlaybackInfo sources. Tests and callers without
+/// context omit alignment labels and readiness routing.
 pub(crate) fn append_external_subtitles(
     media_sources: &mut [api::MediaSourceInfo],
     subs: &[crate::addons::SubtitleInfo],
@@ -1595,6 +1649,7 @@ pub(crate) fn append_external_subtitles(
         item_id,
         api_key,
         dedup,
+        false,
     );
 }
 
@@ -1607,6 +1662,7 @@ pub(crate) fn append_external_subtitles_with_context(
     item_id: Uuid,
     api_key: &str,
     dedup: SubtitleDedupSettings,
+    release_ready_first_redirect: bool,
 ) {
     append_external_subtitles_inner(
         Some(ctx),
@@ -1617,6 +1673,7 @@ pub(crate) fn append_external_subtitles_with_context(
         item_id,
         api_key,
         dedup,
+        release_ready_first_redirect,
     );
 }
 
@@ -1629,8 +1686,9 @@ fn append_external_subtitles_inner(
     item_id: Uuid,
     api_key: &str,
     dedup: SubtitleDedupSettings,
+    release_ready_first_redirect: bool,
 ) {
-    for source in media_sources.iter_mut() {
+    for (index, source) in media_sources.iter_mut().enumerate() {
         if !has_real_probe_data(source) {
             continue;
         }
@@ -1674,7 +1732,14 @@ fn append_external_subtitles_inner(
             source.media_streams.push(stream);
         }
         if let Some(ctx) = ctx {
-            gate::advertise(ctx, source, item_id, api_key);
+            advertise_subtitle_gate(
+                ctx,
+                source,
+                item_id,
+                api_key,
+                index,
+                release_ready_first_redirect,
+            );
         }
     }
 }
@@ -1691,16 +1756,27 @@ pub(crate) async fn inject_external_subtitles(
     user_id: Option<Uuid>,
     device_profile: Option<&api::DeviceProfile>,
     dedup: SubtitleDedupSettings,
+    release_ready_first_redirect: bool,
 ) {
     let subs = ctx
         .addons
         .fetch_subtitles(subtitle_media, ctx, false, user_id)
         .await;
     if subs.is_empty() {
+        for (index, source) in media_sources.iter_mut().enumerate() {
+            advertise_subtitle_gate(
+                ctx,
+                source,
+                item_id,
+                api_key,
+                index,
+                release_ready_first_redirect,
+            );
+        }
         return;
     }
 
-    for source in media_sources.iter_mut() {
+    for (index, source) in media_sources.iter_mut().enumerate() {
         if !has_real_probe_data(source) {
             continue;
         }
@@ -1741,7 +1817,14 @@ pub(crate) async fn inject_external_subtitles(
             }
             source.media_streams.push(stream);
         }
-        gate::advertise(ctx, source, item_id, api_key);
+        advertise_subtitle_gate(
+            ctx,
+            source,
+            item_id,
+            api_key,
+            index,
+            release_ready_first_redirect,
+        );
     }
 }
 
@@ -1889,6 +1972,45 @@ mod tests {
     use http::header::HeaderValue;
 
     use crate::integration_test::{auth_header_with_token, authenticated_server};
+
+    fn redirected_source(path: &str, origin: &str) -> api::MediaSourceInfo {
+        api::MediaSourceInfo {
+            path: Some(path.into()),
+            protocol: api::MediaProtocol::Http,
+            is_remote: true,
+            remux: Some(api::MediaSourceRemuxInfo {
+                provider_info: Some(serde_json::json!({
+                    "descriptor": {"Http": {"url": origin}}
+                })),
+                source: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_releases_a_verified_external_redirect_for_prepared_first_source() {
+        let source = redirected_source(
+            "https://store.example.net/signed-file",
+            "https://torrentio.example/resolve/file",
+        );
+        assert!(should_preserve_ready_redirect(&source, 0, true));
+        assert!(!should_preserve_ready_redirect(&source, 1, true));
+        assert!(!should_preserve_ready_redirect(&source, 0, false));
+
+        let unverified = redirected_source(
+            "https://torrentio.example/resolve/file",
+            "https://torrentio.example/resolve/file",
+        );
+        assert!(!should_preserve_ready_redirect(&unverified, 0, true));
+
+        let internal = redirected_source(
+            "http://127.0.0.1:3000/private",
+            "https://torrentio.example/resolve/file",
+        );
+        assert!(!should_preserve_ready_redirect(&internal, 0, true));
+    }
+
     #[tokio::test]
     async fn subtitle_alias_follows_probed_source_and_is_device_scoped() {
         let (_server, guard, _token) = authenticated_server().await;

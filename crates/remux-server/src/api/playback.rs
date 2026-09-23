@@ -852,6 +852,7 @@ async fn items_playbackinfo_inner(
             .access_token
             .expose(),
         subtitle_dedup,
+        true,
     );
 
     // Re-resolve defaults after external subtitles were injected so language
@@ -1693,7 +1694,9 @@ async fn videos_stream_inner(
                 let redirect_url = crate::stream::redirected_client_url(media.id, &si)
                     .await
                     .unwrap_or_else(|| url.clone());
-                return Ok(axum::response::Redirect::temporary(&redirect_url).into_response());
+                return Ok(
+                    axum::response::Redirect::temporary(&redirect_url).into_response()
+                );
             }
         }
 

@@ -2540,6 +2540,9 @@ async fn item_for_user(
                         .user
                         .id,
                 ),
+                persisted_device_profile.as_ref(),
+                super::subtitles::SubtitleDedupSettings::from_config(&server_config),
+                false,
             )
             .await;
             for source in sources.iter_mut() {
