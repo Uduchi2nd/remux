@@ -3147,12 +3147,6 @@ impl AddonService {
         }
 
         let now = chrono::Utc::now().naive_utc();
-        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
-            .bind(now)
-            .bind(media.id)
-            .execute(&ctx.db)
-            .await?;
-        media.streams_refreshed_at = Some(now);
         let mut sources: Vec<db::Media> = deduped
             .into_iter()
             .enumerate()
@@ -3187,6 +3181,17 @@ impl AddonService {
         }
 
         db::Media::upsert(&ctx.db, &sources).await?;
+
+        // Publish the fresh timestamp only after the child stream rows exist.
+        // Otherwise a concurrent playback lookup can observe a fresh parent,
+        // skip refresh_streams(), then filter out every old child row before
+        // this refresh has upserted the replacement rows.
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(media.id)
+            .execute(&ctx.db)
+            .await?;
+        media.streams_refreshed_at = Some(now);
 
         // delete stale items
         sqlx::query(
