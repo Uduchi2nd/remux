@@ -1117,7 +1117,7 @@ async fn videos_stream_inner(
         );
         return Ok(no_streams_response().into_response());
     };
-    let descriptor = si.descriptor;
+    let descriptor = si.descriptor.clone();
     let playback_id = q
         .play_session_id
         .clone()
@@ -1198,7 +1198,16 @@ async fn videos_stream_inner(
                     })
                     .unwrap_or(false)
             {
-                return Ok(axum::response::Redirect::temporary(url).into_response());
+                // Avoid making clients traverse the add-on redirect chain
+                // (for example Remux -> Torrentio -> TorBox API -> CDN).
+                // VidHub can fail that chain even though the final CDN URL is
+                // healthy. The shared HEAD check is metadata-only; using its
+                // verified final target still sends all media bytes directly
+                // from the CDN to the client.
+                let redirect_url = crate::stream::redirected_client_url(media.id, &si)
+                    .await
+                    .unwrap_or_else(|| url.clone());
+                return Ok(axum::response::Redirect::temporary(&redirect_url).into_response());
             }
         }
 
