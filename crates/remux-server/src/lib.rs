@@ -377,6 +377,9 @@ pub async fn init_app(
     ctx.signals
         .register(services::media_tracker::MediaTrackerSubscriber { ctx: ctx.clone() });
     ctx.signals
+        .register(services::background_prepare::BackgroundPrepareSubscriber { ctx: ctx.clone() });
+    services::background_prepare::BackgroundPrepareSubscriber::start_worker(ctx.clone());
+    ctx.signals
         .register(api::webhooks::WebhookSubscriber { ctx: ctx.clone() });
 
     // Sync intro items at startup (best-effort; errors are logged not fatal).
@@ -577,6 +580,14 @@ fn default_subtitle_alignment_wait_seconds() -> u64 {
     10
 }
 
+fn default_stream_list_cache_ttl_secs() -> u64 {
+    15 * 60
+}
+
+fn default_background_stream_refresh_enabled() -> bool {
+    true
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Config {
     /// Optional private subtitle alignment worker. Disabled unless configured.
@@ -591,6 +602,12 @@ pub struct Config {
     /// Bearer token file, so secrets never appear in serialized configuration.
     #[serde(default)]
     pub subtitle_alignment_token_file: Option<std::path::PathBuf>,
+    /// Freshness window for addon stream candidate lists; warm jobs refresh before expiry.
+    #[serde(default = "default_stream_list_cache_ttl_secs")]
+    pub stream_list_cache_ttl_secs: u64,
+    /// Prepare current, next, and recently played episode stream lists in the background.
+    #[serde(default = "default_background_stream_refresh_enabled")]
+    pub background_stream_refresh_enabled: bool,
     #[serde(default = "default_data_dir")]
     pub data_dir: std::path::PathBuf,
     /// `None` means derive from `data_dir` — call `resolve()` after loading.
@@ -753,6 +770,8 @@ impl Default for Config {
             subtitle_alignment_wait_seconds: default_subtitle_alignment_wait_seconds(),
             subtitle_alignment_gate_base_url: None,
             subtitle_alignment_token_file: None,
+            stream_list_cache_ttl_secs: default_stream_list_cache_ttl_secs(),
+            background_stream_refresh_enabled: default_background_stream_refresh_enabled(),
             data_dir: default_data_dir(),
             database_url: None,
             torrent_data_dir: None,
