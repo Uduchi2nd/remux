@@ -3000,16 +3000,37 @@ impl AddonService {
         ctx: &AppContext,
         user_id: Option<Uuid>,
     ) -> Result<()> {
-        const STREAMS_TTL_SECS: i64 = 60;
+        self.refresh_streams_inner(media, ctx, user_id, false).await
+    }
+
+    /// Refresh streams even when the cache is still technically fresh. Used by
+    /// the background scheduler to renew warm entries before their 15-minute TTL.
+    pub async fn refresh_streams_background(
+        &self,
+        media: &mut db::Media,
+        ctx: &AppContext,
+        user_id: Option<Uuid>,
+    ) -> Result<()> {
+        self.refresh_streams_inner(media, ctx, user_id, true).await
+    }
+
+    async fn refresh_streams_inner(
+        &self,
+        media: &mut db::Media,
+        ctx: &AppContext,
+        user_id: Option<Uuid>,
+        force: bool,
+    ) -> Result<()> {
+        let streams_ttl_secs = ctx.config.stream_list_cache_ttl_secs.clamp(60, 60 * 60) as i64;
         static STREAM_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
 
         // Fast path: TTL not expired — skip the lock entirely.
         let is_fresh = |refreshed: Option<chrono::NaiveDateTime>| {
             refreshed.is_some_and(|r| {
-                (chrono::Utc::now().naive_utc() - r).num_seconds() < STREAMS_TTL_SECS
+                (chrono::Utc::now().naive_utc() - r).num_seconds() < streams_ttl_secs
             })
         };
-        if is_fresh(media.streams_refreshed_at) {
+        if !force && is_fresh(media.streams_refreshed_at) {
             return Ok(());
         }
 
@@ -3028,7 +3049,7 @@ impl AddonService {
         .ok()
         .flatten()
         .flatten();
-        if is_fresh(refreshed_at) {
+        if !force && is_fresh(refreshed_at) {
             media.streams_refreshed_at = refreshed_at;
             return Ok(());
         }
@@ -3143,6 +3164,16 @@ impl AddonService {
         };
         info!(streams = deduped.len(), ?sources, elapsed = ?instant.elapsed(), "streams synced");
         if deduped.is_empty() {
+            // Keep last-known-good candidates when an addon temporarily returns
+            // no streams, but record the successful empty refresh to avoid
+            // hammering providers on every metadata request.
+            let now = chrono::Utc::now().naive_utc();
+            sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(media.id)
+                .execute(&ctx.db)
+                .await?;
+            media.streams_refreshed_at = Some(now);
             return Ok(());
         }
 
