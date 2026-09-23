@@ -21,12 +21,13 @@ discard a good version or its `[Auto-synced]` marker. Cache filenames are hashed
 signed URLs are not stored. The alignment result remains scoped to its media source
 and exact subtitle contents.
 
-Remux validates candidate external subtitle contents before advertising them. An
-empty, malformed, HTML, or error payload with no timed cues is omitted from fresh
-metadata; confirmed invalid responses are negatively cached for 15 minutes, while
-timeouts and other transient provider failures are not treated as bad subtitles.
-The subtitle-delivery route applies the same filter so hidden tracks do not shift
-the advertised stream indexes.
+Remux advertises an external subtitle only after it has fetched and validated a
+copy with timed dialogue cues, or can load a previously validated copy retained for
+seven days. Empty, malformed, HTML, error, unavailable, or not-yet-verified tracks
+are omitted from metadata. This fails closed when a provider times out or returns
+a transient error; it does not classify that response as a bad subtitle. Confirmed
+invalid responses are negatively cached for 15 minutes. The subtitle-delivery
+route applies the same filter so hidden tracks do not shift the advertised indexes.
 
 Menus are normally fetched before the subtitle file. Remux cannot rename a menu
 already held by a player; reopen playback or refresh metadata after the first
