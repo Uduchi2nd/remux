@@ -15,15 +15,17 @@ Original-bypass requests do not erase the normal delivery's last-known state.
 
 The label follows the item, source ID, stable subtitle ID and language rather than
 the signed provider URL or rewritten source path. Remux persists validated original
-subtitle text and the successful per-source result on disk for seven days (up to
-512 track records), so a renewed/broken provider URL or a Remux restart does not
-discard a good version or its `[Auto-synced]` marker. Cache filenames are hashed;
-signed URLs are not stored. The alignment result remains scoped to its media source
-and exact subtitle contents.
+subtitle text and the successful per-source result on disk for up to 30 days,
+subject to a shared 200 MiB budget across the raw-good and aligned-result caches
+and a 512-record cap per cache. Oldest records are removed first when a limit is
+reached. A renewed/broken provider URL or Remux restart therefore does not discard
+a good version or its `[Auto-synced]` marker. Cache filenames are hashed; signed
+URLs are not stored. Alignment remains scoped to its media source and exact content.
 
 Remux advertises an external subtitle only after it has fetched and validated a
-copy with timed dialogue cues, or can load a previously validated copy retained for
-seven days. Empty, malformed, HTML, error, unavailable, or not-yet-verified tracks
+copy with timed dialogue cues, or can load a previously validated copy retained
+for up to 30 days within the shared 200 MiB subtitle-cache budget. Empty, malformed,
+HTML, error, unavailable, or not-yet-verified tracks
 are omitted from metadata. This fails closed when a provider times out or returns
 a transient error; it does not classify that response as a bad subtitle. Confirmed
 invalid responses are negatively cached for 15 minutes. The subtitle-delivery
@@ -91,3 +93,10 @@ have no eligible alignment reference, so they remain unmarked. Empty, malformed,
 HTML, error, unavailable, and not-yet-verified tracks are now omitted from
 metadata. No empty E18 provider candidate was available as a live negative
 sample. No physical player playback was tested.
+
+
+## 30-day subtitle cache budget — 2026-09-23
+
+Production binary SHA256: `edb69cc8e3ac666246cd4aeb8ff89d5878a727fb9db2c4c0a11c3ca107862ec3` (build commit `c9894161`; canonical source commit `464f834c`). Persisted validated originals and aligned outputs share a 200 MiB aggregate budget with 30-day expiry; oldest files are evicted first when size or the per-cache 512-file cap is exceeded. The global in-memory Remux store remains separately weighted and capped at 128 MiB.
+
+After restart, No Pain No Gain S01E18 PlaybackInfo returned HTTP 200 with Torrentio and Usenet Vietnamese tracks still `[Auto-synced]`. All four advertised external Vietnamese subtitle routes returned HTTP 200 with 1,012 timed cues. The persisted subtitle caches contained 11 files totaling 842,862 bytes (six originals/good tracks and five aligned results). Cache-budget/pruning and empty-subtitle validation regression tests passed. LXC 111 rootfs was expanded online from 10 GiB to 12 GiB; it has 2.3 GiB free. Pre-resize config backup: `/root/remux-patch/lxc111-pre-subtitle-cache-resize-20260923.conf`. Previous binary rollback: `/root/remux-patch/remux-server-validated-only-22ddbc83`.
