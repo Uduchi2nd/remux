@@ -10,8 +10,7 @@ use uuid::Uuid;
 use crate::{AppState, api, db};
 
 const MAX_SUBTITLE_BYTES: usize = 2_000_000;
-const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
-const MAX_PERSISTED_ALIGNMENT_FILES: usize = 512;
+const CACHE_TTL: Duration = super::GOOD_TRACK_CACHE_TTL;
 static ALIGNMENT_CACHE_LAST_PRUNE: std::sync::LazyLock<
     std::sync::Mutex<Option<std::time::Instant>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
@@ -71,9 +70,7 @@ async fn load_persisted_alignment(
         false
     };
     if should_prune {
-        if let Some(dir) = path.parent() {
-            prune_alignment_cache(dir).await;
-        }
+        super::prune_persisted_subtitle_caches(data_dir).await;
     }
     let bytes = tokio::fs::read(&path).await.ok()?;
     let cached: PersistedAlignment = serde_json::from_slice(&bytes).ok()?;
@@ -125,35 +122,10 @@ async fn persist_alignment(
         tokio::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600)).await?;
     }
     tokio::fs::rename(&staging, &path).await?;
-    prune_alignment_cache(dir).await;
+    super::prune_persisted_subtitle_caches(data_dir).await;
     Ok(())
 }
 
-async fn prune_alignment_cache(dir: &std::path::Path) {
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return;
-    };
-    let mut files = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let Ok(metadata) = entry.metadata().await else {
-            continue;
-        };
-        if !metadata.is_file() || entry.path().extension().is_none_or(|e| e != "json") {
-            continue;
-        }
-        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-        if modified.elapsed().unwrap_or_default() >= CACHE_TTL {
-            let _ = tokio::fs::remove_file(entry.path()).await;
-        } else {
-            files.push((modified, entry.path()));
-        }
-    }
-    files.sort_by_key(|(modified, _)| *modified);
-    let excess = files.len().saturating_sub(MAX_PERSISTED_ALIGNMENT_FILES);
-    for (_, path) in files.into_iter().take(excess) {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-}
 
 pub(super) fn text_codec(codec: Option<&str>) -> bool {
     matches!(
