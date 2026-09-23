@@ -82,12 +82,12 @@ The iPad was disconnected from USB, so no new physical client menu check is clai
 
 ## Verified deployment — 2026-09-23
 
-Production binary SHA256: `9db6cdaab2d67c796ad720acee814735a56d82397d44f6055d11e80a1b0dbffa`.
-On No Pain No Gain S01E18, the Torrentio and Usenet Vietnamese tracks each
-returned HTTP 200, `aligned`, and 1,012 timed cues. Both displayed
-`[Auto-synced]` in fresh PlaybackInfo. The two vnphim tracks returned HTTP 200,
-`no-reference`, and 1,012 cues, so they remained unmarked. After restarting
-Remux, fresh PlaybackInfo restored the aligned labels from the on-disk cache.
-No empty E18 candidate was available as a live negative sample; empty and
-malformed payloads are filtered by the shared structural validator before the
-track is advertised. No physical player playback was tested.
+Production binary SHA256: `22ddbcb8367931d071a21c5953fe4c12c7dc63662c0b05926a0c21532f79968d` (build commit `5e644c9f`; canonical commit `6d1c75e7`).
+On No Pain No Gain S01E18, fresh PlaybackInfo returned HTTP 200 after restarting
+Remux. The Torrentio and Usenet Vietnamese tracks remained `[Auto-synced]` from
+the seven-day on-disk cache. All four advertised external Vietnamese subtitle
+routes returned HTTP 200 with 1,012 timed cues; the vnphim tracks are valid but
+have no eligible alignment reference, so they remain unmarked. Empty, malformed,
+HTML, error, unavailable, and not-yet-verified tracks are now omitted from
+metadata. No empty E18 provider candidate was available as a live negative
+sample. No physical player playback was tested.
