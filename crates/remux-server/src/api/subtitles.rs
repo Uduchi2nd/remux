@@ -1709,23 +1709,29 @@ async fn validate_external_subtitles_for_advertising(
 
     let mut advertised = Vec::with_capacity(subs.len());
     for sub in subs {
-        if let Some(descriptor) = sub.url.as_ref() {
-            let cached_raw_key = good_track_key(
-                "raw",
-                item_id,
-                None,
-                &sub.id,
-                sub.lang.as_deref(),
-                None,
-            );
-            let has_saved_good_copy = if let Some(key) = cached_raw_key {
-                load_good_track(&state.ctx, &key).await.is_some()
-            } else {
-                false
-            };
-            if !has_saved_good_copy && gate::known_invalid(&state.ctx, descriptor) {
-                continue;
-            }
+        let Some(descriptor) = sub.url.as_ref() else {
+            continue;
+        };
+        let cached_raw_key = good_track_key(
+            "raw",
+            item_id,
+            None,
+            &sub.id,
+            sub.lang.as_deref(),
+            None,
+        );
+        let has_saved_good_copy = if let Some(key) = cached_raw_key {
+            load_good_track(&state.ctx, &key).await.is_some()
+        } else {
+            false
+        };
+        let has_fresh_valid_copy = state
+            .ctx
+            .store
+            .get::<axum::body::Bytes>(&gate::raw_key(descriptor))
+            .is_some();
+        if !has_saved_good_copy && !has_fresh_valid_copy {
+            continue;
         }
         advertised.push(sub);
     }
