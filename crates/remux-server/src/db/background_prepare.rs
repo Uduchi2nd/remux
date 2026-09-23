@@ -3,6 +3,11 @@ use chrono::{Duration, Utc};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+pub const PRIORITY_NEXT_EPISODE: i64 = 200;
+pub const PRIORITY_CURRENT_EPISODE: i64 = 100;
+pub const PRIORITY_UPCOMING_EPISODE: i64 = 80;
+pub const PRIORITY_RECENT_EPISODE: i64 = 40;
+
 #[derive(Debug, Clone)]
 pub struct StreamRefreshJob {
     pub user_id: Uuid,
@@ -26,7 +31,7 @@ pub async fn enqueue_stream_refresh(
          VALUES (?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(user_id, media_id) DO UPDATE SET \
            series_id = COALESCE(excluded.series_id, background_stream_refresh_jobs.series_id), \
-           priority = MAX(background_stream_refresh_jobs.priority, excluded.priority), \
+           priority = excluded.priority, \
            run_after = MIN(background_stream_refresh_jobs.run_after, excluded.run_after), \
            updated_at = excluded.updated_at",
     )
@@ -92,7 +97,11 @@ pub async fn finish_stream_refresh(
     if active_series && job.series_id.is_some() {
         // Spread work across the 12–14 minute pre-expiry window. Stable-ish
         // per-row jitter prevents every queued item from refreshing together.
-        let jitter_secs = (job.media_id.as_bytes()[0] as i64) % 121;
+        let jitter_secs = if job.priority >= PRIORITY_NEXT_EPISODE {
+            0
+        } else {
+            (job.media_id.as_bytes()[0] as i64) % 121
+        };
         let next = now + Duration::minutes(12) + Duration::seconds(jitter_secs);
         sqlx::query(
             "UPDATE background_stream_refresh_jobs \
@@ -178,6 +187,17 @@ mod tests {
         let series = Uuid::new_v4();
         enqueue_stream_refresh(&db, user, item, Some(series), 20).await.unwrap();
         enqueue_stream_refresh(&db, user, item, Some(series), 80).await.unwrap();
+        enqueue_stream_refresh(&db, user, item, Some(series), 40).await.unwrap();
+
+        let stored_priority: i64 = sqlx::query_scalar(
+            "SELECT priority FROM background_stream_refresh_jobs WHERE user_id = ? AND media_id = ?",
+        )
+        .bind(user)
+        .bind(item)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(stored_priority, 40, "a new playback scope must replace stale priority");
 
         let claimed = claim_due_stream_refresh(&db).await.unwrap().unwrap();
         assert_eq!(claimed.user_id, user);
