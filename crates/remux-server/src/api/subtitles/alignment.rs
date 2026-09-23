@@ -11,7 +11,7 @@ use crate::{AppState, api, db};
 
 const MAX_SUBTITLE_BYTES: usize = 2_000_000;
 const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
-const MAX_PERSISTED_ALIGNMENT_FILES: usize = 128;
+const MAX_PERSISTED_ALIGNMENT_FILES: usize = 512;
 static ALIGNMENT_CACHE_LAST_PRUNE: std::sync::LazyLock<
     std::sync::Mutex<Option<std::time::Instant>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));

@@ -2526,7 +2526,7 @@ async fn item_for_user(
                 .clone()
                 .unwrap_or_default();
             super::subtitles::inject_external_subtitles(
-                &state.ctx,
+                &state,
                 &mut subtitle_media,
                 sources,
                 id,
@@ -2536,6 +2536,7 @@ async fn item_for_user(
                     .expose(),
                 sub_langs,
                 Some(
+
                     session
                         .user
                         .id,

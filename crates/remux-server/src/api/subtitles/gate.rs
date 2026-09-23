@@ -18,6 +18,19 @@ pub(super) fn raw_key(descriptor: &crate::stream::StreamDescriptor) -> String {
     )
 }
 
+pub(super) fn invalid_key(descriptor: &crate::stream::StreamDescriptor) -> String {
+    format!("subtitle-invalid-raw:{}", raw_key(descriptor).trim_start_matches("subtitle-valid-raw:"))
+}
+
+pub(super) fn known_invalid(
+    ctx: &AppContext,
+    descriptor: &crate::stream::StreamDescriptor,
+) -> bool {
+    ctx.store
+        .get::<bool>(&invalid_key(descriptor))
+        .is_some_and(|invalid| *invalid)
+}
+
 pub(super) fn valid_subtitle(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
@@ -165,6 +178,7 @@ pub(crate) async fn ensure_ready(
     source: &db::Media,
     item: Uuid,
     user: Option<Uuid>,
+    source_alias: Option<Uuid>,
 ) -> anyhow::Result<()> {
     if state
         .ctx
@@ -197,9 +211,7 @@ pub(crate) async fn ensure_ready(
             .addons
             .fetch_subtitles(
                 &mut media,
-                &state
-                    .ctx
-                    .db,
+                &state.ctx,
                 false,
                 user,
             )
@@ -211,13 +223,18 @@ pub(crate) async fn ensure_ready(
         )
         .await;
         let source_info = api::MediaSourceInfo::from(source.clone());
-        let mut subs: Vec<_> = super::scored_external_subtitles(
+        let subtitle_languages = settings
+            .subtitle_languages
+            .clone()
+            .unwrap_or_default();
+        let dedup = super::SubtitleDedupSettings::from_config(&settings);
+        let mut subs: Vec<_> = super::filter_external_subtitles_for_source(
+            &source_info,
+            super::provider_filename(&source_info),
             &subs,
-            &settings
-                .subtitle_languages
-                .unwrap_or_default(),
-            &source_info.name,
-            &source_info.path,
+            &subtitle_languages,
+            None,
+            dedup,
         )
         .into_iter()
         .cloned()
@@ -261,15 +278,18 @@ pub(crate) async fn ensure_ready(
                     .url
                     .as_ref()
                     .unwrap();
-                let bytes =
-                    super::fetch_external_subtitle_bytes(state, descriptor).await?;
+                let bytes = match super::fetch_external_subtitle_bytes(state, descriptor).await {
+                    Ok(bytes) => bytes,
+                    Err(_) if known_invalid(&state.ctx, descriptor) => continue,
+                    Err(error) => return Err(error),
+                };
                 loop {
                     let response = super::aligned_external_response(
                         state,
                         source,
                         item,
                         Some(&sub.id),
-                        None,
+                        source_alias,
                         None,
                         descriptor,
                         bytes.clone(),
@@ -403,7 +423,7 @@ mod tests {
             .unwrap();
         assert!(!String::from_utf8_lossy(&body).contains("Original text"));
         assert!(
-            ensure_ready(&state, &source, Uuid::new_v4(), None)
+            ensure_ready(&state, &source, Uuid::new_v4(), None, None)
                 .await
                 .is_err()
         );

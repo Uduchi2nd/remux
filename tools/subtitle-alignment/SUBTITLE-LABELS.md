@@ -13,17 +13,27 @@ returns `unchanged`; modified timing returns `aligned`. Rejection, timeout, miss
 reference, same-language skip and disabled alignment do not mark a subtitle.
 Original-bypass requests do not erase the normal delivery's last-known state.
 
-The label is a last-observed result kept for 24h in the bounded in-memory store.
-It follows the advertised item, MediaSourceId, subtitle index and language across
-signed URL renewal. The addon's stable subtitle ID and exact descriptor keys remain
-as fallbacks. A provider replacing subtitle contents under the same track identity
-is discovered on the next subtitle request. Restart clears labels.
+The label follows the item, source ID, stable subtitle ID and language rather than
+the signed provider URL or rewritten source path. Remux persists validated original
+subtitle text and the successful per-source result on disk for seven days (up to
+512 track records), so a renewed/broken provider URL or a Remux restart does not
+discard a good version or its `[Auto-synced]` marker. Cache filenames are hashed;
+signed URLs are not stored. The alignment result remains scoped to its media source
+and exact subtitle contents.
+
+Remux validates candidate external subtitle contents before advertising them. An
+empty, malformed, HTML, or error payload with no timed cues is omitted from fresh
+metadata; confirmed invalid responses are negatively cached for 15 minutes, while
+timeouts and other transient provider failures are not treated as bad subtitles.
+The subtitle-delivery route applies the same filter so hidden tracks do not shift
+the advertised stream indexes.
 
 Menus are normally fetched before the subtitle file. Remux cannot rename a menu
 already held by a player; reopen playback or refresh metadata after the first
-successful matching request. No new extraction or matching is triggered merely
-to render a label. The marker means timing was adjusted, NOT audio sync verified.
-No reference-specific offset exception or language model is enabled.
+successful matching request. The marker means timing was adjusted, NOT audio sync
+verified. Structural validation cannot establish translation quality or prove
+alignment to dialogue. No reference-specific offset exception or language model is
+enabled.
 
 Worker version `embedded-text-v5-change-label` invalidates older results lacking
 the timing_changed field. Remux treats a missing field conservatively as false.
@@ -68,3 +78,15 @@ The iPad was disconnected from USB, so no new physical client menu check is clai
   }
 ]
 ```
+
+## Verified deployment — 2026-09-23
+
+Production binary SHA256: `9db6cdaab2d67c796ad720acee814735a56d82397d44f6055d11e80a1b0dbffa`.
+On No Pain No Gain S01E18, the Torrentio and Usenet Vietnamese tracks each
+returned HTTP 200, `aligned`, and 1,012 timed cues. Both displayed
+`[Auto-synced]` in fresh PlaybackInfo. The two vnphim tracks returned HTTP 200,
+`no-reference`, and 1,012 cues, so they remained unmarked. After restarting
+Remux, fresh PlaybackInfo restored the aligned labels from the on-disk cache.
+No empty E18 candidate was available as a live negative sample; empty and
+malformed payloads are filtered by the shared structural validator before the
+track is advertised. No physical player playback was tested.

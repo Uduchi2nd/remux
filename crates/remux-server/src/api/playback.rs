@@ -506,6 +506,7 @@ async fn items_playbackinfo_inner(
                         .user
                         .id,
                 ),
+                Some(source.id),
             )
             .await
             .context_bad_gateway(
@@ -738,6 +739,15 @@ async fn items_playbackinfo_inner(
                             .id,
                         stream,
                     );
+                    super::subtitles::restore_persisted_subtitle_sync_label(
+                        &state.ctx,
+                        id,
+                        label_source.id,
+                        &route.subtitle.id,
+                        route.subtitle.lang.as_deref(),
+                        stream,
+                    )
+                    .await;
                 }
             }
         }
@@ -839,16 +849,27 @@ async fn items_playbackinfo_inner(
         media_sources.push(source);
     }
 
-    // Probe and subtitle lookup ran concurrently. Append only after the real
-    // stream indexes are known.
+    // Probe and subtitle lookup ran concurrently. Validate external tracks before
+    // advertising them so empty and broken responses are never cached as good.
+    let sub_langs = probe_cfg
+        .subtitle_languages
+        .clone()
+        .unwrap_or_default();
+    let external_subtitles = super::subtitles::validate_external_subtitles_for_advertising(
+        &state,
+        id,
+        external_subtitles,
+        &media_sources,
+        &sub_langs,
+        sort_device_profile.as_ref(),
+        subtitle_dedup,
+    )
+    .await;
     append_external_subtitles_with_context(
         &state.ctx,
         &mut media_sources,
         &external_subtitles,
-        &probe_cfg
-            .subtitle_languages
-            .clone()
-            .unwrap_or_default(),
+        &sub_langs,
         sort_device_profile.as_ref(),
         id,
         session
@@ -857,7 +878,8 @@ async fn items_playbackinfo_inner(
             .expose(),
         subtitle_dedup,
         true,
-    );
+    )
+    .await;
 
     // Re-resolve defaults after external subtitles were injected so language
     // matching can also pick addon subtitles (same request context as the
@@ -1526,7 +1548,14 @@ async fn videos_stream_inner(
         }
     };
     if let Err(error) =
-        super::subtitles::gate::ensure_ready(&state, &media, id, user_id).await
+        super::subtitles::gate::ensure_ready(
+            &state,
+            &media,
+            id,
+            user_id,
+            q.media_source_id.or(Some(media.id)),
+        )
+        .await
     {
         tracing::warn!(item = %id, "playback blocked by subtitle readiness: {error}");
         return Ok((http::StatusCode::SERVICE_UNAVAILABLE, [("Retry-After", "5"), ("Cache-Control", "no-store")], "Playback blocked: external subtitles are not ready. Retry after the subtitle source recovers.").into_response());
