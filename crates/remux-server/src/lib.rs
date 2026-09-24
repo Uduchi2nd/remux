@@ -577,7 +577,7 @@ fn default_torrent_http_port() -> u16 {
 }
 
 fn default_subtitle_alignment_wait_seconds() -> u64 {
-    10
+    2
 }
 
 fn default_stream_list_cache_ttl_secs() -> u64 {
@@ -593,7 +593,12 @@ pub struct Config {
     /// Optional private subtitle alignment worker. Disabled unless configured.
     #[serde(default)]
     pub subtitle_alignment_url: Option<String>,
-    /// Maximum subtitle-request wait, including queue and reference extraction.
+    /// Maximum per-request wait for a ready alignment (default 2s). The
+    /// underlying job (queueing, reference extraction, worker call) is never
+    /// bounded by this and keeps running in the background past the
+    /// deadline; a request that outlasts it just serves the original text
+    /// and a later request for the same track picks up the finished result
+    /// from cache.
     #[serde(default = "default_subtitle_alignment_wait_seconds")]
     pub subtitle_alignment_wait_seconds: u64,
     /// Public Remux URL enabling playback gating for subtitle alignment.

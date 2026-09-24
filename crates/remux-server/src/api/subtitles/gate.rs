@@ -1,5 +1,8 @@
-//! Eligible external subtitles are prepared in the background; video delivery
-//! does not wait for subtitle alignment.
+//! Eligible external subtitles are prepared in the background; video
+//! delivery and subtitle-text delivery both bound their wait on alignment to
+//! Config.subtitle_alignment_wait_seconds (default 2s) and never fail the
+//! request over it — see [`alignment::resolve`] for the actual bounded wait
+//! and [`prepare_in_background`] for the fire-and-forget PlaybackInfo warm-up.
 use super::{alignment, lang_to_two_letter};
 use crate::{AppContext, AppState, api, db};
 use std::{
@@ -152,53 +155,6 @@ fn has_reference(streams: &[api::MediaStream]) -> bool {
 fn eligible(streams: &[api::MediaStream], language: Option<&str>) -> bool {
     has_reference(streams)
         && alignment::alignment_skip_reason(language, streams).is_none()
-}
-
-pub(super) fn required(
-    state: &AppState,
-    source: &db::Media,
-    language: Option<&str>,
-) -> bool {
-    state
-        .ctx
-        .config
-        .subtitle_alignment_gate_base_url
-        .is_some()
-        && source
-            .probe_data
-            .as_ref()
-            .is_some_and(|p| eligible(&p.media_streams, language))
-}
-
-pub(super) async fn resolve_ready(
-    state: &AppState,
-    source: &db::Media,
-    bytes: axum::body::Bytes,
-    language: Option<&str>,
-    format: &str,
-) -> anyhow::Result<(axum::body::Bytes, &'static str)> {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let (output, status) = alignment::resolve(
-                state,
-                source,
-                bytes.clone(),
-                language,
-                format,
-                false,
-            )
-            .await;
-            match status {
-                "aligned" | "unchanged" => return Ok((output, status)),
-                "pending" | "wait-timeout" => {
-                    tokio::time::sleep(Duration::from_millis(100)).await
-                }
-                _ => return Err(anyhow::anyhow!("subtitle alignment unavailable")),
-            }
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("subtitle alignment timed out"))?
 }
 
 pub(crate) fn advertise(
@@ -421,7 +377,7 @@ mod tests {
         assert!(!eligible(&[reference], Some("vie")));
     }
     #[tokio::test]
-    async fn unavailable_alignment_never_returns_original_subtitle() {
+    async fn unavailable_alignment_still_serves_the_original_subtitle() {
         let (_, guard) =
             crate::integration_test::new_test_server_with_config(crate::Config {
                 database_url: Some("sqlite::memory:".into()),
@@ -472,15 +428,20 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        // No subtitle_alignment_url/token is configured in this test, so
+        // alignment is simply "disabled" — the request must never block on
+        // it or fail the response; it serves the already-validated original.
+        assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
             response.headers()["X-Remux-Subtitle-Alignment"],
-            "not-ready"
+            "disabled"
         );
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
-        assert!(!String::from_utf8_lossy(&body).contains("Original text"));
+        assert!(String::from_utf8_lossy(&body).contains("Original text"));
+        // The separate PlaybackInfo warm-up path still surfaces a real error
+        // (e.g. an unknown item) rather than silently doing nothing.
         assert!(
             ensure_ready(&state, &source, Uuid::new_v4(), None)
                 .await

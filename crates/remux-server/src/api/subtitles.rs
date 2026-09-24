@@ -589,23 +589,13 @@ async fn aligned_external_response(
     bypass: bool,
 ) -> Response<Body> {
     let original_bytes = bytes.clone();
-    let (bytes, status) = if !bypass && gate::required(state, source, language) {
-        match gate::resolve_ready(state, source, bytes, language, format).await {
-            Ok(result) => result,
-            Err(_) => return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [
-                    ("X-Remux-Subtitle-Alignment", "not-ready"),
-                    ("Cache-Control", "private, no-store"),
-                    ("Retry-After", "5"),
-                ],
-                "Subtitle alignment is not ready; playback is blocked. Retry later.",
-            )
-                .into_response(),
-        }
-    } else {
-        alignment::resolve(state, source, bytes, language, format, bypass).await
-    };
+    // Bounded best-effort wait (Config.subtitle_alignment_wait_seconds, default
+    // 2s): a track eligible for alignment never blocks the request past that
+    // deadline. The job itself keeps running in the background regardless,
+    // and a later request for the same track serves the finished result from
+    // cache. Never fail the request over alignment being slow or unavailable
+    // — worst case this just serves the original (already cue-validated) text.
+    let (bytes, status) = alignment::resolve(state, source, bytes, language, format, bypass).await;
     if !bypass {
         let source_info = api::MediaSourceInfo::from(source.clone());
         let mut source_ids = vec![source_info.id, source.id];
