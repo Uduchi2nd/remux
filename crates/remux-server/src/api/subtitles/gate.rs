@@ -1,8 +1,71 @@
-//! Playback waits for eligible external subtitle alignment before video delivery.
+//! Eligible external subtitles are prepared in the background; video delivery
+//! does not wait for subtitle alignment.
 use super::{alignment, lang_to_two_letter};
 use crate::{AppContext, AppState, api, db};
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    sync::{LazyLock, Mutex},
+    time::Duration,
+};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
+
+type PrepareKey = (Uuid, Uuid, Option<Uuid>);
+
+static PREPARING: LazyLock<Mutex<HashSet<PrepareKey>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static PREPARE_LIMIT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(2));
+
+/// Warm alignment caches without making playback metadata or video wait for
+/// subtitle providers. Duplicate requests for the same user's source share one
+/// preparation task; work is bounded so browsing many items can't fan out.
+pub(crate) fn prepare_in_background(
+    state: &AppState,
+    source: &db::Media,
+    item: Uuid,
+    user: Option<Uuid>,
+) {
+    let Some(probe) = source.probe_data.as_ref() else {
+        return;
+    };
+    if state
+        .ctx
+        .config
+        .subtitle_alignment_gate_base_url
+        .is_none()
+        || !["vi", "en"].iter().any(|language| eligible(&probe.media_streams, Some(language)))
+    {
+        return;
+    }
+
+    let key = (item, source.id, user);
+    let Ok(mut preparing) = PREPARING.lock() else {
+        return;
+    };
+    if !preparing.insert(key) {
+        return;
+    }
+    drop(preparing);
+
+    let state = state.clone();
+    let source = source.clone();
+    tokio::spawn(async move {
+        let result = match PREPARE_LIMIT.acquire().await {
+            Ok(_permit) => ensure_ready(&state, &source, item, user).await,
+            Err(_) => Err(anyhow::anyhow!("subtitle preparation limit unavailable")),
+        };
+        if result.is_err() {
+            tracing::warn!(
+                item = %item,
+                media_source = %source.id,
+                "background subtitle alignment is not ready"
+            );
+        }
+        if let Ok(mut preparing) = PREPARING.lock() {
+            preparing.remove(&key);
+        }
+    });
+}
 
 pub(super) fn raw_key(descriptor: &crate::stream::StreamDescriptor) -> String {
     let mut value = serde_json::to_value(descriptor).unwrap_or_default();

@@ -315,22 +315,16 @@ async fn items_playbackinfo_inner(
         effective_stream,
     } in probed.results
     {
-        if media_sources.is_empty() {
-            super::subtitles::gate::ensure_ready(
-                &state,
-                &effective_stream,
-                id,
-                Some(
-                    session
-                        .user
-                        .id,
-                ),
-            )
-            .await
-            .context_bad_gateway(
-                "Playback blocked: external subtitles are not ready",
-            )?;
-        }
+        super::subtitles::gate::prepare_in_background(
+            &state,
+            &effective_stream,
+            id,
+            Some(
+                session
+                    .user
+                    .id,
+            ),
+        );
         // Metadata-only torrent probes may not know the container duration yet.
         // Keep the authoritative Movie/Episode duration in PlaybackInfo so
         // clients do not treat a normal VOD source as an indefinite stream.
@@ -1114,12 +1108,9 @@ async fn videos_stream_inner(
             return Ok(no_streams_response().into_response());
         }
     };
-    if let Err(error) =
-        super::subtitles::gate::ensure_ready(&state, &media, id, user_id).await
-    {
-        tracing::warn!(item = %id, "playback blocked by subtitle readiness: {error}");
-        return Ok((http::StatusCode::SERVICE_UNAVAILABLE, [("Retry-After", "5"), ("Cache-Control", "no-store")], "Playback blocked: external subtitles are not ready. Retry after the subtitle source recovers.").into_response());
-    }
+    // Video delivery never waits on subtitle-provider or alignment latency.
+    // PlaybackInfo schedules cache preparation in the background, while the
+    // subtitle endpoint itself remains fail-closed until a track is aligned.
     let Some(si) = media
         .stream_info
         .clone()

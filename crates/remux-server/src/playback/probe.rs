@@ -1042,11 +1042,13 @@ pub(crate) async fn probe_stream(
                 None => true,
             };
             if alive {
+                record_probe_verification(stream, true);
                 debug!(id = %stream.id, "probe cache hit, url alive");
                 let mut info = api::MediaSourceInfo::from(stream.clone());
                 apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
                 return Ok((info, stream.clone()));
             }
+            record_probe_verification(stream, false);
             debug!(id = %stream.id, "probe cache hit but url dead, falling through to fallback");
         } else {
             debug!(id = %stream.id, "probe cache stale or filename-guess only, re-probing");
@@ -1140,38 +1142,109 @@ fn select_candidates(
 
 /// How long a failed probe keeps a stream out of the fallback rotation.
 const PROBE_FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Background refresh runs just before the stream-list cache expires (12–14 min).
+/// Keep verification results warm through that interval, but never trust them
+/// across a restart or a changed source descriptor.
+const PROBE_VERIFICATION_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// Streams whose last probe failed (timeout, ffprobe error, placeholder
 /// duration), with the time of that failure. Process-local: a restart forgets
 /// everything, which is fine — the cost of a stale entry is one skipped probe
 /// while another stream is available, never a missing source.
 static RECENT_PROBE_FAILURES: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<Uuid, std::time::Instant>>,
+    std::sync::Mutex<HashMap<(Uuid, u64), std::time::Instant>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-fn recently_failed(id: Uuid) -> bool {
+/// Short-lived verification state for source-picker candidates. The key hashes
+/// the descriptor so a refreshed signed URL never inherits the previous URL's
+/// health result. URLs and request headers stay out of the cache and logs.
+static RECENT_PROBE_VERIFICATIONS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(Uuid, u64), (std::time::Instant, bool)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn probe_status_key(stream: &db::Media) -> Option<(Uuid, u64)> {
+    use std::hash::{Hash, Hasher};
+
+    let descriptor = &stream.stream_info.as_ref()?.descriptor;
+    let serialized = serde_json::to_vec(descriptor).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serialized.hash(&mut hasher);
+    Some((stream.id, hasher.finish()))
+}
+
+pub(crate) fn record_probe_verification(stream: &db::Media, playable: bool) {
+    let Some(key) = probe_status_key(stream) else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    if let Ok(mut cache) = RECENT_PROBE_VERIFICATIONS.lock() {
+        cache.retain(|_, (checked_at, _)| checked_at.elapsed() < PROBE_VERIFICATION_TTL);
+        if cache.len() >= 8192 {
+            cache.clear();
+        }
+        cache.insert(key, (now, playable));
+    }
+}
+
+pub(crate) fn recently_verified_playable(stream: &db::Media) -> bool {
+    recently_verified(stream) == Some(true)
+}
+
+pub(crate) fn recently_verified_unplayable(stream: &db::Media) -> bool {
+    recently_verified(stream) == Some(false)
+}
+
+fn recently_verified(stream: &db::Media) -> Option<bool> {
+    let Some(key) = probe_status_key(stream) else {
+        return None;
+    };
+    RECENT_PROBE_VERIFICATIONS
+        .lock()
+        .map(|mut cache| {
+            cache.retain(|_, (checked_at, _)| {
+                checked_at.elapsed() < PROBE_VERIFICATION_TTL
+            });
+            cache
+                .get(&key)
+                .map(|(_, playable)| *playable)
+        })
+        .unwrap_or(None)
+}
+
+fn recently_failed(stream: &db::Media) -> bool {
+    let Some(key) = probe_status_key(stream) else {
+        return false;
+    };
     RECENT_PROBE_FAILURES
         .lock()
         .map(|m| {
-            m.get(&id)
+            m.get(&key)
                 .is_some_and(|t| t.elapsed() < PROBE_FAILURE_TTL)
         })
         .unwrap_or(false)
 }
 
-fn note_probe_failure(id: Uuid) {
+fn note_probe_failure(stream: &db::Media) {
+    let Some(key) = probe_status_key(stream) else {
+        return;
+    };
     if let Ok(mut m) = RECENT_PROBE_FAILURES.lock() {
         if m.len() >= 4096 {
             m.retain(|_, t| t.elapsed() < PROBE_FAILURE_TTL);
         }
-        m.insert(id, std::time::Instant::now());
+        m.insert(key, std::time::Instant::now());
     }
+    record_probe_verification(stream, false);
 }
 
-fn clear_probe_failure(id: Uuid) {
+fn clear_probe_failure(stream: &db::Media) {
+    let Some(key) = probe_status_key(stream) else {
+        return;
+    };
     if let Ok(mut m) = RECENT_PROBE_FAILURES.lock() {
-        m.remove(&id);
+        m.remove(&key);
     }
+    record_probe_verification(stream, true);
 }
 
 /// Probe a stream URL, retrying with the next matching candidate on failure.
@@ -1223,7 +1296,7 @@ where
     // failure is still ahead — it stays the last resort otherwise.
     let fresh: Vec<bool> = all_to_try
         .iter()
-        .map(|(m, _)| !recently_failed(m.id))
+        .map(|(m, _)| !recently_failed(m))
         .collect();
 
     for (idx, (stream, url_opt)) in all_to_try
@@ -1235,6 +1308,7 @@ where
             Some(u) => u,
             None => {
                 warn!(id = %stream.id, "skipping stream with no URL");
+                note_probe_failure(&stream);
                 continue;
             }
         };
@@ -1245,7 +1319,6 @@ where
         {
             info!(
                 id = %stream.id,
-                url = %url,
                 "skipping stream that failed to probe recently"
             );
             continue;
@@ -1255,7 +1328,6 @@ where
             info!(
                 failed_id = %primary.id,
                 next_id = %stream.id,
-                next_url = %url,
                 "probe failed, trying next matching stream"
             );
         }
@@ -1296,17 +1368,16 @@ where
                     if probed_ticks < threshold_ticks {
                         warn!(
                             id = %stream.id,
-                            url = %url,
                             probed_ticks,
                             threshold_ticks,
                             known_runtime_secs = ?stream.runtime,
                             "stream is suspiciously short, treating as probe failure"
                         );
-                        note_probe_failure(stream.id);
+                        note_probe_failure(&stream);
                         continue;
                     }
                 }
-                clear_probe_failure(stream.id);
+                clear_probe_failure(&stream);
 
                 if probed
                     .video_stream()
@@ -1328,24 +1399,24 @@ where
                 }
                 if is_retry {
                     info!(
-                        fallback_url = %url,
+                        id = %stream.id,
                         attempt = attempts,
                         "probe succeeded on fallback stream"
                     );
                 }
                 return Ok((probed, stream));
             }
-            Ok(Ok(Err(e))) => {
-                warn!(url = %url, error = %e, "probe failed");
-                note_probe_failure(stream.id);
+            Ok(Ok(Err(_))) => {
+                warn!(id = %stream.id, "probe failed");
+                note_probe_failure(&stream);
             }
-            Ok(Err(e)) => {
-                warn!(url = %url, error = %e, "probe task panicked");
-                note_probe_failure(stream.id);
+            Ok(Err(_)) => {
+                warn!(id = %stream.id, "probe task panicked");
+                note_probe_failure(&stream);
             }
             Err(_) => {
-                warn!(url = %url, timeout = timeout_secs, "probe timed out");
-                note_probe_failure(stream.id);
+                warn!(id = %stream.id, timeout = timeout_secs, "probe timed out");
+                note_probe_failure(&stream);
             }
         }
     }
@@ -1493,6 +1564,24 @@ mod probe_tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn recent_probe_verification_is_bound_to_the_source_descriptor() {
+        let source = http_media("https://cdn.example/video.mkv?sig=old");
+        let refreshed = http_media("https://cdn.example/video.mkv?sig=new");
+
+        assert!(!recently_verified_playable(&source));
+        assert!(!recently_verified_unplayable(&source));
+        record_probe_verification(&source, true);
+        assert!(recently_verified_playable(&source));
+        assert!(!recently_verified_unplayable(&source));
+        assert!(!recently_verified_playable(&refreshed));
+        assert!(!recently_verified_unplayable(&refreshed));
+
+        record_probe_verification(&source, false);
+        assert!(!recently_verified_playable(&source));
+        assert!(recently_verified_unplayable(&source));
     }
 
     fn http_media_with_filename(url: &str, filename: &str) -> db::Media {
@@ -1775,7 +1864,7 @@ mod probe_tests {
         let primary = http_media("http://dead.example.com");
         let fallback = http_media("http://alive.example.com");
         let fallback_id = fallback.id;
-        let all = vec![primary.clone(), fallback];
+        let all = vec![primary.clone(), fallback.clone()];
         // First request: the primary really is probed, fails, and is remembered.
         let (_, effective) = probe_with_fallback(
             primary.clone(),
@@ -1792,8 +1881,8 @@ mod probe_tests {
         .await
         .unwrap();
         assert_eq!(effective.id, fallback_id);
-        assert!(recently_failed(primary.id));
-        assert!(!recently_failed(fallback_id));
+        assert!(recently_failed(&primary));
+        assert!(!recently_failed(&fallback));
 
         // Second request: only ONE probe result is queued. If the dead primary
         // were probed again it would consume it and become the effective
@@ -1819,7 +1908,7 @@ mod probe_tests {
 
         // Last resort: when every candidate failed recently the primary is
         // still probed rather than failing with zero attempts.
-        note_probe_failure(fallback_id);
+        note_probe_failure(&fallback);
         let (_, effective) = probe_with_fallback(
             primary.clone(),
             Some("http://dead.example.com".to_string()),
@@ -1836,10 +1925,10 @@ mod probe_tests {
         .unwrap();
         assert_eq!(effective.id, primary.id);
         assert!(
-            !recently_failed(primary.id),
+            !recently_failed(&primary),
             "a successful probe clears the memory"
         );
-        clear_probe_failure(fallback_id);
+        clear_probe_failure(&fallback);
     }
 
     #[tokio::test]

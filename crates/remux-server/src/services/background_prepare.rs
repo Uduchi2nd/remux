@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
+use futures::{StreamExt, stream};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -22,6 +23,104 @@ fn add_refresh_target(
     } else {
         targets.push((media_id, series_id, priority));
     }
+}
+
+const BACKGROUND_PROBE_CONCURRENCY: usize = 2;
+
+fn has_expected_media_stream(
+    item_kind: &db::MediaKind,
+    source: &crate::api::MediaSourceInfo,
+) -> bool {
+    match item_kind {
+        db::MediaKind::Movie | db::MediaKind::Episode => source.video_stream().is_some(),
+        db::MediaKind::Track => source.audio_stream().is_some(),
+        _ => source.video_stream().is_some() || source.audio_stream().is_some(),
+    }
+}
+
+async fn probe_background_candidate(
+    ctx: AppContext,
+    source: db::Media,
+    item_kind: db::MediaKind,
+    timeout_secs: u64,
+    timeout_p2p_secs: u64,
+    port: u16,
+) -> bool {
+    let Some(stream_info) = source.stream_info.as_ref() else {
+        crate::playback::probe::record_probe_verification(&source, false);
+        return false;
+    };
+    let url = stream_info.descriptor.server_input(source.id, port);
+    let timeout = if stream_info.is_p2p() {
+        timeout_p2p_secs
+    } else {
+        timeout_secs
+    };
+
+    // Force a fresh media probe rather than trusting version metadata from
+    // RemuxDB. probe_stream persists successful ffprobe results for playback.
+    let mut probe_source = source.clone();
+    probe_source.probe_data = None;
+    let pool = [probe_source.clone()];
+    let result = crate::playback::probe::probe_stream(
+        &probe_source,
+        Some(url),
+        false,
+        timeout,
+        false,
+        0,
+        &pool,
+        true,
+        port,
+        &ctx.db,
+    )
+    .await;
+
+    match result {
+        Ok((probe, _)) => {
+            let playable = has_expected_media_stream(&item_kind, &probe);
+            crate::playback::probe::record_probe_verification(&source, playable);
+            playable
+        }
+        Err(_) => {
+            crate::playback::probe::record_probe_verification(&source, false);
+            false
+        }
+    }
+}
+
+async fn probe_background_streams(
+    ctx: &AppContext,
+    item: &mut db::Media,
+) -> anyhow::Result<(usize, usize)> {
+    let sources = item.streams(&ctx.db).await?;
+    let checked = sources.len();
+    let item_kind = item.kind.clone();
+    let probe_config = db::Settings::get_config_or_default(&ctx.db).await;
+    let timeout_secs = probe_config.probe_timeout_secs.unwrap_or(20) as u64;
+    let timeout_p2p_secs = probe_config.probe_timeout_p2p_secs.unwrap_or(60) as u64;
+    let port = ctx.config.port;
+
+    let results = stream::iter(sources.into_iter().map(|source| {
+        let ctx = ctx.clone();
+        let item_kind = item_kind.clone();
+        async move {
+            probe_background_candidate(
+                ctx,
+                source,
+                item_kind,
+                timeout_secs,
+                timeout_p2p_secs,
+                port,
+            )
+            .await
+        }
+    }))
+    .buffer_unordered(BACKGROUND_PROBE_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
+    Ok((checked, results.into_iter().filter(|playable| *playable).count()))
 }
 
 pub struct BackgroundPrepareSubscriber {
@@ -47,6 +146,14 @@ impl BackgroundPrepareSubscriber {
                             ctx.addons
                                 .refresh_streams_background(&mut media, &ctx, Some(job.user_id))
                                 .await?;
+                            let (checked, playable) =
+                                probe_background_streams(&ctx, &mut media).await?;
+                            debug!(
+                                item = %media.id,
+                                checked,
+                                playable,
+                                "background stream verification finished"
+                            );
                             let active = match job.series_id {
                                 Some(series_id) => {
                                     db::series_recently_played(&ctx.db, job.user_id, series_id).await?
