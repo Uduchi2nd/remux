@@ -571,6 +571,15 @@ impl StreamService {
                     .probe_data
                     .as_ref()
                     .is_some_and(ProbeDataExt::needs_reprobe);
+            if skip_probe
+                && crate::playback::probe::recently_verified_unplayable(&stream)
+            {
+                debug!(
+                    id = %stream.id,
+                    "omitting stream candidate with a recent failed probe"
+                );
+                continue;
+            }
             // A filename guess is never a completed probe — it must not skip
             // submitting a freshly-probed result to RemuxDB.
             let was_cached = stream
