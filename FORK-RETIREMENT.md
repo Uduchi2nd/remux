@@ -190,7 +190,7 @@ After the E18 test, VidHub resumed No Pain No Gain S1E1 Episode 16 from the home
 
 During No Pain No Gain S1E18 playback, the live SQLite queue showed E18 at priority 100, E19 at 100, E20–E22 at 80, and recently played episodes at 40. E18/E19 stream lists had refreshed around 08:51 UTC and were still fresh at the 08:54 UTC inspection; their next refreshes were scheduled for about 09:04–05 UTC. The E19 tie came from the previous monotonic `MAX` upsert retaining a higher old priority.
 
-The queue now assigns E19 (the next episode) priority 200, ahead of the current episode (100), following upcoming episodes (80), and recent history (40). Duplicate enqueue targets keep the highest priority within one playback event; a later playback event replaces stale priority values. This update changes stream-list cache refresh order only. It does not pre-align subtitles or run full Usenet article scans in the background.
+The queue now assigns E19 (the next episode) priority 200, ahead of the current episode (100), following upcoming episodes (80), and recent history (40). Duplicate enqueue targets keep the highest priority within one playback event; a later playback event replaces stale priority values. Priority 200 jobs skip the normal 0–120 second refresh jitter. The change is deployed from commits `2d2177ce` and `bac64848`; focused tests passed (2/2), and the deployed binary SHA256 at the time was `e9e2e49ecc71a31ce13ff75015f05e8c04fe7521004b87b4b39667896799226d`. This update changes stream-list cache refresh order only. It does not pre-align subtitles or run full Usenet article scans in the background.
 
 ### Background probe of displayed source candidates — 2026-09-23
 
