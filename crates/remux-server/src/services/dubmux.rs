@@ -343,19 +343,6 @@ pub(crate) async fn ensure_dub_rows(
                     response_headers: Default::default(),
                 };
             }
-            info!(
-                item = %media.id,
-                hq = %hq.id,
-                provider,
-                hq_probe = hq.probe_data.is_some(),
-                hq_guess = hq.probe_data.as_ref().is_some_and(|p| p.is_filename_guess()),
-                hq_subs = hq
-                    .probe_data
-                    .as_ref()
-                    .map(|p| p.media_streams.iter().filter(|s| matches!(s.type_, Some(MediaStreamType::Subtitle)) && !s.is_external).count())
-                    .unwrap_or(0),
-                "dubmux row source"
-            );
             row.probe_data = hq
                 .probe_data
                 .as_ref()
