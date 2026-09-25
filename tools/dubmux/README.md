@@ -41,6 +41,13 @@ front of the source list for every accepted pair.
    external subtitles.
 
 ## Incidents / rules learned
+- The mux routes must answer HEAD (FastAPI `@app.get` does not): remux's
+  liveness check HEADs the master playlist, a 405 counted as "dead", remux
+  fell back to a live ffprobe of the mux (no text tracks) and
+  `save_probe_data` overwrote the row's synthesized probe — which is why
+  dub rows lost their embedded subtitles and why probes kept starting
+  muxes. Routes are `api_route(methods=["GET","HEAD"])` now; HEAD never
+  starts a mux.
 - Background stream probing (remux `probe_background_streams`) must skip
   `[+VN dub]` rows: an ffprobe on the master playlist starts a full-episode
   mux, and one prefetch sweep produced 108 muxes / 298 GB. HEAD requests
