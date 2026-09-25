@@ -249,7 +249,8 @@ pub(crate) async fn ensure_dub_rows(
     let now = chrono::Utc::now().naive_utc();
     let mut rows = Vec::new();
     let mut wait = wait_secs;
-    for hq in hqs {
+    let mut failures = 0u32;
+    'pairs: for hq in hqs {
         let hq_url = http_url(hq).unwrap();
         let hq_id = hq
             .id
@@ -257,16 +258,25 @@ pub(crate) async fn ensure_dub_rows(
             .to_string();
         for (dub, provider, dub_id) in &dubs {
             let dub_url = http_url(dub).unwrap();
-            let reply =
-                match prepare(&client, &cfg, dub_id, dub_url, &hq_id, hq_url, wait)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(item = %media.id, "dubmux prepare failed: {e:#}");
-                        return rows;
+            let reply = match prepare(
+                &client, &cfg, dub_id, dub_url, &hq_id, hq_url, wait,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // A busy muxer answers late, not wrong: the job it was
+                    // asked for keeps running server-side. Skip this pair
+                    // and give up on the walk only if it keeps failing.
+                    failures += 1;
+                    warn!(item = %media.id, failures, "dubmux prepare failed: {e:#}");
+                    wait = 0;
+                    if failures >= 2 {
+                        break 'pairs;
                     }
-                };
+                    continue;
+                }
+            };
             // Only the first pair spends the caller's wait budget; the muxer
             // runs the other preparations concurrently anyway.
             wait = 0;
@@ -554,7 +564,7 @@ async fn prefetch_upcoming(
                 .config
                 .dubmux_premux_next
         {
-            premux_first_pair(ctx, &ep, user).await;
+            premux_first_pair(ctx, &mut ep, user).await;
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
@@ -564,7 +574,7 @@ async fn prefetch_upcoming(
 /// Wait for the next episode's preparations and hit the muxer's master
 /// playlist for the first accepted pair so the whole episode is muxed and
 /// cached before the viewer gets there.
-async fn premux_first_pair(ctx: &AppContext, ep: &db::Media, user: Uuid) {
+async fn premux_first_pair(ctx: &AppContext, ep: &mut db::Media, user: Uuid) {
     let Some(cfg) = DubmuxConfig::from(&ctx.config) else {
         return;
     };
