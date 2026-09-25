@@ -720,6 +720,15 @@ pub struct ServerConfiguration {
     /// Items shorter than this are never shown in continue-watching. Default: 90.
     #[default(Some(90_i64))]
     pub min_resume_duration_seconds: Option<i64>,
+    /// Absolute minimum playback position in seconds to create a resume point.
+    /// When set above 0 this replaces the `min_resume_pct` percentage rule, so
+    /// a title enters Continue Watching after a fixed amount of watch time
+    /// regardless of its runtime (a 2-hour movie and a 20-minute episode both
+    /// qualify after the same number of seconds). Default: 0 (disabled; the
+    /// percentage rule applies). `min_resume_duration_seconds` and
+    /// `max_resume_pct` are unaffected.
+    #[default(Some(0_i64))]
+    pub min_resume_seconds: Option<i64>,
     /// Include the next released episode of started series in Continue Watching.
     /// Disabled by default to retain Jellyfin's standard resume-only behaviour.
     #[default(Some(false))]
