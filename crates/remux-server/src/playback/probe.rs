@@ -1145,7 +1145,8 @@ const PROBE_FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(10
 /// Background refresh runs just before the stream-list cache expires (12–14 min).
 /// Keep verification results warm through that interval, but never trust them
 /// across a restart or a changed source descriptor.
-const PROBE_VERIFICATION_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const PROBE_VERIFICATION_TTL: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
 
 /// Streams whose last probe failed (timeout, ffprobe error, placeholder
 /// duration), with the time of that failure. Process-local: a restart forgets
@@ -1165,7 +1166,10 @@ static RECENT_PROBE_VERIFICATIONS: std::sync::LazyLock<
 fn probe_status_key(stream: &db::Media) -> Option<(Uuid, u64)> {
     use std::hash::{Hash, Hasher};
 
-    let descriptor = &stream.stream_info.as_ref()?.descriptor;
+    let descriptor = &stream
+        .stream_info
+        .as_ref()?
+        .descriptor;
     let serialized = serde_json::to_vec(descriptor).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     serialized.hash(&mut hasher);
@@ -1178,7 +1182,8 @@ pub(crate) fn record_probe_verification(stream: &db::Media, playable: bool) {
     };
     let now = std::time::Instant::now();
     if let Ok(mut cache) = RECENT_PROBE_VERIFICATIONS.lock() {
-        cache.retain(|_, (checked_at, _)| checked_at.elapsed() < PROBE_VERIFICATION_TTL);
+        cache
+            .retain(|_, (checked_at, _)| checked_at.elapsed() < PROBE_VERIFICATION_TTL);
         if cache.len() >= 8192 {
             cache.clear();
         }
@@ -1235,6 +1240,27 @@ fn note_probe_failure(stream: &db::Media) {
         m.insert(key, std::time::Instant::now());
     }
     record_probe_verification(stream, false);
+}
+
+/// Drop a stream's failure memory WITHOUT recording it as verified: used when
+/// a failed probe is being overridden (explicit HLS pick served as a guess),
+/// so the default picker does not hide the stream for the next 10 minutes,
+/// while nothing claims it was actually seen playing.
+pub(crate) fn forget_probe_failure(stream: &db::Media) {
+    let Some(key) = probe_status_key(stream) else {
+        return;
+    };
+    if let Ok(mut m) = RECENT_PROBE_FAILURES.lock() {
+        m.remove(&key);
+    }
+    if let Ok(mut cache) = RECENT_PROBE_VERIFICATIONS.lock() {
+        if cache
+            .get(&key)
+            .is_some_and(|(_, playable)| !*playable)
+        {
+            cache.remove(&key);
+        }
+    }
 }
 
 fn clear_probe_failure(stream: &db::Media) {
@@ -1582,6 +1608,22 @@ mod probe_tests {
         record_probe_verification(&source, false);
         assert!(!recently_verified_playable(&source));
         assert!(recently_verified_unplayable(&source));
+    }
+
+    #[test]
+    fn forget_probe_failure_unhides_without_claiming_verification() {
+        let stream = http_media("https://vnphim.example/p/s.token/Show.S01E02.m3u8");
+        note_probe_failure(&stream);
+        assert!(recently_failed(&stream));
+        assert!(recently_verified_unplayable(&stream));
+
+        forget_probe_failure(&stream);
+        assert!(!recently_failed(&stream));
+        assert!(!recently_verified_unplayable(&stream));
+        assert!(
+            !recently_verified_playable(&stream),
+            "forgetting a failure must not fabricate a successful probe"
+        );
     }
 
     fn http_media_with_filename(url: &str, filename: &str) -> db::Media {

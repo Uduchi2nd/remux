@@ -552,9 +552,9 @@ impl StreamService {
             } else {
                 timeout
             };
-            let (mut source, effective_stream) = probe_stream(
+            let probed = probe_stream(
                 &stream,
-                url_opt,
+                url_opt.clone(),
                 skip_probe,
                 timeout_secs,
                 auto_next,
@@ -566,8 +566,48 @@ impl StreamService {
                     .ctx
                     .db,
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            .await;
+            let (mut source, effective_stream) = match probed {
+                Ok(probed) => probed,
+                // PATCH (uduchi2nd): a remote HLS playlist the client picked
+                // by hand is not declared dead just because ffprobe could not
+                // finish inside the probe budget. vnphim's proxied kkphim/ophim
+                // dubs pull every segment ffprobe reads through the VN home
+                // uplink (~21 s measured for Đầu Xuân Tươi Sáng E02 against a
+                // 20 s budget), so the explicit pick came back as a 500 and
+                // the stream was hidden for 10 minutes. Serve the filename
+                // guess instead — container/language are already in the
+                // release name — and let the player try; a link that is
+                // really gone fails there, visibly, in one attempt.
+                Err(e)
+                    if self.requested_id == Some(stream.id)
+                        && stream_is_remote_hls(&stream) =>
+                {
+                    tracing::warn!(
+                        id = %stream.id,
+                        "probe of explicitly selected HLS stream failed ({e:?}); \
+                         serving filename guess instead of failing playback"
+                    );
+                    crate::playback::probe::forget_probe_failure(&stream);
+                    probe_stream(
+                        &stream,
+                        url_opt,
+                        true,
+                        timeout_secs,
+                        auto_next,
+                        max_retries,
+                        &sel.probe_pool,
+                        sel.restrict_resolution,
+                        port,
+                        &self
+                            .ctx
+                            .db,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                }
+                Err(e) => return Err(anyhow::anyhow!("{e:?}")),
+            };
 
             // Use the StreamGroup UUID when this candidate is a group representative
             // (group_id is set by filter_sources). This ensures the client sends back
@@ -1370,5 +1410,37 @@ mod tests {
             StreamService::probe_fallback_for(ctx, "psid-group-request", group_a),
             Some(alive.id)
         );
+    }
+}
+
+/// An addon stream whose input is an HLS playlist on another host: either the
+/// probe already told us the container, or the URL path says so (`.m3u8`/
+/// `.m3u`; query strings are ignored, they carry tokens, not format hints).
+fn stream_is_remote_hls(stream: &db::Media) -> bool {
+    if stream
+        .probe_data
+        .as_ref()
+        .and_then(|p| {
+            p.container
+                .as_ref()
+        })
+        .is_some_and(|c| c.is_hls_input())
+    {
+        return true;
+    }
+    match stream
+        .stream_info
+        .as_ref()
+        .map(|si| &si.descriptor)
+    {
+        Some(crate::stream::StreamDescriptor::Http { url, .. }) => url::Url::parse(url)
+            .ok()
+            .is_some_and(|u| {
+                let path = u
+                    .path()
+                    .to_ascii_lowercase();
+                path.ends_with(".m3u8") || path.ends_with(".m3u")
+            }),
+        _ => false,
     }
 }
