@@ -19,7 +19,11 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-const MAX_HQ: usize = 2;
+// Every listed HQ release is tried (bounded): different cuts of the same
+// episode coexist (Đầu Xuân Tươi Sáng E02: 2160p at 2902.9 s, 1080p at
+// 2915.0 s) and only the matching cut passes the duration gate. Results are
+// cached by the muxer, so extra pairs cost one small request each.
+const MAX_HQ: usize = 6;
 const MAX_DUBS: usize = 3;
 const DUB_TOKENS: [&str; 2] = ["Vietnamese.ThuyetMinh", "Vietnamese.LongTieng"];
 
