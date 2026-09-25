@@ -588,6 +588,14 @@ fn default_dubmux_prepare_wait_secs() -> u64 {
     10
 }
 
+fn default_dubmux_prefetch_episodes() -> u64 {
+    10
+}
+
+fn default_dubmux_premux_next() -> bool {
+    true
+}
+
 fn default_stream_list_cache_ttl_secs() -> u64 {
     15 * 60
 }
@@ -627,6 +635,14 @@ pub struct Config {
     /// refreshes never wait.
     #[serde(default = "default_dubmux_prepare_wait_secs")]
     pub dubmux_prepare_wait_secs: u64,
+    /// On playback start, prepare (extract + match, no mux) the dubs of this
+    /// many upcoming episodes once per series per hour. 0 disables.
+    #[serde(default = "default_dubmux_prefetch_episodes")]
+    pub dubmux_prefetch_episodes: u64,
+    /// Also pre-mux the very next episode's first accepted pair so it starts
+    /// instantly (one HQ download onto the seedbox per played episode).
+    #[serde(default = "default_dubmux_premux_next")]
+    pub dubmux_premux_next: bool,
     /// Freshness window for addon stream candidate lists; warm jobs refresh before expiry.
     #[serde(default = "default_stream_list_cache_ttl_secs")]
     pub stream_list_cache_ttl_secs: u64,
@@ -797,6 +813,8 @@ impl Default for Config {
             dubmux_url: None,
             dubmux_public_url: None,
             dubmux_prepare_wait_secs: default_dubmux_prepare_wait_secs(),
+            dubmux_prefetch_episodes: default_dubmux_prefetch_episodes(),
+            dubmux_premux_next: default_dubmux_premux_next(),
             subtitle_alignment_token_file: None,
             stream_list_cache_ttl_secs: default_stream_list_cache_ttl_secs(),
             background_stream_refresh_enabled:
