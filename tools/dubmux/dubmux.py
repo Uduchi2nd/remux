@@ -73,7 +73,10 @@ def decode(url, start, span, extra=()):
 
 
 def xcorr_lag(a, b, max_lag_s):
-    """Lag (seconds) such that b(t) ≈ a(t + lag); positive = b is later."""
+    """Lag (seconds) such that a(t) ≈ b(t + lag): with a = video and b = dub,
+    video(t) lines up with dub(t + lag). Negative lag = the video has extra
+    content before the point where the dub starts. (Verified with a synthetic
+    2 s head: lag = -2.000.)"""
     n = min(len(a), len(b))
     a = a[:n] - a[:n].mean(); b = b[:n] - b[:n].mean()
     a /= (np.linalg.norm(a) or 1); b /= (np.linalg.norm(b) or 1)
@@ -252,10 +255,10 @@ def cmd_match(args):
 def cmd_sample(args):
     dub = os.path.join(CACHE, args.name + ".m4a")
     out = args.out or os.path.join(CACHE, f"{args.name}-sample-{int(args.at)}.mp4")
-    # dub(t) ≈ video(t + lag)  =>  when cutting video at T, cut dub at T - lag.
+    # video(t) <-> dub(t + lag)  =>  when cutting video at T, cut dub at T + lag.
     run(["ffmpeg", "-v", "error", "-nostdin", "-y", *ua_for(args.video),
          "-ss", f"{args.at:.3f}", "-t", f"{args.len:.3f}", "-i", args.video,
-         "-ss", f"{args.at - args.offset:.3f}", "-t", f"{args.len:.3f}", "-i", dub,
+         "-ss", f"{args.at + args.offset:.3f}", "-t", f"{args.len:.3f}", "-i", dub,
          "-map", "0:v:0", "-map", "1:a:0", "-map", "0:a", "-c", "copy",
          "-metadata:s:a:0", "language=vie", "-metadata:s:a:0", "title=Thuyết Minh (vnphim)",
          "-disposition:a:0", "default", "-disposition:a:1", "0",
