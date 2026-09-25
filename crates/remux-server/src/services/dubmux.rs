@@ -83,7 +83,7 @@ fn dub_provider(name: &str) -> Option<String> {
     Some(provider.to_ascii_lowercase())
 }
 
-fn is_dubmux_row(stream: &db::Media) -> bool {
+pub(crate) fn is_dubmux_row(stream: &db::Media) -> bool {
     filename(stream).is_some_and(|f| f.contains(".VNDub-"))
 }
 
