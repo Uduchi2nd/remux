@@ -165,7 +165,11 @@ def analyse(video_pcm, dub_pcm):
     # First run starts where the dub starts (video may have a longer head:
     # lag < 0 means video(t) <-> dub(t + lag), i.e. dub 0 <-> video -lag).
     runs[0]["dub_start"] = 0.0
-    runs[-1]["dub_end"] = min(ddur, vdur + runs[-1]["lag"])
+    last_evidence = runs[-1]["last"] + COARSE_SPAN
+    if min(ddur, vdur + runs[-1]["lag"]) - last_evidence <= 2 * COARSE_STEP:
+        runs[-1]["dub_end"] = min(ddur, vdur + runs[-1]["lag"])
+    else:
+        runs[-1]["dub_end"] = last_evidence
     out = []
     for r in runs:
         rr = {"dub_start": round(max(0.0, r["dub_start"]), 3), "dub_end": round(r["dub_end"], 3),
@@ -174,10 +178,19 @@ def analyse(video_pcm, dub_pcm):
         rr["video_end"] = round(rr["dub_end"] - rr["lag"], 3)
         if rr["dub_end"] - rr["dub_start"] > 1.0 and rr["video_start"] >= -0.5:
             out.append(rr)
+    # Coverage is judged on CONFIDENT windows, not on run extent: a run's
+    # last window is where the evidence ends, and the tail after it is only
+    # extended to the dub's end when the evidence reaches close to the end.
+    # (Pursuit of Jade vs the DDHDTV 2160p pack: 3 strong windows at -34.8 s,
+    # then 43 windows of noise — the release's audio does not match past the
+    # opening; that must be a rejection, not a constant offset.)
+    confident = sum(1 for _s, r in coarse if r and r[1] >= MIN_RATIO)
+    in_runs = sum(r["windows"] for r in out)
+    coverage = in_runs / len(coarse) if coarse else 0.0
     covered = sum(r["dub_end"] - r["dub_start"] for r in out)
-    coverage = covered / ddur if ddur else 0.0
     verdict = "accept" if out and coverage >= MIN_COVERAGE else "reject:coverage"
-    return {"verdict": verdict, "coverage": round(coverage, 3), "runs": out,
+    return {"verdict": verdict, "coverage": round(coverage, 3), "confident_windows": confident,
+            "total_windows": len(coarse), "covered_seconds": round(covered, 1), "runs": out,
             "video_duration": round(vdur, 3), "dub_duration": round(ddur, 3),
             "max_lag": max_lag,
             "coarse": [(s, r and round(r[0], 3), r and round(r[1], 1)) for s, r in coarse]}

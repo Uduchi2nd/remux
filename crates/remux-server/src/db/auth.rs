@@ -695,7 +695,12 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(auth) = parts
+        // PATCH (uduchi2nd): a `MediaBrowser Client=… DeviceId=…` header
+        // WITHOUT `Token=` is what players send on media/subtitle URLs while
+        // the token rides in `?ApiKey=` (VidHub on every `/remux/subtitle-ready`
+        // stream request → 401 before this). Like Jellyfin, keep the header's
+        // device metadata and take the token from wherever it is.
+        let mut auth = parts
             .headers
             .get(http::header::AUTHORIZATION)
             .or_else(|| {
@@ -705,51 +710,47 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
             })
             .map(header_text_lossy)
             .and_then(|raw| JellyfinAuthHeader::from_str(&raw).ok())
+            .unwrap_or_default();
+        if auth
+            .token
+            .is_none()
         {
-            return Ok(auth);
+            auth.token = token_outside_auth_header(parts);
         }
+        Ok(auth)
+    }
+}
 
-        // Try X-Emby / MediaBrowser token headers
-        let token = parts
-            .headers
-            .get("X-Emby-Token")
-            .or_else(|| {
-                parts
-                    .headers
-                    .get("X-MediaBrowser-Token")
-            })
-            .map(header_text_lossy);
-
-        if let Some(token) = token {
-            return Ok(JellyfinAuthHeader {
-                token: Some(token),
-                ..Default::default()
-            });
-        }
-
-        // Query params fallback
-        if let Some(query) = parts
-            .uri
-            .query()
-        {
-            for pair in query.split('&') {
-                let mut kv = pair.splitn(2, '=');
-                if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
-                    if key.eq_ignore_ascii_case("api_key")
-                        || key.eq_ignore_ascii_case("apikey")
-                        || key.eq_ignore_ascii_case("token")
-                    {
-                        return Ok(JellyfinAuthHeader {
-                            token: Some(val.to_string()),
-                            ..Default::default()
-                        });
-                    }
-                }
+/// The access token carried by the `X-Emby-Token` / `X-MediaBrowser-Token`
+/// headers or by an `api_key` / `ApiKey` / `token` query parameter.
+fn token_outside_auth_header(parts: &Parts) -> Option<String> {
+    if let Some(token) = parts
+        .headers
+        .get("X-Emby-Token")
+        .or_else(|| {
+            parts
+                .headers
+                .get("X-MediaBrowser-Token")
+        })
+        .map(header_text_lossy)
+    {
+        return Some(token);
+    }
+    let query = parts
+        .uri
+        .query()?;
+    for pair in query.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
+            if key.eq_ignore_ascii_case("api_key")
+                || key.eq_ignore_ascii_case("apikey")
+                || key.eq_ignore_ascii_case("token")
+            {
+                return Some(val.to_string());
             }
         }
-
-        Ok(JellyfinAuthHeader::default())
     }
+    None
 }
 
 #[cfg(test)]
@@ -837,6 +838,60 @@ mod tests {
                 "each key should own a session under its own device id: {device_ids:?}"
             );
         }
+    }
+
+    #[test]
+    fn token_outside_auth_header_reads_query_and_token_headers() {
+        use http::header::AUTHORIZATION;
+        let req = http::Request::builder()
+            .uri("/videos/x/stream?Static=true&ApiKey=abc123")
+            .header(
+                AUTHORIZATION,
+                "MediaBrowser Client=\"VidHub\", Device=\"iPad\", DeviceId=\"dev-1\", Version=\"3.0.6\"",
+            )
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        assert_eq!(token_outside_auth_header(&parts).as_deref(), Some("abc123"));
+        let header = JellyfinAuthHeader::from_str(
+            parts
+                .headers
+                .get(AUTHORIZATION)
+                .map(header_text_lossy)
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            header
+                .token
+                .is_none(),
+            "the header itself carries no token"
+        );
+        assert_eq!(
+            header
+                .device_id
+                .as_deref(),
+            Some("dev-1")
+        );
+
+        let req = http::Request::builder()
+            .uri("/videos/x/stream")
+            .header("X-Emby-Token", "hdr-token")
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        assert_eq!(
+            token_outside_auth_header(&parts).as_deref(),
+            Some("hdr-token")
+        );
+
+        let req = http::Request::builder()
+            .uri("/videos/x/stream?foo=bar")
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        assert_eq!(token_outside_auth_header(&parts), None);
     }
 
     #[tokio::test]
