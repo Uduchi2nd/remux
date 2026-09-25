@@ -55,6 +55,19 @@ front of the source list for every accepted pair.
   at startup (`POST /sweep` applies it on demand).
 - Never edit repo files while a build chain is still in its format/copy-back
   step: the copy-back clobbered a later edit once (the 2-previous walk).
+- Piecewise acceptance must be judged on confident windows, not on run
+  extent: the last run used to stretch to the end of the dub, so 3 confident
+  windows out of 46 (Pursuit of Jade E01 kkphim × DDHDTV 2160p — the
+  release's audio does not match past the opening) became one constant
+  offset that was wrong from ~22:00. `analyse()` now needs ≥ 85 % of the
+  coarse windows confident and inside accepted runs, and only extends a run
+  to the end when its evidence reaches there. Real matches score ~100 %,
+  bad pairs ≤ 50 % — there was nothing in between across 142 records.
+- A dub row's path must never be rewritten to remux's subtitle-ready gate
+  route: the master is then served inline by remux and its relative
+  `index.m3u8` resolves against the wrong host (VidHub: row never starts).
+  The HQ release's embedded text tracks on a dub row are presented as
+  external (`Path <lang>.vtt`) so VidHub/Infuse list them.
 
 ## Operations
 - Deploy: copy `dubmux.py server.py Containerfile run.sh` to seedbox
