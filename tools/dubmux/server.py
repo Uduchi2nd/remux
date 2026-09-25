@@ -276,7 +276,7 @@ def _start_mux(k, video_url, dub_id, lag):
     threading.Thread(target=reaper, daemon=True).start()
 
 
-@app.get("/mux/{dub_id}/{video_id}/master.m3u8")
+@app.api_route("/mux/{dub_id}/{video_id}/master.m3u8", methods=["GET", "HEAD"])
 def master(dub_id: str, video_id: str, request: Request):
     k = _key(_check_id(dub_id), _check_id(video_id))
     m = _load_match(k)
@@ -309,10 +309,13 @@ def _wait_for(path: Path, timeout: float):
     return True
 
 
-@app.get("/mux/{dub_id}/{video_id}/index.m3u8")
-def index(dub_id: str, video_id: str):
+@app.api_route("/mux/{dub_id}/{video_id}/index.m3u8", methods=["GET", "HEAD"])
+def index(dub_id: str, video_id: str, request: Request):
     k = _key(_check_id(dub_id), _check_id(video_id))
     p = _session_dir(k) / "index.m3u8"
+    if request.method == "HEAD":
+        return Response(status_code=200 if p.exists() or _load_match(k) else 404,
+                        media_type="application/vnd.apple.mpegurl")
     if not _wait_for(p, SEG_WAIT_S):
         raise HTTPException(503, "mux not started")
     text = p.read_text()
@@ -321,12 +324,14 @@ def index(dub_id: str, video_id: str):
                     headers={"Cache-Control": "no-store"})
 
 
-@app.get("/mux/{dub_id}/{video_id}/{seg}")
-def segment(dub_id: str, video_id: str, seg: str):
+@app.api_route("/mux/{dub_id}/{video_id}/{seg}", methods=["GET", "HEAD"])
+def segment(dub_id: str, video_id: str, seg: str, request: Request):
     k = _key(_check_id(dub_id), _check_id(video_id))
     if not re.match(r"^seg\d{5}\.ts$", seg):
         raise HTTPException(404)
     p = _session_dir(k) / seg
+    if request.method == "HEAD":
+        return Response(status_code=200 if p.exists() else 404, media_type="video/mp2t")
     if not p.exists():
         d = _session_dir(k)
         if (d / ".done").exists() or (d / ".failed").exists():
