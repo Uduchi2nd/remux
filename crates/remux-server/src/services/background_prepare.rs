@@ -113,9 +113,16 @@ async fn probe_background_streams(
     ctx: &AppContext,
     item: &mut db::Media,
 ) -> anyhow::Result<(usize, usize)> {
-    let sources = item
+    let sources: Vec<db::Media> = item
         .streams(&ctx.db)
-        .await?;
+        .await?
+        .into_iter()
+        // PATCH (uduchi2nd): a "[+VN dub]" row already carries a synthesized
+        // probe, and ffprobe-ing its master playlist would make the seedbox
+        // mux the whole episode just to verify it — 100+ muxes / 300 GB in
+        // one prefetch sweep. Its HQ source is verified on its own.
+        .filter(|s| !crate::services::dubmux::is_dubmux_row(s))
+        .collect();
     let checked = sources.len();
     let item_kind = item
         .kind
