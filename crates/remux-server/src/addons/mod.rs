@@ -3000,7 +3000,8 @@ impl AddonService {
         ctx: &AppContext,
         user_id: Option<Uuid>,
     ) -> Result<()> {
-        self.refresh_streams_inner(media, ctx, user_id, false).await
+        self.refresh_streams_inner(media, ctx, user_id, false)
+            .await
     }
 
     /// Refresh streams even when the cache is still technically fresh. Used by
@@ -3011,7 +3012,8 @@ impl AddonService {
         ctx: &AppContext,
         user_id: Option<Uuid>,
     ) -> Result<()> {
-        self.refresh_streams_inner(media, ctx, user_id, true).await
+        self.refresh_streams_inner(media, ctx, user_id, true)
+            .await
     }
 
     async fn refresh_streams_inner(
@@ -3021,7 +3023,10 @@ impl AddonService {
         user_id: Option<Uuid>,
         force: bool,
     ) -> Result<()> {
-        let streams_ttl_secs = ctx.config.stream_list_cache_ttl_secs.clamp(60, 60 * 60) as i64;
+        let streams_ttl_secs = ctx
+            .config
+            .stream_list_cache_ttl_secs
+            .clamp(60, 60 * 60) as i64;
         static STREAM_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
 
         // Fast path: TTL not expired — skip the lock entirely.
@@ -3212,6 +3217,12 @@ impl AddonService {
         }
 
         db::Media::upsert(&ctx.db, &sources).await?;
+        // PATCH (uduchi2nd): pair vnphim dubs with the HQ sources through the
+        // seedbox muxer and add "[+VN dub]" rows in front. A refresh never
+        // waits for a preparation that is still running; a playback request
+        // does (StreamService::load) so the rows appear by the time the
+        // client presses play on a freshly opened episode.
+        crate::services::dubmux::ensure_dub_rows(ctx, media, &sources, 0).await;
 
         // Publish the fresh timestamp only after the child stream rows exist.
         // Otherwise a concurrent playback lookup can observe a fresh parent,

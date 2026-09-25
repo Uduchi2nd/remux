@@ -377,8 +377,12 @@ pub async fn init_app(
     ctx.signals
         .register(services::media_tracker::MediaTrackerSubscriber { ctx: ctx.clone() });
     ctx.signals
-        .register(services::background_prepare::BackgroundPrepareSubscriber { ctx: ctx.clone() });
-    services::background_prepare::BackgroundPrepareSubscriber::start_worker(ctx.clone());
+        .register(services::background_prepare::BackgroundPrepareSubscriber {
+            ctx: ctx.clone(),
+        });
+    services::background_prepare::BackgroundPrepareSubscriber::start_worker(
+        ctx.clone(),
+    );
     ctx.signals
         .register(api::webhooks::WebhookSubscriber { ctx: ctx.clone() });
 
@@ -580,6 +584,10 @@ fn default_subtitle_alignment_wait_seconds() -> u64 {
     2
 }
 
+fn default_dubmux_prepare_wait_secs() -> u64 {
+    10
+}
+
 fn default_stream_list_cache_ttl_secs() -> u64 {
     15 * 60
 }
@@ -607,6 +615,18 @@ pub struct Config {
     /// Bearer token file, so secrets never appear in serialized configuration.
     #[serde(default)]
     pub subtitle_alignment_token_file: Option<std::path::PathBuf>,
+    /// Seedbox dubmux service, as reachable from this server (tailnet), e.g.
+    /// `http://100.68.133.6:12500`. Unset disables VN-dub augmentation.
+    #[serde(default)]
+    pub dubmux_url: Option<String>,
+    /// The same service as clients reach it, e.g. `https://dubmux.geniallark.box.ca`.
+    #[serde(default)]
+    pub dubmux_public_url: Option<String>,
+    /// How long a playback request waits for a still-running dub preparation
+    /// before answering without the dub rows (default 10 s). Background stream
+    /// refreshes never wait.
+    #[serde(default = "default_dubmux_prepare_wait_secs")]
+    pub dubmux_prepare_wait_secs: u64,
     /// Freshness window for addon stream candidate lists; warm jobs refresh before expiry.
     #[serde(default = "default_stream_list_cache_ttl_secs")]
     pub stream_list_cache_ttl_secs: u64,
@@ -774,9 +794,13 @@ impl Default for Config {
             subtitle_alignment_url: None,
             subtitle_alignment_wait_seconds: default_subtitle_alignment_wait_seconds(),
             subtitle_alignment_gate_base_url: None,
+            dubmux_url: None,
+            dubmux_public_url: None,
+            dubmux_prepare_wait_secs: default_dubmux_prepare_wait_secs(),
             subtitle_alignment_token_file: None,
             stream_list_cache_ttl_secs: default_stream_list_cache_ttl_secs(),
-            background_stream_refresh_enabled: default_background_stream_refresh_enabled(),
+            background_stream_refresh_enabled:
+                default_background_stream_refresh_enabled(),
             data_dir: default_data_dir(),
             database_url: None,
             torrent_data_dir: None,

@@ -118,6 +118,34 @@ impl StreamService {
                     .db,
             )
             .await?;
+        // PATCH (uduchi2nd): a playback request waits (bounded) for the
+        // seedbox dub preparation the refresh above only kicked off, so a
+        // freshly opened episode gets its "[+VN dub]" rows before the client
+        // picks a version. Rows already in db_streams are re-upserted, new
+        // ones are prepended (they sort first by negative idx anyway).
+        let db_streams = {
+            let wait = self
+                .ctx
+                .config
+                .dubmux_prepare_wait_secs;
+            let added = crate::services::dubmux::ensure_dub_rows(
+                &self.ctx,
+                &root,
+                &db_streams,
+                wait,
+            )
+            .await;
+            let mut merged: Vec<db::Media> = added
+                .into_iter()
+                .filter(|a| {
+                    !db_streams
+                        .iter()
+                        .any(|s| s.id == a.id)
+                })
+                .collect();
+            merged.extend(db_streams);
+            merged
+        };
         let mut raw = if db_streams.is_empty() {
             // Root item can be the stream itself (e.g. locally-imported files)
             // but only when it carries a URL. Addon content uses the root as a
