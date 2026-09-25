@@ -377,16 +377,6 @@ pub(crate) async fn ensure_dub_rows(
     if rows.is_empty() {
         return rows;
     }
-    for r in &rows {
-        info!(
-            row = %r.id,
-            probe = r.probe_data.is_some(),
-            subs = r.probe_data.as_ref().map(|p| p.media_streams.iter().filter(|s| matches!(s.type_, Some(MediaStreamType::Subtitle))).count()).unwrap_or(0),
-            streams = r.probe_data.as_ref().map(|p| p.media_streams.len()).unwrap_or(0),
-            json = r.probe_data.as_ref().and_then(|p| serde_json::to_string(p).ok()).map(|j| j.len()).unwrap_or(0),
-            "dubmux row about to upsert"
-        );
-    }
     if let Err(e) = db::Media::upsert(&ctx.db, &rows).await {
         warn!(item = %media.id, "dubmux row upsert failed: {e:#}");
         return vec![];
