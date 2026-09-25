@@ -737,8 +737,13 @@ async fn items_playbackinfo_inner(
                         &state.ctx,
                         id,
                         label_source.id,
-                        &route.subtitle.id,
-                        route.subtitle.lang.as_deref(),
+                        &route
+                            .subtitle
+                            .id,
+                        route
+                            .subtitle
+                            .lang
+                            .as_deref(),
                         stream,
                     )
                     .await;
@@ -874,6 +879,14 @@ async fn items_playbackinfo_inner(
         true,
     )
     .await;
+    super::subtitles::present_dub_row_embedded_subtitles(
+        &mut media_sources,
+        id,
+        session
+            .device
+            .access_token
+            .expose(),
+    );
 
     // Re-resolve defaults after external subtitles were injected so language
     // matching can also pick addon subtitles (same request context as the

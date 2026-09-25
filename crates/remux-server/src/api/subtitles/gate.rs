@@ -29,7 +29,10 @@ pub(crate) fn prepare_in_background(
     user: Option<Uuid>,
     source_alias: Option<Uuid>,
 ) {
-    let Some(probe) = source.probe_data.as_ref() else {
+    let Some(probe) = source
+        .probe_data
+        .as_ref()
+    else {
         return;
     };
     if state
@@ -37,7 +40,9 @@ pub(crate) fn prepare_in_background(
         .config
         .subtitle_alignment_gate_base_url
         .is_none()
-        || !["vi", "en"].iter().any(|language| eligible(&probe.media_streams, Some(language)))
+        || !["vi", "en"]
+            .iter()
+            .any(|language| eligible(&probe.media_streams, Some(language)))
     {
         return;
     }
@@ -86,7 +91,10 @@ pub(super) fn raw_key(descriptor: &crate::stream::StreamDescriptor) -> String {
 }
 
 pub(super) fn invalid_key(descriptor: &crate::stream::StreamDescriptor) -> String {
-    format!("subtitle-invalid-raw:{}", raw_key(descriptor).trim_start_matches("subtitle-valid-raw:"))
+    format!(
+        "subtitle-invalid-raw:{}",
+        raw_key(descriptor).trim_start_matches("subtitle-valid-raw:")
+    )
 }
 
 pub(super) fn known_invalid(
@@ -170,6 +178,18 @@ pub(crate) fn advertise(
     else {
         return;
     };
+    // PATCH (uduchi2nd): a "[+VN dub]" row's path IS the seedbox muxer's
+    // master playlist and must reach the client verbatim — routed through
+    // this server the master's relative `index.m3u8` resolves against the
+    // wrong host and the player fails. Its subtitles are prepared in the
+    // background like everyone else's.
+    if source
+        .path
+        .as_deref()
+        .is_some_and(|p| p.contains("/mux/") && p.contains("master.m3u8"))
+    {
+        return;
+    }
     if !source
         .media_streams
         .iter()
@@ -298,11 +318,13 @@ pub(crate) async fn ensure_ready(
                     .url
                     .as_ref()
                     .unwrap();
-                let bytes = match super::fetch_external_subtitle_bytes(state, descriptor).await {
-                    Ok(bytes) => bytes,
-                    Err(_) if known_invalid(&state.ctx, descriptor) => continue,
-                    Err(error) => return Err(error),
-                };
+                let bytes =
+                    match super::fetch_external_subtitle_bytes(state, descriptor).await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(_) if known_invalid(&state.ctx, descriptor) => continue,
+                        Err(error) => return Err(error),
+                    };
                 loop {
                     let response = super::aligned_external_response(
                         state,
@@ -437,10 +459,7 @@ mod tests {
         // alignment is simply "disabled" — the request must never block on
         // it or fail the response; it serves the already-validated original.
         assert_eq!(response.status(), http::StatusCode::OK);
-        assert_eq!(
-            response.headers()["X-Remux-Subtitle-Alignment"],
-            "disabled"
-        );
+        assert_eq!(response.headers()["X-Remux-Subtitle-Alignment"], "disabled");
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();

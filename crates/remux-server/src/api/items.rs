@@ -2508,6 +2508,29 @@ async fn item_for_user(
         base_item.can_download = Some(false);
     }
 
+    if want_streams {
+        let cfg = session
+            .user
+            .configuration
+            .as_ref()
+            .map(|c| c.0.clone())
+            .unwrap_or_default();
+        if let Some(sources) = base_item.media_sources.as_mut() {
+            for source in sources.iter_mut() {
+                source.resolve_default_streams(
+                    &cfg,
+                    server_config.preferred_metadata_language.as_deref(),
+                    media.original_language.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                super::playback::ensure_remote_hls_audio_default(source);
+            }
+        }
+    }
+
     if want_streams
         && server_config
             .enable_subtitles_detail
@@ -2546,6 +2569,14 @@ async fn item_for_user(
                 false,
             )
             .await;
+            super::subtitles::present_dub_row_embedded_subtitles(
+                sources,
+                id,
+                session
+                    .device
+                    .access_token
+                    .expose(),
+            );
             for source in sources.iter_mut() {
                 for s in &mut source.media_streams {
                     if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {
