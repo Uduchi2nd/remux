@@ -1071,11 +1071,20 @@ impl UserMediaState {
             let min_duration = server_config
                 .min_resume_duration_seconds
                 .unwrap_or(90);
+            let min_seconds = server_config
+                .min_resume_seconds
+                .unwrap_or(0);
 
-            let played = runtime > 0 && position_seconds >= runtime * max_pct / 100;
-            let no_resume = runtime > 0
-                && (runtime < min_duration
-                    || position_seconds < runtime * min_pct / 100);
+            let (played, no_resume) = resume_verdict(
+                position_seconds,
+                runtime,
+                ResumeThresholds {
+                    min_pct,
+                    max_pct,
+                    min_duration,
+                    min_seconds,
+                },
+            );
 
             if played {
                 ms.playback_position = 0;
@@ -2258,5 +2267,77 @@ mod identity_reattach_tests {
             "the orphaned legacy row should have been found via the backfilled identity"
         );
         assert_eq!(reattached.play_count, 9);
+    }
+}
+
+/// Server-configured resume/played thresholds, see [`resume_verdict`].
+#[derive(Debug, Clone, Copy)]
+pub struct ResumeThresholds {
+    /// Percentage of runtime below which no resume point is kept.
+    pub min_pct: i64,
+    /// Percentage of runtime at which the item counts as played.
+    pub max_pct: i64,
+    /// Items shorter than this (seconds) never get a resume point.
+    pub min_duration: i64,
+    /// Absolute watch time (seconds) below which no resume point is kept.
+    /// `> 0` replaces the `min_pct` rule; `0` disables it.
+    pub min_seconds: i64,
+}
+
+/// Decide `(played, no_resume)` for a stop/progress report.
+///
+/// `no_resume` means the position is discarded (reset to 0) so a brief peek
+/// doesn't land in Continue Watching. The minimum can be either a percentage
+/// of runtime (Jellyfin's `MinResumePct`) or, when `min_seconds > 0`, a fixed
+/// number of seconds independent of runtime.
+pub fn resume_verdict(position_seconds: i64, runtime: i64, t: ResumeThresholds) -> (bool, bool) {
+    if runtime <= 0 {
+        return (false, false);
+    }
+    let played = position_seconds >= runtime * t.max_pct / 100;
+    let below_min = if t.min_seconds > 0 {
+        position_seconds < t.min_seconds
+    } else {
+        position_seconds < runtime * t.min_pct / 100
+    };
+    let no_resume = runtime < t.min_duration || below_min;
+    (played, no_resume)
+}
+
+#[cfg(test)]
+mod resume_threshold_tests {
+    use super::*;
+
+    fn pct_only() -> ResumeThresholds {
+        ResumeThresholds { min_pct: 5, max_pct: 90, min_duration: 90, min_seconds: 0 }
+    }
+
+    #[test]
+    fn percentage_rule_applies_when_no_absolute_minimum() {
+        // 112-minute movie: 5 % is 336 s.
+        assert_eq!(resume_verdict(176, 6720, pct_only()), (false, true));
+        assert_eq!(resume_verdict(336, 6720, pct_only()), (false, false));
+        assert_eq!(resume_verdict(6048, 6720, pct_only()), (true, false));
+    }
+
+    #[test]
+    fn absolute_minimum_replaces_percentage_rule() {
+        let t = ResumeThresholds { min_seconds: 60, ..pct_only() };
+        // Same 3-minute session into the movie now qualifies.
+        assert_eq!(resume_verdict(176, 6720, t), (false, false));
+        assert_eq!(resume_verdict(59, 6720, t), (false, true));
+        assert_eq!(resume_verdict(60, 6720, t), (false, false));
+        // And the rule is runtime-independent: 60 s into a 20-minute episode
+        // (5 % would only be 60 s anyway) and into a 3-hour film both keep.
+        assert_eq!(resume_verdict(60, 1200, t), (false, false));
+        assert_eq!(resume_verdict(60, 10800, t), (false, false));
+        // Played threshold and the short-item cutoff are unaffected.
+        assert_eq!(resume_verdict(1100, 1200, t), (true, false));
+        assert_eq!(resume_verdict(75, 80, t), (true, true));
+    }
+
+    #[test]
+    fn zero_runtime_never_decides_anything() {
+        assert_eq!(resume_verdict(500, 0, pct_only()), (false, false));
     }
 }
