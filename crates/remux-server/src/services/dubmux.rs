@@ -455,3 +455,155 @@ mod tests {
         );
     }
 }
+
+// ------------------------------------------------------------------------
+// One-shot prefetch on playback start: prepare the dubs of the upcoming
+// episodes (extract + match on the seedbox, no muxing) and pre-mux the very
+// next one so it starts instantly. Runs once per series per hour, off the
+// request path, sequentially with a small gap so addon/muxer load stays flat.
+
+static PREFETCHED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn spawn_prefetch_upcoming(ctx: AppContext, media: db::Media, user: Uuid) {
+    let Some(_) = DubmuxConfig::from(&ctx.config) else {
+        return;
+    };
+    if media.kind != db::MediaKind::Episode
+        || ctx
+            .config
+            .dubmux_prefetch_episodes
+            == 0
+    {
+        return;
+    }
+    let Some(series_id) = media.grandparent_id else {
+        return;
+    };
+    {
+        let mut seen = PREFETCHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        seen.retain(|_, t| t.elapsed() < Duration::from_secs(3600));
+        if seen.contains_key(&series_id) {
+            return;
+        }
+        seen.insert(series_id, std::time::Instant::now());
+    }
+    tokio::spawn(async move {
+        if let Err(e) = prefetch_upcoming(&ctx, &media, series_id, user).await {
+            warn!(series = %series_id, "dub prefetch failed: {e:#}");
+        }
+    });
+}
+
+async fn prefetch_upcoming(
+    ctx: &AppContext,
+    media: &db::Media,
+    series_id: Uuid,
+    user: Uuid,
+) -> anyhow::Result<()> {
+    let limit = ctx
+        .config
+        .dubmux_prefetch_episodes as i64;
+    let next = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM media WHERE kind = 'episode' AND grandparent_id = ? \
+         AND (parent_idx > ? OR (parent_idx = ? AND idx > ?)) \
+         ORDER BY parent_idx, idx LIMIT ?",
+    )
+    .bind(series_id)
+    .bind(
+        media
+            .parent_idx
+            .unwrap_or(0),
+    )
+    .bind(
+        media
+            .parent_idx
+            .unwrap_or(0),
+    )
+    .bind(
+        media
+            .idx
+            .unwrap_or(0),
+    )
+    .bind(limit)
+    .fetch_all(&ctx.db)
+    .await?;
+    info!(series = %series_id, episodes = next.len(), "dub prefetch: walking upcoming episodes");
+    for (offset, id) in next
+        .into_iter()
+        .enumerate()
+    {
+        let Some(mut ep) = db::Media::get_by_id(&ctx.db, &id).await? else {
+            continue;
+        };
+        // refresh_streams honours the freshness window and runs the dub hook
+        // (wait 0) itself; stale lists cost one addon round-trip per episode.
+        if let Err(e) = ctx
+            .addons
+            .refresh_streams(&mut ep, ctx, Some(user))
+            .await
+        {
+            warn!(episode = %id, "dub prefetch: stream refresh failed: {e:#}");
+            continue;
+        }
+        if offset == 0
+            && ctx
+                .config
+                .dubmux_premux_next
+        {
+            premux_first_pair(ctx, &ep, user).await;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    Ok(())
+}
+
+/// Wait for the next episode's preparations and hit the muxer's master
+/// playlist for the first accepted pair so the whole episode is muxed and
+/// cached before the viewer gets there.
+async fn premux_first_pair(ctx: &AppContext, ep: &db::Media, user: Uuid) {
+    let Some(cfg) = DubmuxConfig::from(&ctx.config) else {
+        return;
+    };
+    let Ok(streams) = ep
+        .streams(&ctx.db)
+        .await
+    else {
+        return;
+    };
+    let mut rows = ensure_dub_rows(ctx, ep, &streams, 45).await;
+    if rows.is_empty() {
+        rows = streams
+            .iter()
+            .filter(|s| is_dubmux_row(s))
+            .cloned()
+            .collect();
+    }
+    let Some(url) = rows
+        .first()
+        .and_then(http_url)
+    else {
+        debug!(episode = %ep.id, "dub prefetch: no accepted pair to pre-mux");
+        return;
+    };
+    // Reach the muxer over the tailnet API host, not the public hostname.
+    let url = url.replacen(cfg.public, cfg.api, 1);
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap_or_default();
+    match client
+        .get(&url)
+        .send()
+        .await
+    {
+        Ok(r) => {
+            info!(episode = %ep.id, status = %r.status(), user = %user, "dub prefetch: next episode mux started")
+        }
+        Err(e) => warn!(episode = %ep.id, "dub prefetch: mux start failed: {e:#}"),
+    }
+}

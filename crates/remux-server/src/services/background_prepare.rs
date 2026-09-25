@@ -6,7 +6,10 @@ use uuid::Uuid;
 
 use crate::{
     AppContext,
-    db::{self, PRIORITY_CURRENT_EPISODE, PRIORITY_NEXT_EPISODE, PRIORITY_RECENT_EPISODE, PRIORITY_UPCOMING_EPISODE},
+    db::{
+        self, PRIORITY_CURRENT_EPISODE, PRIORITY_NEXT_EPISODE, PRIORITY_RECENT_EPISODE,
+        PRIORITY_UPCOMING_EPISODE,
+    },
     signals::{DeliveryMode, Event, EventType, PlaybackContext, Subscriber},
 };
 
@@ -16,8 +19,9 @@ fn add_refresh_target(
     series_id: Option<Uuid>,
     priority: i64,
 ) {
-    if let Some((_, _, existing_priority)) =
-        targets.iter_mut().find(|(id, _, _)| *id == media_id)
+    if let Some((_, _, existing_priority)) = targets
+        .iter_mut()
+        .find(|(id, _, _)| *id == media_id)
     {
         *existing_priority = (*existing_priority).max(priority);
     } else {
@@ -32,9 +36,20 @@ fn has_expected_media_stream(
     source: &crate::api::MediaSourceInfo,
 ) -> bool {
     match item_kind {
-        db::MediaKind::Movie | db::MediaKind::Episode => source.video_stream().is_some(),
-        db::MediaKind::Track => source.audio_stream().is_some(),
-        _ => source.video_stream().is_some() || source.audio_stream().is_some(),
+        db::MediaKind::Movie | db::MediaKind::Episode => source
+            .video_stream()
+            .is_some(),
+        db::MediaKind::Track => source
+            .audio_stream()
+            .is_some(),
+        _ => {
+            source
+                .video_stream()
+                .is_some()
+                || source
+                    .audio_stream()
+                    .is_some()
+        }
     }
 }
 
@@ -46,11 +61,16 @@ async fn probe_background_candidate(
     timeout_p2p_secs: u64,
     port: u16,
 ) -> bool {
-    let Some(stream_info) = source.stream_info.as_ref() else {
+    let Some(stream_info) = source
+        .stream_info
+        .as_ref()
+    else {
         crate::playback::probe::record_probe_verification(&source, false);
         return false;
     };
-    let url = stream_info.descriptor.server_input(source.id, port);
+    let url = stream_info
+        .descriptor
+        .server_input(source.id, port);
     let timeout = if stream_info.is_p2p() {
         timeout_p2p_secs
     } else {
@@ -93,34 +113,54 @@ async fn probe_background_streams(
     ctx: &AppContext,
     item: &mut db::Media,
 ) -> anyhow::Result<(usize, usize)> {
-    let sources = item.streams(&ctx.db).await?;
+    let sources = item
+        .streams(&ctx.db)
+        .await?;
     let checked = sources.len();
-    let item_kind = item.kind.clone();
+    let item_kind = item
+        .kind
+        .clone();
     let probe_config = db::Settings::get_config_or_default(&ctx.db).await;
-    let timeout_secs = probe_config.probe_timeout_secs.unwrap_or(20) as u64;
-    let timeout_p2p_secs = probe_config.probe_timeout_p2p_secs.unwrap_or(60) as u64;
-    let port = ctx.config.port;
+    let timeout_secs = probe_config
+        .probe_timeout_secs
+        .unwrap_or(20) as u64;
+    let timeout_p2p_secs = probe_config
+        .probe_timeout_p2p_secs
+        .unwrap_or(60) as u64;
+    let port = ctx
+        .config
+        .port;
 
-    let results = stream::iter(sources.into_iter().map(|source| {
-        let ctx = ctx.clone();
-        let item_kind = item_kind.clone();
-        async move {
-            probe_background_candidate(
-                ctx,
-                source,
-                item_kind,
-                timeout_secs,
-                timeout_p2p_secs,
-                port,
-            )
-            .await
-        }
-    }))
+    let results = stream::iter(
+        sources
+            .into_iter()
+            .map(|source| {
+                let ctx = ctx.clone();
+                let item_kind = item_kind.clone();
+                async move {
+                    probe_background_candidate(
+                        ctx,
+                        source,
+                        item_kind,
+                        timeout_secs,
+                        timeout_p2p_secs,
+                        port,
+                    )
+                    .await
+                }
+            }),
+    )
     .buffer_unordered(BACKGROUND_PROBE_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
 
-    Ok((checked, results.into_iter().filter(|playable| *playable).count()))
+    Ok((
+        checked,
+        results
+            .into_iter()
+            .filter(|playable| *playable)
+            .count(),
+    ))
 }
 
 pub struct BackgroundPrepareSubscriber {
@@ -129,7 +169,10 @@ pub struct BackgroundPrepareSubscriber {
 
 impl BackgroundPrepareSubscriber {
     pub fn start_worker(ctx: AppContext) {
-        if !ctx.config.background_stream_refresh_enabled {
+        if !ctx
+            .config
+            .background_stream_refresh_enabled
+        {
             return;
         }
         tokio::spawn(async move {
@@ -137,14 +180,18 @@ impl BackgroundPrepareSubscriber {
                 match db::claim_due_stream_refresh(&ctx.db).await {
                     Ok(Some(job)) => {
                         let result = async {
-                            let Some(mut media) = db::Media::get_by_id(&ctx.db, &job.media_id)
-                                .await?
+                            let Some(mut media) =
+                                db::Media::get_by_id(&ctx.db, &job.media_id).await?
                             else {
                                 db::finish_stream_refresh(&ctx.db, &job, false).await?;
                                 return Ok::<_, anyhow::Error>(());
                             };
                             ctx.addons
-                                .refresh_streams_background(&mut media, &ctx, Some(job.user_id))
+                                .refresh_streams_background(
+                                    &mut media,
+                                    &ctx,
+                                    Some(job.user_id),
+                                )
                                 .await?;
                             let (checked, playable) =
                                 probe_background_streams(&ctx, &mut media).await?;
@@ -156,7 +203,12 @@ impl BackgroundPrepareSubscriber {
                             );
                             let active = match job.series_id {
                                 Some(series_id) => {
-                                    db::series_recently_played(&ctx.db, job.user_id, series_id).await?
+                                    db::series_recently_played(
+                                        &ctx.db,
+                                        job.user_id,
+                                        series_id,
+                                    )
+                                    .await?
                                 }
                                 None => false,
                             };
@@ -172,15 +224,22 @@ impl BackgroundPrepareSubscriber {
                                 "background stream refresh failed"
                             );
                             let still_active = match job.series_id {
-                                Some(series_id) => {
-                                    db::series_recently_played(&ctx.db, job.user_id, series_id)
-                                        .await
-                                        .unwrap_or(false)
-                                }
+                                Some(series_id) => db::series_recently_played(
+                                    &ctx.db,
+                                    job.user_id,
+                                    series_id,
+                                )
+                                .await
+                                .unwrap_or(false),
                                 None => false,
                             };
                             let reschedule = if still_active {
-                                db::fail_stream_refresh(&ctx.db, &job, &error.to_string()).await
+                                db::fail_stream_refresh(
+                                    &ctx.db,
+                                    &job,
+                                    &error.to_string(),
+                                )
+                                .await
                             } else {
                                 db::finish_stream_refresh(&ctx.db, &job, false).await
                             };
@@ -196,7 +255,9 @@ impl BackgroundPrepareSubscriber {
                         // recently watched episodes at once.
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
-                    Ok(None) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+                    Ok(None) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await
+                    }
                     Err(error) => {
                         warn!(error = %error, "background stream refresh queue unavailable");
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -206,8 +267,18 @@ impl BackgroundPrepareSubscriber {
         });
     }
 
-    async fn enqueue_playback_scope(&self, playback: &PlaybackContext) -> anyhow::Result<()> {
-        let Some(media) = db::Media::get_by_id(&self.ctx.db, &playback.media_id).await? else {
+    async fn enqueue_playback_scope(
+        &self,
+        playback: &PlaybackContext,
+    ) -> anyhow::Result<()> {
+        let Some(media) = db::Media::get_by_id(
+            &self
+                .ctx
+                .db,
+            &playback.media_id,
+        )
+        .await?
+        else {
             return Ok(());
         };
         let mut targets = Vec::new();
@@ -232,7 +303,10 @@ impl BackgroundPrepareSubscriber {
                 .bind(media.idx.unwrap_or(0))
                 .fetch_all(&self.ctx.db)
                 .await?;
-                for (offset, id) in next.into_iter().enumerate() {
+                for (offset, id) in next
+                    .into_iter()
+                    .enumerate()
+                {
                     let priority = if offset == 0 {
                         PRIORITY_NEXT_EPISODE
                     } else {
@@ -265,9 +339,23 @@ impl BackgroundPrepareSubscriber {
             }
         }
 
+        // PATCH (uduchi2nd): one-shot VN-dub prefetch for the upcoming
+        // episodes (seedbox extract + match; next episode also pre-muxed).
+        // Separate from the refresh queue on purpose: that one re-polls its
+        // targets every 12–14 min, which is the wrong cadence for a 10-deep
+        // walk of addon calls.
+        crate::services::dubmux::spawn_prefetch_upcoming(
+            self.ctx
+                .clone(),
+            media.clone(),
+            playback.user_id,
+        );
+
         for (media_id, series_id, priority) in targets {
             db::enqueue_stream_refresh(
-                &self.ctx.db,
+                &self
+                    .ctx
+                    .db,
                 playback.user_id,
                 media_id,
                 series_id,
@@ -299,11 +387,16 @@ impl Subscriber for BackgroundPrepareSubscriber {
     }
 
     async fn handle(&self, event: Event) -> anyhow::Result<()> {
-        if !self.ctx.config.background_stream_refresh_enabled {
+        if !self
+            .ctx
+            .config
+            .background_stream_refresh_enabled
+        {
             return Ok(());
         }
         if let Event::PlaybackStarted(playback) = event {
-            self.enqueue_playback_scope(&playback).await?;
+            self.enqueue_playback_scope(&playback)
+                .await?;
         }
         Ok(())
     }
