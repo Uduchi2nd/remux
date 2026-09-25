@@ -319,6 +319,16 @@ pub(crate) async fn ensure_dub_rows(
                 .filter(|p| !p.is_filename_guess())
                 .map(|p| mux_probe(p, provider));
             rows.push(row);
+            // HQ releases are walked in quality order, so the cap keeps the
+            // best video and its dub variants (backups against a bad dub)
+            // rather than one dub across every release.
+            if rows.len()
+                >= ctx
+                    .config
+                    .dubmux_max_rows as usize
+            {
+                break 'pairs;
+            }
         }
     }
     if rows.is_empty() {
