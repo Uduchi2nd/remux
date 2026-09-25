@@ -596,6 +596,10 @@ fn default_dubmux_prefetch_previous() -> u64 {
     2
 }
 
+fn default_dubmux_max_rows() -> u64 {
+    3
+}
+
 fn default_dubmux_premux_next() -> bool {
     true
 }
@@ -650,6 +654,9 @@ pub struct Config {
     /// Episodes before the current one to prepare after the upcoming ones.
     #[serde(default = "default_dubmux_prefetch_previous")]
     pub dubmux_prefetch_previous: u64,
+    /// Most "[+VN dub]" rows per item, filled in HQ-quality order (default 3).
+    #[serde(default = "default_dubmux_max_rows")]
+    pub dubmux_max_rows: u64,
     /// Freshness window for addon stream candidate lists; warm jobs refresh before expiry.
     #[serde(default = "default_stream_list_cache_ttl_secs")]
     pub stream_list_cache_ttl_secs: u64,
@@ -823,6 +830,7 @@ impl Default for Config {
             dubmux_prefetch_episodes: default_dubmux_prefetch_episodes(),
             dubmux_premux_next: default_dubmux_premux_next(),
             dubmux_prefetch_previous: default_dubmux_prefetch_previous(),
+            dubmux_max_rows: default_dubmux_max_rows(),
             subtitle_alignment_token_file: None,
             stream_list_cache_ttl_secs: default_stream_list_cache_ttl_secs(),
             background_stream_refresh_enabled:
