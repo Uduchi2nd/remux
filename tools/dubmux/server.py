@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dubmux  # noqa: E402
+import align  # noqa: E402
 
 DATA = Path(os.environ.get("DUBMUX_DATA", "/data"))
 AUDIO, MATCH, HLS = DATA / "audio", DATA / "match", DATA / "hls"
@@ -64,6 +65,28 @@ def _load_match(k):
 
 
 _extract_locks: dict[str, threading.Lock] = {}
+# Matching is CPU/IO heavy (3 concurrent HTTP seeks + decodes + FFTs per
+# pair); a prefetch fan-out can queue dozens of pairs at once. Bound it so
+# the event loop keeps answering /prepare and /mux promptly.
+MATCH_SLOTS = threading.Semaphore(int(os.environ.get("DUBMUX_MATCH_SLOTS", "3")))
+# Decoded HQ windows are shared across the dubs paired with the same release
+# (up to three dubs per episode) for a few minutes.
+_hq_windows: dict[tuple, tuple[float, object]] = {}
+
+
+def _decode_hq(url, start, span):
+    key = (url, round(start, 1), span)
+    now = time.time()
+    with _lock:
+        hit = _hq_windows.get(key)
+        if hit and now - hit[0] < 600:
+            return hit[1]
+    data = dubmux.decode(url, start, span)
+    with _lock:
+        if len(_hq_windows) > 60:
+            _hq_windows.clear()
+        _hq_windows[key] = (now, data)
+    return data
 
 
 def _extract_lock(dub_id):
@@ -81,6 +104,7 @@ for _stray in AUDIO.glob("*.m4a.part"):
 
 def _prepare_worker(dub, video, k):
     job = _jobs[k]
+    slot_held = False
     try:
         meta = AUDIO / f"{dub['id']}.json"
         # One extraction per dub even when several HQ sources ask at once
@@ -91,6 +115,9 @@ def _prepare_worker(dub, video, k):
                 args = type("A", (), {"name": dub["id"], "url": dub["url"], "reencode": False,
                                       "parallel": WORKERS})
                 dubmux.cmd_extract(args)
+        job["stage"] = "match:queued"
+        MATCH_SLOTS.acquire()
+        slot_held = True
         job["stage"] = "match"
         args = type("A", (), {"name": dub["id"], "video": video["url"], "windows": "90,mid,-150",
                               "span": 120.0, "tolerance": 1.5, "max_lag": 60.0,
@@ -107,7 +134,21 @@ def _prepare_worker(dub, video, k):
                   "dub_duration": ddur, "duration_delta": round(vdur - ddur, 3),
                   "created": int(time.time())}
         if abs(vdur - ddur) > args.tolerance:
-            result["verdict"] = "reject:duration"
+            # Different cut (VN encodes drop the ident / credits / preview):
+            # try a piecewise alignment and render a track on the video's
+            # clock; the mux then uses that track with no offset.
+            job["stage"] = "match:piecewise"
+            dubfile = str(AUDIO / f"{dub['id']}.m4a")
+            rep = align.align(video["url"], dubfile, str(MATCH), k)
+            result["piecewise"] = {kk: vv for kk, vv in rep.items() if kk != "aligned"}
+            if rep.get("verdict") == "accept":
+                result["lag"] = 0.0
+                result["verdict"] = "accept"
+            else:
+                result["verdict"] = "reject:duration"
+            hq = MATCH / f"{k}.hq.mka"
+            if hq.exists():
+                hq.unlink()
         else:
             dubfile = str(AUDIO / f"{dub['id']}.m4a")
             windows = [90.0, vdur / 2, vdur - 150 - args.span]
@@ -115,7 +156,7 @@ def _prepare_worker(dub, video, k):
             from concurrent.futures import ThreadPoolExecutor
 
             def one(start):
-                a = dubmux.decode(video["url"], start, args.span)
+                a = _decode_hq(video["url"], start, args.span)
                 b = dubmux.decode(dubfile, start, args.span)
                 lag, peak, ratio = dubmux.xcorr_lag(a, b, args.max_lag)
                 method = "waveform"
@@ -141,6 +182,8 @@ def _prepare_worker(dub, video, k):
               file=sys.stderr, flush=True)
         job.update(status="error", stage="done", error=str(e)[-500:])
     finally:
+        if slot_held:
+            MATCH_SLOTS.release()
         job["finished"] = time.time()
 
 
@@ -199,9 +242,14 @@ def _start_mux(k, video_url, dub_id, lag):
         for f in d.iterdir():
             f.unlink()
         dubfile = str(AUDIO / f"{dub_id}.m4a")
-        # dub(t) ≈ video(t + lag): delay the dub by lag so both clocks agree.
+        # video(t) <-> dub(t + lag) (verified against a synthetic delay), so
+        # the dub must be shifted by -lag to sit on the video's clock. A
+        # piecewise-aligned track already lives on the video's clock.
+        aligned = MATCH / f"{k}.aligned.m4a"
+        if aligned.exists():
+            dubfile, lag = str(aligned), 0.0
         cmd = ["ffmpeg", "-nostdin", "-y", "-v", "warning", *dubmux.ua_for(video_url),
-               "-i", video_url, "-itsoffset", f"{lag:.3f}", "-i", dubfile,
+               "-i", video_url, "-itsoffset", f"{-lag:.3f}", "-i", dubfile,
                # Subtitles are dropped from the TS on purpose: text tracks
                # can't be muxed into MPEG-TS, and remux keeps serving the
                # source's subtitles (embedded via its own extraction routes,
@@ -237,6 +285,12 @@ def master(dub_id: str, video_id: str, request: Request):
     video_url = request.query_params.get("video") or m.get("video_url")
     if not video_url:
         raise HTTPException(400, "video url required (query ?video=)")
+    # remux liveness checks (and item-doc probes) HEAD the master while a
+    # viewer merely browses; only a GET — a player, or the deliberate
+    # next-episode pre-mux — may start a full-episode mux.
+    if request.method == "HEAD":
+        return Response(status_code=200, media_type="application/vnd.apple.mpegurl",
+                        headers={"Cache-Control": "no-store"})
     if not (_session_dir(k) / ".done").exists():
         m["video_url"] = video_url
         json.dump(m, open(_match_path(k), "w"), indent=1)

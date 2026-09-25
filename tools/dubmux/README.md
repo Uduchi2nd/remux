@@ -19,6 +19,19 @@ front of the source list for every accepted pair.
    (±1.5 s), then cross-correlate 120 s mono 8 kHz windows at 90 s / midpoint /
    end-150 s (numpy FFT; envelope fallback). Accept when all peak/rms ≥ 8 and
    the lags agree within 0.15 s. ~11 s. Result cached in `match/`.
+2b. **piecewise** (`align.py`, when the duration gate fails by ≤ 180 s): VN
+   encodes are the same episode minus blocks (streamer ident, opening
+   credits, tail preview), so the lag is piecewise constant. The HQ audio is
+   fetched once into a local .mka (debrid CDNs 429 on dozens of ranged
+   seeks); 60 s coarse windows are grouped into runs of constant lag (single
+   weak windows are noise, dropped), each boundary is pinned to 0.5 s by
+   comparing the two candidate lags on 3 s windows, and one AAC track is
+   rendered on the video's clock: dub inside the runs, the release's own
+   audio in the gaps. Pursuit of Jade E01 (kkphim dub 2783 s vs NF 2820 s):
+   dub[0,178) at −5.92 s, dub[178,end) at −33.44 s, original audio for the
+   5.9 s ident, the 27.5 s credits and the 3 s tail. The mux then uses
+   `match/<pair>.aligned.m4a` with no offset. Sign convention:
+   `video(t) <-> dub(t + lag)` (verified on a synthetic delay).
 3. **mux** (`/mux/<dub>/<hq>/master.m3u8`): one `ffmpeg -c copy` pass into
    6 s MPEG-TS segments (`-hls_playlist_type event`, dub delayed by the
    measured lag). Segments are served as they land; a seek past the produced
@@ -35,6 +48,10 @@ front of the source list for every accepted pair.
   `GET /status/<dub>/<hq>`, `podman logs dubmux`.
 - Restart policy only survives process exits; a Whatbox maintenance SIGTERM
   leaves it stopped (same as nzbdav) — `podman start dubmux`.
+- HEAD on master.m3u8 never starts a mux (remux liveness checks); only a
+  GET does. `DUBMUX_MATCH_SLOTS` (3) bounds concurrent matches. The
+  container runs with `--network=host` (pasta cannot hairpin to the
+  seedbox's own public hostname used by vnphim's VN-proxied segments).
 - Cold first play of an episode: ~20 s of preparation. remux waits up to
   `DUBMUX_PREPARE_WAIT_SECS` (12) in PlaybackInfo, so the rows usually appear
   on the second request (opening the episode triggers the first).
