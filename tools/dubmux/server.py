@@ -374,6 +374,18 @@ def jobs():
     return {k: {kk: vv for kk, vv in v.items() if kk != "result"} for k, v in _jobs.items()}
 
 
+@app.post("/sweep")
+def sweep_now():
+    """Apply retention / budget immediately (also runs at startup)."""
+    _sweep()
+    return health()
+
+
+# Retention on startup too: a prefetch sweep can complete many muxes while the
+# reaper-time sweep only ever runs on this process's own completions.
+threading.Thread(target=_sweep, daemon=True).start()
+
+
 @app.get("/health")
 def health():
     hls = [d for d in HLS.iterdir() if d.is_dir()]

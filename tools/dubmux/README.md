@@ -40,6 +40,15 @@ front of the source list for every accepted pair.
    (MPEG-TS cannot carry text tracks); remux keeps serving addon/vnphim
    external subtitles.
 
+## Incidents / rules learned
+- Background stream probing (remux `probe_background_streams`) must skip
+  `[+VN dub]` rows: an ffprobe on the master playlist starts a full-episode
+  mux, and one prefetch sweep produced 108 muxes / 298 GB. HEAD requests
+  never start a mux; `DUBMUX_HLS_BUDGET_GB` is 150 and retention also runs
+  at startup (`POST /sweep` applies it on demand).
+- Never edit repo files while a build chain is still in its format/copy-back
+  step: the copy-back clobbered a later edit once (the 2-previous walk).
+
 ## Operations
 - Deploy: copy `dubmux.py server.py Containerfile run.sh` to seedbox
   `~/dubmux/`, `podman build -t localhost/dubmux:latest -f Containerfile .`,
