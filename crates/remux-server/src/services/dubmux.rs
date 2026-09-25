@@ -541,8 +541,42 @@ async fn prefetch_upcoming(
     .bind(limit)
     .fetch_all(&ctx.db)
     .await?;
-    info!(series = %series_id, episodes = next.len(), "dub prefetch: walking upcoming episodes");
-    for (offset, id) in next
+    // The two episodes before the current one go last: a rewatch/"what did I
+    // miss" is plausible but far less likely than pressing next.
+    let previous = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM media WHERE kind = 'episode' AND grandparent_id = ? \
+         AND (parent_idx < ? OR (parent_idx = ? AND idx < ?)) \
+         ORDER BY parent_idx DESC, idx DESC LIMIT ?",
+    )
+    .bind(series_id)
+    .bind(
+        media
+            .parent_idx
+            .unwrap_or(0),
+    )
+    .bind(
+        media
+            .parent_idx
+            .unwrap_or(0),
+    )
+    .bind(
+        media
+            .idx
+            .unwrap_or(0),
+    )
+    .bind(
+        ctx.config
+            .dubmux_prefetch_previous as i64,
+    )
+    .fetch_all(&ctx.db)
+    .await?;
+    let upcoming = next.len();
+    let order: Vec<Uuid> = next
+        .into_iter()
+        .chain(previous)
+        .collect();
+    info!(series = %series_id, upcoming, total = order.len(), "dub prefetch: walking episodes");
+    for (offset, id) in order
         .into_iter()
         .enumerate()
     {
