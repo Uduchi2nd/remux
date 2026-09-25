@@ -7,9 +7,9 @@ use axum::{
 use axum_anyhow::ApiResult as Result;
 use http::{Response, StatusCode};
 use remux_macros::get;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-use std::time::Duration;
 
 mod alignment;
 pub(crate) mod gate;
@@ -81,17 +81,34 @@ fn good_track_key(
     ))
 }
 
-fn good_track_path(data_dir: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
+fn good_track_path(
+    data_dir: &std::path::Path,
+    key: &str,
+) -> Option<std::path::PathBuf> {
     let id = key.strip_prefix("subtitle-good-track:")?;
-    if id.len() != 36 || !id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+    if id.len() != 36
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b'-')
+    {
         return None;
     }
-    Some(data_dir.join("subtitle-good-tracks").join(format!("{id}.json")))
+    Some(
+        data_dir
+            .join("subtitle-good-tracks")
+            .join(format!("{id}.json")),
+    )
 }
 
 async fn load_good_track(ctx: &crate::AppContext, key: &str) -> Option<GoodTrack> {
-    let path = good_track_path(&ctx.config.data_dir, key)?;
-    let body = tokio::fs::read(&path).await.ok()?;
+    let path = good_track_path(
+        &ctx.config
+            .data_dir,
+        key,
+    )?;
+    let body = tokio::fs::read(&path)
+        .await
+        .ok()?;
     let cached: PersistedGoodTrack = match serde_json::from_slice(&body) {
         Ok(cached) => cached,
         Err(_) => {
@@ -105,8 +122,15 @@ async fn load_good_track(ctx: &crate::AppContext, key: &str) -> Option<GoodTrack
         .as_secs();
     let age = now.saturating_sub(cached.saved_at_unix);
     if age >= GOOD_TRACK_CACHE_TTL.as_secs()
-        || cached.text.len() > MAX_GOOD_TRACK_BYTES
-        || !gate::valid_subtitle(cached.text.as_bytes())
+        || cached
+            .text
+            .len()
+            > MAX_GOOD_TRACK_BYTES
+        || !gate::valid_subtitle(
+            cached
+                .text
+                .as_bytes(),
+        )
     {
         let _ = tokio::fs::remove_file(path).await;
         return None;
@@ -126,9 +150,15 @@ async fn save_good_track(
     if bytes.len() > MAX_GOOD_TRACK_BYTES || !gate::valid_subtitle(bytes) {
         anyhow::bail!("refusing to persist an invalid subtitle track");
     }
-    let path = good_track_path(&ctx.config.data_dir, key)
-        .ok_or_else(|| anyhow!("invalid good subtitle cache key"))?;
-    let dir = path.parent().expect("subtitle cache path has parent");
+    let path = good_track_path(
+        &ctx.config
+            .data_dir,
+        key,
+    )
+    .ok_or_else(|| anyhow!("invalid good subtitle cache key"))?;
+    let dir = path
+        .parent()
+        .expect("subtitle cache path has parent");
     tokio::fs::create_dir_all(dir).await?;
     #[cfg(unix)]
     {
@@ -148,15 +178,22 @@ async fn save_good_track(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        tokio::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600)).await?;
+        tokio::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
+            .await?;
     }
     tokio::fs::rename(&staging, &path).await?;
-    prune_persisted_subtitle_caches(&ctx.config.data_dir).await;
+    prune_persisted_subtitle_caches(
+        &ctx.config
+            .data_dir,
+    )
+    .await;
     Ok(())
 }
 
 pub(super) async fn prune_persisted_subtitle_caches(data_dir: &std::path::Path) {
-    let _guard = PERSISTED_SUBTITLE_CACHE_PRUNE_LOCK.lock().await;
+    let _guard = PERSISTED_SUBTITLE_CACHE_PRUNE_LOCK
+        .lock()
+        .await;
     let mut files = Vec::new();
     for (directory, kind) in [
         (
@@ -168,19 +205,36 @@ pub(super) async fn prune_persisted_subtitle_caches(data_dir: &std::path::Path) 
             PersistedSubtitleCacheKind::Alignment,
         ),
     ] {
-        let Ok(mut entries) = tokio::fs::read_dir(data_dir.join(directory)).await else {
+        let Ok(mut entries) = tokio::fs::read_dir(data_dir.join(directory)).await
+        else {
             continue;
         };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let Ok(metadata) = entry.metadata().await else {
+        while let Ok(Some(entry)) = entries
+            .next_entry()
+            .await
+        {
+            let Ok(metadata) = entry
+                .metadata()
+                .await
+            else {
                 continue;
             };
             let path = entry.path();
-            if !metadata.is_file() || path.extension().is_none_or(|extension| extension != "json") {
+            if !metadata.is_file()
+                || path
+                    .extension()
+                    .is_none_or(|extension| extension != "json")
+            {
                 continue;
             }
-            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-            if modified.elapsed().unwrap_or_default() >= GOOD_TRACK_CACHE_TTL {
+            let modified = metadata
+                .modified()
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if modified
+                .elapsed()
+                .unwrap_or_default()
+                >= GOOD_TRACK_CACHE_TTL
+            {
                 let _ = tokio::fs::remove_file(path).await;
             } else {
                 files.push(PersistedSubtitleCacheFile {
@@ -211,7 +265,10 @@ fn select_cache_files_to_prune(
     max_alignment_files: usize,
 ) -> Vec<PersistedSubtitleCacheFile> {
     files.sort_by_key(|file| file.modified);
-    let mut total_bytes: u64 = files.iter().map(|file| file.bytes).sum();
+    let mut total_bytes: u64 = files
+        .iter()
+        .map(|file| file.bytes)
+        .sum();
     let mut good_track_count = files
         .iter()
         .filter(|file| file.kind == PersistedSubtitleCacheKind::GoodTrack)
@@ -472,7 +529,9 @@ async fn fetch_external_subtitle_bytes(
         return Ok((*bytes).clone());
     }
     if gate::known_invalid(&state.ctx, descriptor) {
-        return Err(anyhow!("upstream subtitle was recently rejected as invalid"));
+        return Err(anyhow!(
+            "upstream subtitle was recently rejected as invalid"
+        ));
     }
     let resp = match descriptor {
         crate::stream::StreamDescriptor::Opendal { addon_id, .. } => {
@@ -500,11 +559,14 @@ async fn fetch_external_subtitle_bytes(
     let status = resp.status();
     if !status.is_success() {
         if matches!(status.as_u16(), 400 | 404 | 410) {
-            state.ctx.store.save(
-                gate::invalid_key(descriptor),
-                true,
-                Duration::from_secs(15 * 60),
-            );
+            state
+                .ctx
+                .store
+                .save(
+                    gate::invalid_key(descriptor),
+                    true,
+                    Duration::from_secs(15 * 60),
+                );
         }
         return Err(anyhow!("upstream subtitle HTTP failure"));
     }
@@ -512,14 +574,20 @@ async fn fetch_external_subtitle_bytes(
         .await
         .map_err(|_| anyhow!("subtitle read failed"))?;
     if !gate::valid_subtitle(&bytes) {
-        state.ctx.store.save(
-            gate::invalid_key(descriptor),
-            true,
-            Duration::from_secs(15 * 60),
-        );
+        state
+            .ctx
+            .store
+            .save(
+                gate::invalid_key(descriptor),
+                true,
+                Duration::from_secs(15 * 60),
+            );
         return Err(anyhow!("upstream returned no valid subtitle cues"));
     }
-    state.ctx.store.delete(gate::invalid_key(descriptor));
+    state
+        .ctx
+        .store
+        .delete(gate::invalid_key(descriptor));
     state
         .ctx
         .store
@@ -562,16 +630,22 @@ fn cached_external_subtitle_response(
     auto_synced: bool,
 ) -> Response<Body> {
     let mut response = external_subtitle_response(bytes, output_format);
-    response.headers_mut().insert(
-        "X-Remux-Subtitle-Alignment",
-        if auto_synced { "aligned" } else { "unchanged" }
-            .parse()
-            .unwrap(),
-    );
-    response.headers_mut().insert(
-        "Cache-Control",
-        "private, no-store".parse().unwrap(),
-    );
+    response
+        .headers_mut()
+        .insert(
+            "X-Remux-Subtitle-Alignment",
+            if auto_synced { "aligned" } else { "unchanged" }
+                .parse()
+                .unwrap(),
+        );
+    response
+        .headers_mut()
+        .insert(
+            "Cache-Control",
+            "private, no-store"
+                .parse()
+                .unwrap(),
+        );
     response
 }
 
@@ -595,7 +669,8 @@ async fn aligned_external_response(
     // and a later request for the same track serves the finished result from
     // cache. Never fail the request over alignment being slow or unavailable
     // — worst case this just serves the original (already cue-validated) text.
-    let (bytes, status) = alignment::resolve(state, source, bytes, language, format, bypass).await;
+    let (bytes, status) =
+        alignment::resolve(state, source, bytes, language, format, bypass).await;
     if !bypass {
         let source_info = api::MediaSourceInfo::from(source.clone());
         let mut source_ids = vec![source_info.id, source.id];
@@ -606,14 +681,9 @@ async fn aligned_external_response(
         source_ids.dedup();
 
         if let Some(subtitle_id) = subtitle_id {
-            if let Some(key) = good_track_key(
-                "raw",
-                item_id,
-                None,
-                subtitle_id,
-                language,
-                None,
-            ) {
+            if let Some(key) =
+                good_track_key("raw", item_id, None, subtitle_id, language, None)
+            {
                 let _ = save_good_track(&state.ctx, &key, &original_bytes, false).await;
             }
             if matches!(status, "aligned" | "unchanged") {
@@ -658,11 +728,7 @@ async fn aligned_external_response(
                 state
                     .ctx
                     .store
-                    .save(
-                        key,
-                        status == "aligned",
-                        GOOD_TRACK_CACHE_TTL,
-                    );
+                    .save(key, status == "aligned", GOOD_TRACK_CACHE_TTL);
             }
         }
         if let Some(subtitle_id) = subtitle_id {
@@ -673,11 +739,10 @@ async fn aligned_external_response(
                     subtitle_id,
                     language,
                 ) {
-                    state.ctx.store.save(
-                        key,
-                        status == "aligned",
-                        GOOD_TRACK_CACHE_TTL,
-                    );
+                    state
+                        .ctx
+                        .store
+                        .save(key, status == "aligned", GOOD_TRACK_CACHE_TTL);
                 }
             }
         }
@@ -692,11 +757,7 @@ async fn aligned_external_response(
                 state
                     .ctx
                     .store
-                    .save(
-                        key,
-                        status == "aligned",
-                        GOOD_TRACK_CACHE_TTL,
-                    );
+                    .save(key, status == "aligned", GOOD_TRACK_CACHE_TTL);
             }
         }
     }
@@ -1051,10 +1112,13 @@ async fn subtitles_stream_inner(
                                 item_id,
                                 Some(source.id),
                                 &sub.id,
-                                sub.lang.as_deref(),
+                                sub.lang
+                                    .as_deref(),
                                 Some(&output_format),
                             ) {
-                                if let Some(cached) = load_good_track(&state.ctx, &key).await {
+                                if let Some(cached) =
+                                    load_good_track(&state.ctx, &key).await
+                                {
                                     return Ok(cached_external_subtitle_response(
                                         cached.bytes,
                                         &output_format,
@@ -1068,7 +1132,8 @@ async fn subtitles_stream_inner(
                             item_id,
                             None,
                             &sub.id,
-                            sub.lang.as_deref(),
+                            sub.lang
+                                .as_deref(),
                             None,
                         );
                         let bytes = if !bypass {
@@ -1083,23 +1148,30 @@ async fn subtitles_stream_inner(
                         };
                         let bytes = match bytes {
                             Some(bytes) => bytes,
-                            None => match fetch_external_subtitle_bytes(&state, descriptor).await {
-                                Ok(bytes) => {
-                                    if let Some(key) = raw_key.as_deref() {
-                                        let _ = save_good_track(&state.ctx, key, &bytes, false).await;
+                            None => {
+                                match fetch_external_subtitle_bytes(&state, descriptor)
+                                    .await
+                                {
+                                    Ok(bytes) => {
+                                        if let Some(key) = raw_key.as_deref() {
+                                            let _ = save_good_track(
+                                                &state.ctx, key, &bytes, false,
+                                            )
+                                            .await;
+                                        }
+                                        bytes
                                     }
-                                    bytes
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, item_id = %item_id, stream_index,
+                                    Err(e) => {
+                                        warn!(error = %e, item_id = %item_id, stream_index,
                                         "external subtitle unavailable");
-                                    return Ok((
-                                        StatusCode::NOT_FOUND,
-                                        "subtitle unavailable",
-                                    )
-                                        .into_response());
+                                        return Ok((
+                                            StatusCode::NOT_FOUND,
+                                            "subtitle unavailable",
+                                        )
+                                            .into_response());
+                                    }
                                 }
-                            },
+                            }
                         };
                         return Ok(aligned_external_response(
                             &state,
@@ -1110,7 +1182,8 @@ async fn subtitles_stream_inner(
                             Some(stream_index),
                             descriptor,
                             bytes,
-                            sub.lang.as_deref(),
+                            sub.lang
+                                .as_deref(),
                             &output_format,
                             bypass,
                         )
@@ -1151,6 +1224,10 @@ async fn subtitles_stream_inner(
                 )
         })
         .context_not_found("media source has no URL")?;
+    // PATCH (uduchi2nd): a "[+VN dub]" row is an HLS mux without text tracks;
+    // its listed subtitle streams are the HQ release's, extracted from the
+    // HQ file the mux was built from.
+    let url = crate::services::dubmux::hq_url_of(&media).unwrap_or(url);
 
     let output_format = format.to_ascii_lowercase();
     let is_json = matches!(output_format.as_str(), "js" | "json");
@@ -1544,7 +1621,9 @@ pub(crate) fn apply_subtitle_sync_label(
             item_id,
             source.id,
             subtitle_id,
-            stream.language.as_deref(),
+            stream
+                .language
+                .as_deref(),
         )
         .and_then(|key| {
             ctx.store
@@ -1576,8 +1655,14 @@ pub(crate) async fn restore_persisted_subtitle_sync_label(
     language: Option<&str>,
     stream: &mut api::MediaStream,
 ) {
-    if ctx.config.subtitle_alignment_url.is_none()
-        || ctx.config.subtitle_alignment_token_file.is_none()
+    if ctx
+        .config
+        .subtitle_alignment_url
+        .is_none()
+        || ctx
+            .config
+            .subtitle_alignment_token_file
+            .is_none()
     {
         return;
     }
@@ -1712,31 +1797,71 @@ async fn validate_external_subtitles_for_advertising(
         ),
     > = Default::default();
     for source in media_sources {
-        for sub in scored_external_subtitles(
-            &subs,
-            sub_langs,
-            &source.name,
-            &source.path,
-        ) {
-            let Some(descriptor) = sub.url.as_ref() else {
+        for sub in
+            scored_external_subtitles(&subs, sub_langs, &source.name, &source.path)
+        {
+            let Some(descriptor) = sub
+                .url
+                .as_ref()
+            else {
                 continue;
             };
             let key = gate::raw_key(descriptor);
             let entry = candidates
                 .entry(key)
                 .or_insert_with(|| (descriptor.clone(), Vec::new()));
-            let track = (sub.id.clone(), sub.lang.clone());
-            if !entry.1.contains(&track) {
-                entry.1.push(track);
+            let track = (
+                sub.id
+                    .clone(),
+                sub.lang
+                    .clone(),
+            );
+            if !entry
+                .1
+                .contains(&track)
+            {
+                entry
+                    .1
+                    .push(track);
             }
         }
     }
 
     let state_for_checks = state.clone();
-    let checks = futures::stream::iter(candidates.into_iter().take(64))
-        .map(move |(descriptor_key, (descriptor, tracks))| {
-            let state = state_for_checks.clone();
-            async move {
+    let checks = futures::stream::iter(
+        candidates
+            .into_iter()
+            .take(64),
+    )
+    .map(move |(descriptor_key, (descriptor, tracks))| {
+        let state = state_for_checks.clone();
+        async move {
+            for (subtitle_id, language) in &tracks {
+                if let Some(key) = good_track_key(
+                    "raw",
+                    item_id,
+                    None,
+                    subtitle_id,
+                    language.as_deref(),
+                    None,
+                ) {
+                    if load_good_track(&state.ctx, &key)
+                        .await
+                        .is_some()
+                    {
+                        return None;
+                    }
+                }
+            }
+            if gate::known_invalid(&state.ctx, &descriptor) {
+                return Some(descriptor_key);
+            }
+            if let Ok(Ok(bytes)) = tokio::time::timeout(
+                Duration::from_secs(6),
+                fetch_external_subtitle_bytes(&state, &descriptor),
+            )
+            .await
+            {
                 for (subtitle_id, language) in &tracks {
                     if let Some(key) = good_track_key(
                         "raw",
@@ -1746,46 +1871,26 @@ async fn validate_external_subtitles_for_advertising(
                         language.as_deref(),
                         None,
                     ) {
-                        if load_good_track(&state.ctx, &key).await.is_some() {
-                            return None;
-                        }
+                        let _ = save_good_track(&state.ctx, &key, &bytes, false).await;
                     }
                 }
-                if gate::known_invalid(&state.ctx, &descriptor) {
-                    return Some(descriptor_key);
-                }
-                if let Ok(Ok(bytes)) = tokio::time::timeout(
-                    Duration::from_secs(6),
-                    fetch_external_subtitle_bytes(&state, &descriptor),
-                )
-                .await
-                {
-                    for (subtitle_id, language) in &tracks {
-                        if let Some(key) = good_track_key(
-                            "raw",
-                            item_id,
-                            None,
-                            subtitle_id,
-                            language.as_deref(),
-                            None,
-                        ) {
-                            let _ = save_good_track(&state.ctx, &key, &bytes, false).await;
-                        }
-                    }
-                    return None;
-                }
-                gate::known_invalid(&state.ctx, &descriptor).then_some(descriptor_key)
+                return None;
             }
-        })
-        .buffer_unordered(4)
-        .collect::<Vec<_>>();
+            gate::known_invalid(&state.ctx, &descriptor).then_some(descriptor_key)
+        }
+    })
+    .buffer_unordered(4)
+    .collect::<Vec<_>>();
     // Metadata must not wait indefinitely for subtitle hosts. Confirmed invalid
     // results are recorded in the shared negative cache and filtered below.
     let _ = tokio::time::timeout(Duration::from_secs(15), checks).await;
 
     let mut advertised = Vec::with_capacity(subs.len());
     for sub in subs {
-        let Some(descriptor) = sub.url.as_ref() else {
+        let Some(descriptor) = sub
+            .url
+            .as_ref()
+        else {
             continue;
         };
         let cached_raw_key = good_track_key(
@@ -1793,11 +1898,14 @@ async fn validate_external_subtitles_for_advertising(
             item_id,
             None,
             &sub.id,
-            sub.lang.as_deref(),
+            sub.lang
+                .as_deref(),
             None,
         );
         let has_saved_good_copy = if let Some(key) = cached_raw_key {
-            load_good_track(&state.ctx, &key).await.is_some()
+            load_good_track(&state.ctx, &key)
+                .await
+                .is_some()
         } else {
             false
         };
@@ -1909,7 +2017,8 @@ pub(crate) async fn inject_external_subtitles(
                     item_id,
                     source.id,
                     &sub.id,
-                    sub.lang.as_deref(),
+                    sub.lang
+                        .as_deref(),
                     &mut stream,
                 )
                 .await;
@@ -1960,9 +2069,24 @@ mod tests {
         assert_eq!(MAX_PERSISTED_SUBTITLE_CACHE_BYTES, 200 * 1024 * 1024);
         let pruned = select_cache_files_to_prune(
             vec![
-                test_cache_file("old-good", PersistedSubtitleCacheKind::GoodTrack, 80, 1),
-                test_cache_file("new-alignment", PersistedSubtitleCacheKind::Alignment, 50, 2),
-                test_cache_file("new-good", PersistedSubtitleCacheKind::GoodTrack, 50, 3),
+                test_cache_file(
+                    "old-good",
+                    PersistedSubtitleCacheKind::GoodTrack,
+                    80,
+                    1,
+                ),
+                test_cache_file(
+                    "new-alignment",
+                    PersistedSubtitleCacheKind::Alignment,
+                    50,
+                    2,
+                ),
+                test_cache_file(
+                    "new-good",
+                    PersistedSubtitleCacheKind::GoodTrack,
+                    50,
+                    3,
+                ),
             ],
             100,
             10,
@@ -1973,9 +2097,24 @@ mod tests {
 
         let pruned = select_cache_files_to_prune(
             vec![
-                test_cache_file("old-good", PersistedSubtitleCacheKind::GoodTrack, 1, 1),
-                test_cache_file("new-good", PersistedSubtitleCacheKind::GoodTrack, 1, 2),
-                test_cache_file("alignment", PersistedSubtitleCacheKind::Alignment, 1, 3),
+                test_cache_file(
+                    "old-good",
+                    PersistedSubtitleCacheKind::GoodTrack,
+                    1,
+                    1,
+                ),
+                test_cache_file(
+                    "new-good",
+                    PersistedSubtitleCacheKind::GoodTrack,
+                    1,
+                    2,
+                ),
+                test_cache_file(
+                    "alignment",
+                    PersistedSubtitleCacheKind::Alignment,
+                    1,
+                    3,
+                ),
             ],
             10,
             1,

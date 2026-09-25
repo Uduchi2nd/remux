@@ -198,8 +198,38 @@ fn mux_probe(hq: &api::MediaSourceInfo, provider: &str) -> api::MediaSourceInfo 
             streams.push(a);
         }
     }
+    // Embedded subtitle tracks stay listed (MPEG-TS can't carry text, so the
+    // mux has none): remux extracts them from the HQ file itself — its URL is
+    // the mux URL's `video` query parameter (see api/subtitles.rs). Indices
+    // are offset so they never collide with the rebuilt audio indices; only
+    // their relative order matters for the `0:s:<ordinal>` map.
+    for s in &hq.media_streams {
+        if matches!(s.type_, Some(MediaStreamType::Subtitle)) && !s.is_external {
+            let mut t = s.clone();
+            t.index = SUBTITLE_INDEX_OFFSET + s.index;
+            t.is_default = Some(false);
+            streams.push(t);
+        }
+    }
     probe.media_streams = streams;
     probe
+}
+
+/// Subtitle streams on a "[+VN dub]" row keep the HQ's ordering at this offset.
+pub(crate) const SUBTITLE_INDEX_OFFSET: i64 = 100;
+
+/// The HQ release a "[+VN dub]" row was built from: the muxer URL carries it
+/// as `?video=<url>`. Subtitle extraction reads the HQ file, not the mux.
+pub(crate) fn hq_url_of(stream: &db::Media) -> Option<String> {
+    let url = http_url(stream)?;
+    if !url.contains("/mux/") {
+        return None;
+    }
+    url::Url::parse(url)
+        .ok()?
+        .query_pairs()
+        .find(|(k, _)| k == "video")
+        .map(|(_, v)| v.into_owned())
 }
 
 /// Make sure a "[+VN dub]" stream row exists for every (HQ source, vnphim dub)
@@ -452,7 +482,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(kinds.len(), 3);
+        assert_eq!(kinds.len(), 4);
         assert!(matches!(kinds[0], (0, Some(MediaStreamType::Video), _, _)));
         assert_eq!(
             kinds[1]
@@ -468,10 +498,34 @@ mod tests {
             Some("zho")
         );
         assert_eq!(kinds[2].3, Some(false));
-        assert!(
-            !p.media_streams
-                .iter()
-                .any(|s| matches!(s.type_, Some(MediaStreamType::Subtitle)))
+        let subs: Vec<_> = p
+            .media_streams
+            .iter()
+            .filter(|s| matches!(s.type_, Some(MediaStreamType::Subtitle)))
+            .collect();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].index, SUBTITLE_INDEX_OFFSET + 2);
+        assert_eq!(
+            subs[0]
+                .codec
+                .as_deref(),
+            Some("subrip")
+        );
+    }
+
+    #[test]
+    fn hq_url_is_recovered_from_the_mux_url() {
+        let row = http_media(
+            "https://dubmux.example/mux/d/h/master.m3u8?video=https%3A%2F%2Fcdn.example%2Fa.mkv%3Ft%3D1",
+            "X.VNDub-hotphim.m3u8",
+        );
+        assert_eq!(
+            hq_url_of(&row).as_deref(),
+            Some("https://cdn.example/a.mkv?t=1")
+        );
+        assert_eq!(
+            hq_url_of(&http_media("https://cdn.example/a.mkv", "a.mkv")),
+            None
         );
     }
 }
