@@ -369,6 +369,15 @@ pub(crate) async fn ensure_dub_rows(
     if rows.is_empty() {
         return rows;
     }
+    // Sources sort by idx ascending, so the first-built row (best HQ
+    // release) gets the most negative idx.
+    let n = rows.len() as i64;
+    for (i, row) in rows
+        .iter_mut()
+        .enumerate()
+    {
+        row.idx = Some(i as i64 - n);
+    }
     if let Err(e) = db::Media::upsert(&ctx.db, &rows).await {
         warn!(item = %media.id, "dubmux row upsert failed: {e:#}");
         return vec![];
