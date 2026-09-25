@@ -2277,6 +2277,14 @@ async fn item_for_user(
                     false,
                 )
                 .await;
+                super::subtitles::present_dub_row_embedded_subtitles(
+                    sources,
+                    id,
+                    session
+                        .device
+                        .access_token
+                        .expose(),
+                );
                 for source in sources.iter_mut() {
                     for s in &mut source.media_streams {
                         if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {

@@ -218,6 +218,11 @@ fn mux_probe(hq: &api::MediaSourceInfo, provider: &str) -> api::MediaSourceInfo 
 /// Subtitle streams on a "[+VN dub]" row keep the HQ's ordering at this offset.
 pub(crate) const SUBTITLE_INDEX_OFFSET: i64 = 100;
 
+/// Is this a muxer master-playlist path (a "[+VN dub]" row's source path)?
+pub(crate) fn is_mux_path(path: Option<&str>) -> bool {
+    path.is_some_and(|p| p.contains("/mux/") && p.contains("master.m3u8"))
+}
+
 /// The HQ release a "[+VN dub]" row was built from: the muxer URL carries it
 /// as `?video=<url>`. Subtitle extraction reads the HQ file, not the mux.
 pub(crate) fn hq_url_of(stream: &db::Media) -> Option<String> {

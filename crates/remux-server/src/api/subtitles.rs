@@ -1922,6 +1922,62 @@ async fn validate_external_subtitles_for_advertising(
     advertised
 }
 
+/// PATCH (uduchi2nd): the "[+VN dub]" muxed rows carry the HQ release's
+/// embedded text subtitles at `SUBTITLE_INDEX_OFFSET + n` (they are served by
+/// this server, not by the muxer's playlist). Stored probes keep them
+/// `is_external = false` so alignment still treats them as an embedded
+/// reference, but VidHub/Infuse only list tracks that look external AND have
+/// a `Path`, so present them that way in every client-facing document.
+pub(crate) fn present_dub_row_embedded_subtitles(
+    media_sources: &mut [api::MediaSourceInfo],
+    item_id: Uuid,
+    api_key: &str,
+) {
+    for source in media_sources.iter_mut() {
+        if !crate::services::dubmux::is_mux_path(
+            source
+                .path
+                .as_deref(),
+        ) {
+            continue;
+        }
+        let source_id = source
+            .id
+            .clone();
+        for stream in source
+            .media_streams
+            .iter_mut()
+        {
+            if !matches!(stream.type_, Some(api::MediaStreamType::Subtitle))
+                || stream.index < crate::services::dubmux::SUBTITLE_INDEX_OFFSET
+                || stream.is_external
+            {
+                continue;
+            }
+            let idx = stream.index;
+            stream.is_external = true;
+            stream.supports_external_stream = true;
+            stream.is_text_subtitle_stream = true;
+            stream.delivery_method = Some(api::SubtitleDeliveryMethod::External);
+            stream.delivery_url = Some(format!(
+                "/Videos/{item_id}/{source_id}/Subtitles/{idx}/0/Stream.vtt?ApiKey={api_key}"
+            ));
+            if stream
+                .path
+                .is_none()
+            {
+                stream.path = Some(format!(
+                    "{}.vtt",
+                    stream
+                        .language
+                        .as_deref()
+                        .unwrap_or("und")
+                ));
+            }
+        }
+    }
+}
+
 pub(crate) async fn inject_external_subtitles(
     state: &AppState,
     subtitle_media: &mut crate::db::Media,
