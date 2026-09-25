@@ -10,7 +10,7 @@ Cache layout: $DUBMUX_CACHE/<name>.m4a + <name>.json (meta). Matching decodes
 short mono 8 kHz windows from both sides and cross-correlates them (FFT) at
 several points along the runtime; the lag must agree across windows.
 """
-import argparse, json, os, re, subprocess, sys, tempfile, time, urllib.request
+import argparse, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 import numpy as np
@@ -163,6 +163,53 @@ def parallel_fetch_ts(url, workers, log=sys.stderr):
     return tmp.name, total, time.time() - t0
 
 
+VN_EXTRACTOR = os.environ.get("DUBMUX_VN_EXTRACTOR", "").rstrip("/")
+
+
+def is_proxied_playlist(url):
+    """vnphim `/p/s.` `/p/D.` playlists: segments go through the VN MediaFlow."""
+    try:
+        _, segs = parse_media_playlist(url)
+    except Exception:  # noqa: BLE001
+        return False
+    return any("/proxy/stream" in s[0] or "mediaflow" in s[0] for s in segs[:3])
+
+
+def vn_extract(name, url, out, log=sys.stderr, timeout=1500):
+    """Have the VN-side extractor (LXC 100 next to MediaFlow) pull the origin
+    segments with domestic bandwidth and demux the AAC there; only the ~70 MB
+    result crosses the VN uplink. Returns fetch stats or raises."""
+    # The seedbox runs tailscaled in userspace mode: tailnet hosts are only
+    # reachable through its local HTTP CONNECT proxy, which also resolves
+    # MagicDNS names (the VN tailscale-serve cert is for that name).
+    proxy = os.environ.get("DUBMUX_VN_PROXY", "http://127.0.0.1:1055")
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {}))
+    body = json.dumps({"id": name, "url": url}).encode()
+    def call(path, data=None):
+        req = urllib.request.Request(VN_EXTRACTOR + path, data=data,
+                                     headers={"Content-Type": "application/json"})
+        with opener.open(req, timeout=60) as r:
+            return r.read()
+    job = json.loads(call("/extract", body))
+    t0 = time.time()
+    while job.get("status") in ("queued", "running"):
+        if time.time() - t0 > timeout:
+            raise RuntimeError("vn extractor timed out")
+        time.sleep(5)
+        job = json.loads(call(f"/extract/{name}"))
+        print(f"  vn extract: {job.get('status')} {job.get('fetched', 0)}/{job.get('segments', '?')} "
+              f"{(job.get('bytes') or 0) / 1e6:.0f} MB", file=log, flush=True)
+    if job.get("status") != "ready":
+        raise RuntimeError(f"vn extractor: {job.get('status')} {job.get('error', '')}")
+    req = urllib.request.Request(VN_EXTRACTOR + f"/extract/{name}/audio")
+    with opener.open(req, timeout=600) as r, open(out + ".part", "wb") as f:
+        shutil.copyfileobj(r, f, 1 << 20)
+    os.replace(out + ".part", out)
+    return {"segments_bytes": job.get("bytes"), "fetch_seconds": job.get("seconds"),
+            "workers": "vn-extractor", "transfer_seconds": round(time.time() - t0, 1)}
+
+
 def cmd_extract(args):
     os.makedirs(CACHE, exist_ok=True)
     out = os.path.join(CACHE, args.name + ".m4a")
@@ -170,6 +217,19 @@ def cmd_extract(args):
     t0 = time.time()
     fetch = None
     src = args.url
+    if VN_EXTRACTOR and is_proxied_playlist(args.url):
+        try:
+            fetch = vn_extract(args.name, args.url, out)
+            dur = ffprobe_duration(out)
+            info = {"name": args.name, "source": args.url, "codec_in": "aac", "copied": True,
+                    "duration": dur, "bytes": os.path.getsize(out), "created": int(time.time()),
+                    "extract_seconds": round(time.time() - t0, 1), "fetch": fetch}
+            json.dump(info, open(meta, "w"), indent=1)
+            print(json.dumps(info, indent=1))
+            return
+        except Exception as e:  # noqa: BLE001
+            print(f"  vn extractor unavailable ({str(e)[-200:]}); extracting via the proxy",
+                  file=sys.stderr, flush=True)
     try:
         if args.parallel > 1:
             ts_path, ts_bytes, fetch_s = parallel_fetch_ts(args.url, args.parallel)

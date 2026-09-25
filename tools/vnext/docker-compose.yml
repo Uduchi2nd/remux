@@ -1,0 +1,15 @@
+services:
+  vnext:
+    build: .
+    container_name: vnext
+    restart: unless-stopped
+    ports:
+      - "19000:19000"
+    volumes:
+      - ./data:/data
+    environment:
+      VNEXT_WORKERS: "64"
+      VNEXT_WINDOW: "48"
+      VNEXT_JOBS: "2"
+      VNEXT_TTL_HOURS: "12"
+    mem_limit: 300m
