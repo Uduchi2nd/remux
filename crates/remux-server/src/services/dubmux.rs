@@ -255,6 +255,10 @@ pub(crate) async fn ensure_dub_rows(
     if !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
         return vec![];
     }
+    let existing: Vec<&db::Media> = streams
+        .iter()
+        .filter(|s| is_dubmux_row(s))
+        .collect();
     let dubs: Vec<(&db::Media, String, String)> = streams
         .iter()
         .filter(|s| !is_dubmux_row(s))
@@ -266,9 +270,6 @@ pub(crate) async fn ensure_dub_rows(
         })
         .take(MAX_DUBS)
         .collect();
-    if dubs.is_empty() {
-        return vec![];
-    }
     let hqs: Vec<&db::Media> = streams
         .iter()
         .filter(|s| is_hq_candidate(s))
@@ -277,15 +278,25 @@ pub(crate) async fn ensure_dub_rows(
     if hqs.is_empty() {
         return vec![];
     }
+    let now = chrono::Utc::now().naive_utc();
+    if dubs.is_empty() {
+        // The dub addon answered nothing this time (vnphim's upstream or
+        // its VN proxy was down): the muxes already made are still good,
+        // so keep the rows that were built on releases still listed.
+        return carry_over(ctx, media, &existing, &hqs, &[], now).await;
+    }
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .build()
         .unwrap_or_default();
-    let now = chrono::Utc::now().naive_utc();
     let mut rows = Vec::new();
+    let mut rejected: Vec<Uuid> = Vec::new();
     let mut wait = wait_secs;
     let mut failures = 0u32;
-    'pairs: for hq in hqs {
+    'pairs: for hq in hqs
+        .iter()
+        .copied()
+    {
         let hq_url = http_url(hq).unwrap();
         let hq_id = hq
             .id
@@ -318,6 +329,9 @@ pub(crate) async fn ensure_dub_rows(
             if reply.status != "ready" {
                 debug!(item = %media.id, provider, hq = %hq.id, status = reply.status,
                        stage = ?reply.stage, "dubmux pair not ready");
+                if reply.status == "rejected" {
+                    rejected.push(row_id(media, dub_id, &hq.id));
+                }
                 continue;
             }
             let mut row = hq.clone();
@@ -366,6 +380,30 @@ pub(crate) async fn ensure_dub_rows(
             }
         }
     }
+    // Rows this walk could not rebuild (muxer busy, a pair not answered in
+    // time) but which were fine before stay, unless the muxer now rejects
+    // the pair or the cap is reached.
+    let max_rows = ctx
+        .config
+        .dubmux_max_rows as usize;
+    if rows.len() < max_rows {
+        let have: Vec<Uuid> = rows
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        let keep: Vec<&db::Media> = existing
+            .iter()
+            .copied()
+            .filter(|r| !have.contains(&r.id))
+            .collect();
+        for row in carried_rows(&keep, &hqs, &rejected, now) {
+            if rows.len() >= max_rows {
+                break;
+            }
+            debug!(item = %media.id, row = %row.id, "dubmux row carried over");
+            rows.push(row);
+        }
+    }
     if rows.is_empty() {
         return rows;
     }
@@ -400,6 +438,81 @@ pub(crate) async fn ensure_dub_rows(
             }
         });
     }
+    rows
+}
+
+/// The HQ source id a dub row was built on (the `/mux/<dub>/<hq>/` path).
+fn hq_id_of(row: &db::Media) -> Option<Uuid> {
+    let url = http_url(row)?;
+    let rest = url
+        .split("/mux/")
+        .nth(1)?;
+    let hq = rest
+        .split('/')
+        .nth(1)?;
+    Uuid::parse_str(hq).ok()
+}
+
+/// Existing dub rows worth keeping: their HQ release is still listed and the
+/// muxer has not rejected the pair. The mux URL's `?video=` is refreshed to
+/// the release's current URL so a swept mux can be rebuilt.
+fn carried_rows(
+    existing: &[&db::Media],
+    hqs: &[&db::Media],
+    rejected: &[Uuid],
+    now: chrono::NaiveDateTime,
+) -> Vec<db::Media> {
+    let mut out = Vec::new();
+    for row in existing {
+        if rejected.contains(&row.id) {
+            continue;
+        }
+        let Some(hq_id) = hq_id_of(row) else {
+            continue;
+        };
+        let Some(hq) = hqs
+            .iter()
+            .find(|h| h.id == hq_id)
+        else {
+            continue;
+        };
+        let Some(hq_url) = http_url(hq) else {
+            continue;
+        };
+        let mut row = (*row).clone();
+        row.updated_at = now;
+        if let Some(si) = row
+            .stream_info
+            .as_mut()
+        {
+            if let StreamDescriptor::Http { url, .. } = &mut si.descriptor {
+                if let Some((base, _)) = url.split_once("?video=") {
+                    *url = format!("{base}?video={}", urlencoding::encode(hq_url));
+                }
+            }
+        }
+        out.push(row);
+    }
+    out
+}
+
+async fn carry_over(
+    ctx: &AppContext,
+    media: &db::Media,
+    existing: &[&db::Media],
+    hqs: &[&db::Media],
+    rejected: &[Uuid],
+    now: chrono::NaiveDateTime,
+) -> Vec<db::Media> {
+    let rows = carried_rows(existing, hqs, rejected, now);
+    if rows.is_empty() {
+        return rows;
+    }
+    if let Err(e) = db::Media::upsert(&ctx.db, &rows).await {
+        warn!(item = %media.id, "dubmux carry-over upsert failed: {e:#}");
+        return vec![];
+    }
+    info!(item = %media.id, rows = rows.len(), "dubmux rows carried over (no dub streams listed)");
     rows
 }
 
