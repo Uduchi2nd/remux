@@ -833,9 +833,52 @@ async fn prefetch_upcoming(
         {
             premux_first_pair(ctx, &mut ep, user).await;
         }
+        // The viewer will most likely get to these episodes: keep their
+        // finished muxes from aging out before the one being watched.
+        touch_episode_muxes(ctx, &mut ep).await;
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
     Ok(())
+}
+
+/// Extend the retention of every finished mux behind an episode's dub rows
+/// (muxer `POST …/touch`; never starts a mux).
+async fn touch_episode_muxes(ctx: &AppContext, ep: &mut db::Media) {
+    let Some(cfg) = DubmuxConfig::from(&ctx.config) else {
+        return;
+    };
+    let Ok(streams) = ep
+        .streams(&ctx.db)
+        .await
+    else {
+        return;
+    };
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    for url in streams
+        .iter()
+        .filter(|s| is_dubmux_row(s))
+        .filter_map(http_url)
+    {
+        let touch = url
+            .replacen(cfg.public, cfg.api, 1)
+            .replacen("/master.m3u8", "/touch", 1);
+        let touch = touch
+            .split('?')
+            .next()
+            .unwrap_or(&touch)
+            .to_string();
+        if let Err(e) = client
+            .post(&touch)
+            .send()
+            .await
+        {
+            debug!(episode = %ep.id, "dubmux touch failed: {e:#}");
+        }
+    }
 }
 
 /// Wait for the next episode's preparations and hit the muxer's master
