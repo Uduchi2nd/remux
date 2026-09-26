@@ -91,21 +91,16 @@ front of the source list for every accepted pair.
   `DUBMUX_PREPARE_WAIT_SECS` (12) in PlaybackInfo, so the rows usually appear
   on the second request (opening the episode triggers the first).
 
-## Segment relay (`/relay/<b64url(url)>.ts`, 2026-09-26)
+## Not here: yanhh3d segment proxying (2026-09-26)
 
-Not a dub feature — the service just happens to be the seedbox's public
-HTTP front. vnphim points viewers outside VN at it for yanhh3d's segments
-(`yanhh3d.relay_base` in vnphim's config.yaml). Why: the donghuavip CDN
-(Backblaze behind Cloudflare, no tiered cache) pulls a cold segment through
-Cloudflare's LAX edge (home) at 100 KB/s–1.3 MB/s, erratically — one 6 s
-segment took 37 s — but through IAD (seedbox) at 1.6–3 MB/s every time;
-cached objects are 8–14 MB/s from both. Measured on 2026-09-26 with fresh
-segments in alternating order, all `cf-cache-status: MISS`; Referer/UA/HTTP
-version made no difference. Through the relay a home viewer gets cold
-segments in ~2 s each (0.7–4 MB/s) and warm ones at ~4 MB/s.
+A `/relay/` passthrough for yanhh3d's CDN segments lived in this service
+for a few hours on 2026-09-26 and was replaced the same day by a MediaFlow
+Proxy Light on the seedbox (`mediaflow-us.geniallark.box.ca`, container
+`mediaflow-us`, port 12888, `~/mediaflow-us/keeper.sh`), which vnphim
+wraps segments with (`yanhh3d.mediaflow_us`). Reason for proxying at all:
+the donghuavip CDN pulls a cold segment through Cloudflare's LAX edge at
+100 KB/s–1.3 MB/s (erratic) but through IAD, where the seedbox lands, at
+1.6–3 MB/s; per-POP cache, no tiered cache. Keep this service dub-only.
 
-The route is a plain passthrough: Range and Content-Range preserved, HEAD
-answered with the full length, nothing stored (Cloudflare IAD caches for
-the next viewer). `DUBMUX_RELAY_HOSTS` (regex, default the donghuavip
-hosts) limits what it will fetch — keep it narrow, this is a public host.
-Video bytes go CDN → seedbox → player, never through nimo or the tunnel.
+HLS retention budget is 500 GB (`DUBMUX_HLS_BUDGET_GB`, raised from 150
+on 2026-09-26 at the user's request; ~2.3 GB per muxed episode).

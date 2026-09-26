@@ -4,6 +4,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certi
 RUN pip install --no-cache-dir "fastapi==0.115.*" "uvicorn[standard]==0.30.*" "numpy==2.*"
 WORKDIR /app
 COPY dubmux.py server.py align.py /app/
-ENV DUBMUX_DATA=/data DUBMUX_VN_EXTRACTOR=https://vietnam-home50btx-proxmox.buffalo-deneb.ts.net:8444 DUBMUX_FETCH_WORKERS=128 DUBMUX_RETENTION_DAYS=30 DUBMUX_HLS_BUDGET_GB=150
+ENV DUBMUX_DATA=/data DUBMUX_VN_EXTRACTOR=https://vietnam-home50btx-proxmox.buffalo-deneb.ts.net:8444 DUBMUX_FETCH_WORKERS=128 DUBMUX_RETENTION_DAYS=30 DUBMUX_HLS_BUDGET_GB=500
 EXPOSE 12500
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "12500", "--workers", "1", "--timeout-keep-alive", "75"]

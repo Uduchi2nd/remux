@@ -4,7 +4,6 @@
 POST /prepare      {"dub":{"id","url"},"video":{"id","url"}}  -> job state
 GET  /status/{dub_id}/{video_id}                               -> job state
 GET  /mux/{dub_id}/{video_id}/master.m3u8                      -> HLS (starts the mux)
-GET  /relay/{b64url(url)}.ts                                    -> passthrough of one CDN segment (Range OK; hosts limited by DUBMUX_RELAY_HOSTS)
 GET  /mux/{dub_id}/{video_id}/index.m3u8                       (VOD once the mux is done; waits up to MASTER_WAIT_S)
 POST /mux/{dub_id}/{video_id}/start                             -> start the mux, return at once
 GET  /mux/{dub_id}/{video_id}/seg{n}.ts
@@ -15,12 +14,11 @@ State on disk under DUBMUX_DATA:
   match/<dub_id>__<video_id>.json cross-correlation result
   hls/<dub_id>__<video_id>/       segments + playlist (+ .done when VOD)
 """
-import asyncio, base64, json, os, re, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
-from urllib.parse import urlsplit
+import asyncio, json, os, re, shutil, subprocess, sys, threading, time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dubmux  # noqa: E402
@@ -40,12 +38,6 @@ SEG_WAIT_S = 25
 # it gets a VOD playlist (duration + seeking); an EVENT playlist is served
 # only when the mux is still running after that.
 MASTER_WAIT_S = float(os.environ.get("DUBMUX_MASTER_WAIT_S", "50"))
-# Segment relay: which upstream hosts may be fetched through /relay/. The
-# yanhh3d CDN (Backblaze behind Cloudflare) pulls a cold segment at
-# ~100 KB/s through the LAX edge but at 1-3 MB/s through IAD, where this box
-# lands, so vnphim points non-VN viewers' playlists here.
-RELAY_HOSTS = re.compile(os.environ.get("DUBMUX_RELAY_HOSTS", r"^(photos\.)?donghuavip\d*\.com$"))
-RELAY_CHUNK = 256 * 1024
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 
 app = FastAPI(title="dubmux")
@@ -444,62 +436,3 @@ def health():
             "matches": len(list(MATCH.glob("*.json"))), "hls_sessions": len(hls),
             "running": sum(1 for s in _sessions.values() if s["proc"].poll() is None),
             "hls_bytes": sum(f.stat().st_size for d in hls for f in d.iterdir())}
-
-
-# ---------------------------------------------------------------- relay ---
-def _relay_url(token: str) -> str:
-    if token.endswith(".ts"):
-        token = token[:-3]
-    try:
-        url = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
-    except Exception:
-        raise HTTPException(404)
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or not RELAY_HOSTS.match(parts.hostname or ""):
-        raise HTTPException(403, "host not relayed")
-    return url
-
-
-@app.api_route("/relay/{token}", methods=["GET", "HEAD"])
-def relay(token: str, request: Request):
-    """Fetch one CDN segment and stream it back unchanged (status, Range,
-    Content-Range and Content-Length preserved). Nothing is stored here —
-    Cloudflare's IAD edge keeps the object cached for the next viewer."""
-    url = _relay_url(token)
-    headers = {"User-Agent": dubmux.UA}
-    rng = request.headers.get("range")
-    if request.method == "HEAD":
-        rng = "bytes=0-0"
-    if rng:
-        headers["Range"] = rng
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        up = urllib.request.urlopen(req, timeout=60)
-    except urllib.error.HTTPError as e:
-        raise HTTPException(e.code if e.code in (404, 403, 416) else 502)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"upstream: {e}")
-    out = {"Cache-Control": "public, max-age=86400", "Accept-Ranges": "bytes"}
-    for h in ("Content-Length", "Content-Range"):
-        v = up.headers.get(h)
-        if v:
-            out[h] = v
-    if request.method == "HEAD":
-        total = (up.headers.get("Content-Range") or "").rsplit("/", 1)[-1]
-        up.close()
-        if total.isdigit():
-            out["Content-Length"] = total
-        out.pop("Content-Range", None)
-        return Response(status_code=200, media_type="video/mp2t", headers=out)
-
-    def body():
-        try:
-            while True:
-                chunk = up.read(RELAY_CHUNK)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            up.close()
-
-    return StreamingResponse(body(), status_code=up.status, media_type="video/mp2t", headers=out)
