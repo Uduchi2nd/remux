@@ -219,6 +219,47 @@ impl BackgroundPrepareSubscriber {
                                 }
                                 None => false,
                             };
+                            // PATCH (uduchi2nd): the persistent queue also
+                            // keeps dub muxes alive (and, for a series being
+                            // watched, muxed) and pre-aligns the external
+                            // subtitles of the sources a player would pick —
+                            // the same work the on-play walk does, but
+                            // retried on every refresh, so anything that
+                            // dropped gets rebuilt eventually.
+                            let dub_rows =
+                                crate::services::dubmux::background_episode_hook(
+                                    &ctx, &mut media, active,
+                                )
+                                .await;
+                            if let Some(state) = crate::APP_STATE.get() {
+                                let mut candidates: Vec<db::Media> = dub_rows;
+                                if let Ok(streams) = media
+                                    .streams(&ctx.db)
+                                    .await
+                                {
+                                    candidates.extend(
+                                        streams
+                                            .into_iter()
+                                            .filter(|s| {
+                                                !crate::services::dubmux::is_dubmux_row(
+                                                    s,
+                                                )
+                                            })
+                                            .take(1),
+                                    );
+                                }
+                                for source in candidates
+                                    .iter()
+                                    .take(2)
+                                {
+                                    crate::api::subtitles::gate::prepare_in_background(
+                                        state,
+                                        source,
+                                        media.id,
+                                        Some(job.user_id),
+                                    );
+                                }
+                            }
                             db::finish_stream_refresh(&ctx.db, &job, active).await?;
                             Ok(())
                         }

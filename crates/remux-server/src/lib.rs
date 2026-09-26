@@ -415,6 +415,7 @@ pub async fn init_app(
         ctx: ctx.clone(),
         tasks: task_service,
     };
+    let _ = APP_STATE.set(state.clone());
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -545,6 +546,10 @@ pub struct AppState {
     pub ctx: AppContext,
     pub tasks: tasks::TaskService,
 }
+
+/// The running server's state, for background workers that only hold an
+/// `AppContext` but need request-path helpers (subtitle preparation).
+pub static APP_STATE: std::sync::OnceLock<AppState> = std::sync::OnceLock::new();
 
 fn default_data_dir() -> std::path::PathBuf {
     dirs::data_dir()

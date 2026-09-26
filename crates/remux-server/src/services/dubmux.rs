@@ -844,13 +844,50 @@ async fn prefetch_upcoming(
 /// Extend the retention of every finished mux behind an episode's dub rows
 /// (muxer `POST …/touch`; never starts a mux).
 async fn touch_episode_muxes(ctx: &AppContext, ep: &mut db::Media) {
-    let Some(cfg) = DubmuxConfig::from(&ctx.config) else {
-        return;
-    };
     let Ok(streams) = ep
         .streams(&ctx.db)
         .await
     else {
+        return;
+    };
+    touch_muxes(ctx, ep.id, &streams).await;
+}
+
+/// The persistent background refresh queue's share of the dub work, run after
+/// an episode's streams were refreshed (the refresh itself already created or
+/// carried over the dub rows): keep the finished muxes of everything the queue
+/// tracks alive, and — while the series is being watched — make sure the best
+/// pair of each episode is muxed, so a dropped mux or a row that appeared
+/// late gets built without waiting for a playback. Returns the dub rows.
+pub(crate) async fn background_episode_hook(
+    ctx: &AppContext,
+    ep: &mut db::Media,
+    premux: bool,
+) -> Vec<db::Media> {
+    let Ok(streams) = ep
+        .streams(&ctx.db)
+        .await
+    else {
+        return vec![];
+    };
+    touch_muxes(ctx, ep.id, &streams).await;
+    let rows: Vec<db::Media> = streams
+        .into_iter()
+        .filter(is_dubmux_row)
+        .collect();
+    if premux {
+        if let Some((cfg, url)) = DubmuxConfig::from(&ctx.config).zip(
+            rows.first()
+                .and_then(http_url),
+        ) {
+            start_mux(&url.replacen(cfg.public, cfg.api, 1), ep.id).await;
+        }
+    }
+    rows
+}
+
+async fn touch_muxes(ctx: &AppContext, item: Uuid, streams: &[db::Media]) {
+    let Some(cfg) = DubmuxConfig::from(&ctx.config) else {
         return;
     };
     let client = reqwest::Client::builder()
@@ -876,7 +913,7 @@ async fn touch_episode_muxes(ctx: &AppContext, ep: &mut db::Media) {
             .send()
             .await
         {
-            debug!(episode = %ep.id, "dubmux touch failed: {e:#}");
+            debug!(item = %item, "dubmux touch failed: {e:#}");
         }
     }
 }
