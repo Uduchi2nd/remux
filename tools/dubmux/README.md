@@ -90,3 +90,22 @@ front of the source list for every accepted pair.
 - Cold first play of an episode: ~20 s of preparation. remux waits up to
   `DUBMUX_PREPARE_WAIT_SECS` (12) in PlaybackInfo, so the rows usually appear
   on the second request (opening the episode triggers the first).
+
+## Segment relay (`/relay/<b64url(url)>.ts`, 2026-09-26)
+
+Not a dub feature — the service just happens to be the seedbox's public
+HTTP front. vnphim points viewers outside VN at it for yanhh3d's segments
+(`yanhh3d.relay_base` in vnphim's config.yaml). Why: the donghuavip CDN
+(Backblaze behind Cloudflare, no tiered cache) pulls a cold segment through
+Cloudflare's LAX edge (home) at 100 KB/s–1.3 MB/s, erratically — one 6 s
+segment took 37 s — but through IAD (seedbox) at 1.6–3 MB/s every time;
+cached objects are 8–14 MB/s from both. Measured on 2026-09-26 with fresh
+segments in alternating order, all `cf-cache-status: MISS`; Referer/UA/HTTP
+version made no difference. Through the relay a home viewer gets cold
+segments in ~2 s each (0.7–4 MB/s) and warm ones at ~4 MB/s.
+
+The route is a plain passthrough: Range and Content-Range preserved, HEAD
+answered with the full length, nothing stored (Cloudflare IAD caches for
+the next viewer). `DUBMUX_RELAY_HOSTS` (regex, default the donghuavip
+hosts) limits what it will fetch — keep it narrow, this is a public host.
+Video bytes go CDN → seedbox → player, never through nimo or the tunnel.
