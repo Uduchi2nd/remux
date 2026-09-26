@@ -6,6 +6,7 @@ GET  /status/{dub_id}/{video_id}                               -> job state
 GET  /mux/{dub_id}/{video_id}/master.m3u8                      -> HLS (starts the mux)
 GET  /mux/{dub_id}/{video_id}/index.m3u8                       (VOD once the mux is done; waits up to MASTER_WAIT_S)
 POST /mux/{dub_id}/{video_id}/start                             -> start the mux, return at once
+POST /mux/{dub_id}/{video_id}/touch                             -> extend a finished mux's retention (never starts one)
 GET  /mux/{dub_id}/{video_id}/seg{n}.ts
 GET  /health
 
@@ -313,6 +314,19 @@ def _ensure_mux(k, dub_id, m, video_url):
     m["video_url"] = video_url
     json.dump(m, open(_match_path(k), "w"), indent=1)
     _start_mux(k, dubmux.resolve_url(video_url), dub_id, m["lag"])
+
+
+@app.post("/mux/{dub_id}/{video_id}/touch")
+def touch(dub_id: str, video_id: str):
+    """Extend a finished mux's retention as if it had just been played.
+    remux calls this for every dub row of the episodes around the one being
+    watched (next 10, previous 2): the viewer will most likely get to them, so
+    their muxes should not age out first. Never starts a mux."""
+    d = _session_dir(_key(_check_id(dub_id), _check_id(video_id)))
+    if not (d / ".done").exists():
+        return {"touched": False}
+    (d / ".touched").write_text(str(int(time.time())))
+    return {"touched": True}
 
 
 @app.post("/mux/{dub_id}/{video_id}/start")
