@@ -26,7 +26,8 @@ MIN_RATIO = 12.0        # coarse window confidence floor (peak / rms)
 STRONG_RATIO = 30.0     # a lone window needs this to stand as its own run
 RUN_TOL = 0.25          # lags within this are the same run
 MAX_RUNS = 8
-MAX_SKEW = 180.0        # give up beyond this much total difference
+MAX_SKEW = 360.0        # give up beyond this much total difference (Striking Rescue: 206 s of extra credits/ident)
+MIN_MAX_LAG = 75.0      # always search at least this far (mid-roll ad jumps)
 MIN_COVERAGE = 0.85     # dub time / windows that must be covered by accepted runs
 MAX_GAP_WINDOWS = 4     # inside a run: up to 4 unconfident windows (240 s) between confident ones
 R = dubmux.RATE
@@ -106,7 +107,12 @@ def analyse(video_pcm, dub_pcm):
     skew = abs(vdur - ddur)
     if skew > MAX_SKEW:
         return {"verdict": "reject:skew", "skew": round(skew, 1)}
-    max_lag = skew + 15.0
+    # The search range must cover a mid-roll ad the VN source injects
+    # (kkphim: ~30 s around 15 min, so the lag jumps by that much) even when
+    # the total durations happen to agree: skew + 15 s was too tight and
+    # correlation "died" after the ad (The First Frost E25, High School
+    # Return of a Gangster E05).
+    max_lag = max(skew + 15.0, MIN_MAX_LAG)
     limit = min(vdur, ddur) - COARSE_SPAN - 1
     starts = list(_frange(10.0, limit, COARSE_STEP))
     if len(starts) < 3:
@@ -177,6 +183,13 @@ def analyse(video_pcm, dub_pcm):
     for r in runs:
         rr = {"dub_start": round(max(0.0, r["dub_start"]), 3), "dub_end": round(r["dub_end"], 3),
               "lag": r["lag"], "min_ratio": round(min(r["ratios"]), 1), "windows": len(r["lags"])}
+        # A positive lag means the dub starts BEFORE the video (a longer
+        # streamer ident on the VN side): video(t) <-> dub(t + lag), so dub
+        # time [0, lag) has no video — clip the run there instead of
+        # dropping it (LINK CLICK S02E02 / Sword of Coming / Dragon Ball
+        # Daima all lost a perfect 19-window match this way).
+        if rr["dub_start"] - rr["lag"] < 0:
+            rr["dub_start"] = round(rr["lag"], 3)
         rr["video_start"] = round(rr["dub_start"] - rr["lag"], 3)
         rr["video_end"] = round(rr["dub_end"] - rr["lag"], 3)
         if rr["dub_end"] - rr["dub_start"] > 1.0 and rr["video_start"] >= -0.5:
