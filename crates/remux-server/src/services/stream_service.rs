@@ -156,6 +156,8 @@ impl StreamService {
                 &root,
                 &db_streams,
                 wait,
+            ,
+                crate::services::dubmux::PRIORITY_PLAYBACK,
             )
             .await;
             let mut merged: Vec<db::Media> = added

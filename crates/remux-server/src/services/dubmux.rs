@@ -134,11 +134,13 @@ async fn prepare(
     hq_id: &str,
     hq_url: &str,
     wait: u64,
+    priority: u32,
 ) -> anyhow::Result<PrepareReply> {
     let body = serde_json::json!({
         "dub": {"id": dub_id, "url": dub_url},
         "video": {"id": hq_id, "url": hq_url},
         "wait": wait,
+        "priority": priority,
     });
     let reply = client
         .post(format!("{}/prepare", cfg.api))
@@ -243,11 +245,22 @@ pub(crate) fn hq_url_of(stream: &db::Media) -> Option<String> {
 /// so their `updated_at` follows the parent's refresh). `wait_secs` bounds
 /// how long a still-running preparation is waited for — 0 on background
 /// refreshes, a few seconds on a playback request.
+/// Muxer priorities (lower = sooner). The pair's rank within its episode is
+/// added on top, so every episode's FIRST dub version is prepared before
+/// anyone's second variant.
+pub(crate) const PRIORITY_PLAYBACK: u32 = 0;
+pub(crate) const PRIORITY_WALK: u32 = 100;
+pub(crate) const PRIORITY_BACKGROUND: u32 = 300;
+/// Variants (second dub provider / second-best release) of an episode rank
+/// behind the first pairs of the whole walk (up to 12 episodes).
+const VARIANT_PENALTY: u32 = 50;
+
 pub(crate) async fn ensure_dub_rows(
     ctx: &AppContext,
     media: &db::Media,
     streams: &[db::Media],
     wait_secs: u64,
+    priority: u32,
 ) -> Vec<db::Media> {
     let Some(cfg) = DubmuxConfig::from(&ctx.config) else {
         return vec![];
@@ -306,6 +319,7 @@ pub(crate) async fn ensure_dub_rows(
     let mut rejected: Vec<Uuid> = Vec::new();
     let mut wait = wait_secs;
     let mut failures = 0u32;
+    let mut pairs_seen: u32 = 0;
     'pairs: for hq in hqs
         .iter()
         .copied()
@@ -317,8 +331,14 @@ pub(crate) async fn ensure_dub_rows(
             .to_string();
         for (dub, provider, dub_id) in &dubs {
             let dub_url = http_url(dub).unwrap();
+            let pair_priority = if pairs_seen == 0 {
+                priority
+            } else {
+                priority + VARIANT_PENALTY + pairs_seen.min(40)
+            };
+            pairs_seen += 1;
             let reply = match prepare(
-                &client, &cfg, dub_id, dub_url, &hq_id, hq_url, wait,
+                &client, &cfg, dub_id, dub_url, &hq_id, hq_url, wait, pair_priority,
             )
             .await
             {
@@ -375,10 +395,13 @@ pub(crate) async fn ensure_dub_rows(
                     response_headers: Default::default(),
                 };
             }
+            // Even a filename-guess probe of the HQ gives the row its track
+            // list (dub first, default) from the moment it exists; the next
+            // refresh rebuilds it from the HQ's real probe. Without it a
+            // just-created row showed no Vietnamese track until then.
             row.probe_data = hq
                 .probe_data
                 .as_ref()
-                .filter(|p| !p.is_filename_guess())
                 .map(|p| mux_probe(p, provider));
             rows.push(row);
             // HQ releases are walked in quality order, so the cap keeps the
@@ -851,7 +874,8 @@ async fn prefetch_upcoming(
             continue;
         };
         // refresh_streams honours the freshness window and runs the dub hook
-        // (wait 0) itself; stale lists cost one addon round-trip per episode.
+        // (wait 0, background priority) itself; stale lists cost one addon
+        // round-trip per episode.
         if let Err(e) = ctx
             .addons
             .refresh_streams(&mut ep, ctx, Some(user))
@@ -859,6 +883,15 @@ async fn prefetch_upcoming(
         {
             warn!(episode = %id, "dub prefetch: stream refresh failed: {e:#}");
             continue;
+        }
+        // Re-submit this episode's pairs at walk priority (next episodes
+        // first, previous ones last): the muxer bumps queued jobs in place.
+        if let Ok(streams) = ep
+            .streams(&ctx.db)
+            .await
+        {
+            let prio = PRIORITY_WALK + offset as u32;
+            let _ = ensure_dub_rows(ctx, &ep, &streams, 0, prio).await;
         }
         if offset == 0
             && ctx
@@ -965,7 +998,7 @@ async fn premux_first_pair(ctx: &AppContext, ep: &mut db::Media, user: Uuid) {
     else {
         return;
     };
-    let mut rows = ensure_dub_rows(ctx, ep, &streams, 45).await;
+    let mut rows = ensure_dub_rows(ctx, ep, &streams, 45, PRIORITY_WALK).await;
     if rows.is_empty() {
         rows = streams
             .iter()
