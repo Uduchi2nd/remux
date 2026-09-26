@@ -589,7 +589,7 @@ fn default_dubmux_prepare_wait_secs() -> u64 {
 }
 
 fn default_dubmux_prefetch_episodes() -> u64 {
-    20
+    10
 }
 
 fn default_dubmux_prefetch_previous() -> u64 {
