@@ -3222,7 +3222,14 @@ impl AddonService {
         // waits for a preparation that is still running; a playback request
         // does (StreamService::load) so the rows appear by the time the
         // client presses play on a freshly opened episode.
-        crate::services::dubmux::ensure_dub_rows(ctx, media, &sources, 0).await;
+        crate::services::dubmux::ensure_dub_rows(
+            ctx,
+            media,
+            &sources,
+            0,
+            crate::services::dubmux::PRIORITY_BACKGROUND,
+        )
+        .await;
 
         // Publish the fresh timestamp only after the child stream rows exist.
         // Otherwise a concurrent playback lookup can observe a fresh parent,

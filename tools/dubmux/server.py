@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """dubmux service: on-demand Vietnamese-dub muxing onto high-quality sources.
 
-POST /prepare      {"dub":{"id","url"},"video":{"id","url"}}  -> job state
+POST /prepare  {dub:{id,url}, video:{id,url}, wait, priority}  (priority: lower = sooner; re-POST to bump)      {"dub":{"id","url"},"video":{"id","url"}}  -> job state
 GET  /status/{dub_id}/{video_id}                               -> job state
 GET  /mux/{dub_id}/{video_id}/master.m3u8                      -> HLS (starts the mux)
 GET  /mux/{dub_id}/{video_id}/index.m3u8                       (VOD once the mux is done; waits up to MASTER_WAIT_S)
@@ -71,10 +71,59 @@ def _load_match(k):
 
 
 _extract_locks: dict[str, threading.Lock] = {}
+
+
+class PriorityGate:
+    """N concurrent slots handed out lowest-`priority` first (ties: FIFO).
+    A waiter's priority can be raised later (`bump`) — remux re-submits a
+    pair with a better priority when the viewer gets closer to it."""
+
+    def __init__(self, slots):
+        self.slots = slots
+        self.cv = threading.Condition()
+        self.waiting: dict[str, list] = {}   # key -> [priority, seq]
+        self.seq = 0
+        self.active = 0
+
+    def acquire(self, key, priority):
+        with self.cv:
+            self.seq += 1
+            self.waiting[key] = [priority, self.seq]
+            while True:
+                if self.active < self.slots:
+                    best = min(self.waiting.items(), key=lambda kv: (kv[1][0], kv[1][1]))[0]
+                    if best == key:
+                        del self.waiting[key]
+                        self.active += 1
+                        return
+                self.cv.wait(1.0)
+
+    def release(self):
+        with self.cv:
+            self.active -= 1
+            self.cv.notify_all()
+
+    def bump(self, key, priority):
+        with self.cv:
+            w = self.waiting.get(key)
+            if w and priority < w[0]:
+                w[0] = priority
+                self.cv.notify_all()
+
+    def snapshot(self):
+        with self.cv:
+            return {"active": self.active, "slots": self.slots,
+                    "waiting": sorted((p, k[:8]) for k, (p, _s) in self.waiting.items())}
+
+
 # Matching is CPU/IO heavy (3 concurrent HTTP seeks + decodes + FFTs per
 # pair); a prefetch fan-out can queue dozens of pairs at once. Bound it so
-# the event loop keeps answering /prepare and /mux promptly.
-MATCH_SLOTS = threading.Semaphore(int(os.environ.get("DUBMUX_MATCH_SLOTS", "3")))
+# the event loop keeps answering /prepare and /mux promptly. Extraction is
+# bounded to what the VN extractor runs in parallel, so ITS queue never
+# holds work this gate would have ordered differently.
+MATCH_GATE = PriorityGate(int(os.environ.get("DUBMUX_MATCH_SLOTS", "3")))
+EXTRACT_GATE = PriorityGate(int(os.environ.get("DUBMUX_EXTRACT_SLOTS", "2")))
+DEFAULT_PRIORITY = 500
 # Decoded HQ windows are shared across the dubs paired with the same release
 # (up to three dubs per episode) for a few minutes.
 _hq_windows: dict[tuple, tuple[float, object]] = {}
@@ -117,12 +166,17 @@ def _prepare_worker(dub, video, k):
         # (PlaybackInfo pairs every HQ release with every dub).
         with _extract_lock(dub["id"]):
             if not meta.exists():
-                job["stage"] = "extract"
-                args = type("A", (), {"name": dub["id"], "url": dub["url"], "reencode": False,
-                                      "parallel": WORKERS})
-                dubmux.cmd_extract(args)
+                job["stage"] = "extract:queued"
+                EXTRACT_GATE.acquire(k, job["priority"])
+                try:
+                    job["stage"] = "extract"
+                    args = type("A", (), {"name": dub["id"], "url": dub["url"], "reencode": False,
+                                          "parallel": WORKERS})
+                    dubmux.cmd_extract(args)
+                finally:
+                    EXTRACT_GATE.release()
         job["stage"] = "match:queued"
-        MATCH_SLOTS.acquire()
+        MATCH_GATE.acquire(k, job["priority"])
         slot_held = True
         job["stage"] = "match"
         args = type("A", (), {"name": dub["id"], "video": video["url"], "windows": "90,mid,-150",
@@ -189,7 +243,7 @@ def _prepare_worker(dub, video, k):
         job.update(status="error", stage="done", error=str(e)[-500:])
     finally:
         if slot_held:
-            MATCH_SLOTS.release()
+            MATCH_GATE.release()
         job["finished"] = time.time()
 
 
@@ -206,12 +260,25 @@ async def prepare(req: Request):
     if cached:
         return {"status": "ready" if cached["verdict"] == "accept" else "rejected",
                 "stage": "done", "result": cached, "cached": True}
+    # Lower = sooner. remux sends 0 for the episode being played, ~100+ for
+    # the on-play walk (next episodes first; a pair's rank within its
+    # episode is added, so every episode's FIRST dub version is served before
+    # anyone's second variant), ~300+ for the hourly background queue.
+    try:
+        priority = int(body.get("priority", DEFAULT_PRIORITY))
+    except (TypeError, ValueError):
+        priority = DEFAULT_PRIORITY
     with _lock:
         job = _jobs.get(k)
         if not job or (job["status"] in ("error",) and time.time() - job.get("finished", 0) > 60):
-            job = {"status": "running", "stage": "queued", "started": time.time()}
+            job = {"status": "running", "stage": "queued", "started": time.time(),
+                   "priority": priority}
             _jobs[k] = job
             threading.Thread(target=_prepare_worker, args=(dub, video, k), daemon=True).start()
+        elif job["status"] == "running" and priority < job.get("priority", DEFAULT_PRIORITY):
+            job["priority"] = priority
+            EXTRACT_GATE.bump(k, priority)
+            MATCH_GATE.bump(k, priority)
     wait = float(body.get("wait", 0) or 0)
     deadline = time.time() + min(wait, 60)
     while job["status"] == "running" and time.time() < deadline:
@@ -429,6 +496,12 @@ def _sweep():
 def jobs():
     """In-memory preparation jobs (this process lifetime) for debugging."""
     return {k: {kk: vv for kk, vv in v.items() if kk != "result"} for k, v in _jobs.items()}
+
+
+@app.get("/queue")
+def queue():
+    """Gate occupancy + waiting pairs by priority (lowest first)."""
+    return {"extract": EXTRACT_GATE.snapshot(), "match": MATCH_GATE.snapshot()}
 
 
 @app.post("/sweep")
