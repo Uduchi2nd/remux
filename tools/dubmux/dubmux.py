@@ -210,12 +210,51 @@ def vn_extract(name, url, out, log=sys.stderr, timeout=1500):
             "workers": "vn-extractor", "transfer_seconds": round(time.time() - t0, 1)}
 
 
+VNPHIM_URL = os.environ.get("DUBMUX_VNPHIM_URL", "").rstrip("/")
+VNPHIM_KEY = os.environ.get("DUBMUX_VNPHIM_KEY", "")
+MF_PASSWORD = os.environ.get("DUBMUX_MF_PASSWORD", "")
+
+
+def dub_source(url, log=sys.stderr):
+    """A vnphim stream address is an encrypted MediaFlow URL (2026-09-26) that
+    nobody can decode. Ask vnphim what it stands for and rebuild a fetchable
+    address: the VN extractor gets a MediaFlow-style wrap (origin + h_Referer,
+    which it unwraps), the seedbox fallback the same wrap with the password.
+    Falls back to the URL itself when vnphim does not know it."""
+    if "_token_" not in url or not (VNPHIM_URL and VNPHIM_KEY):
+        return url
+    from urllib.parse import quote, urlencode
+    req = urllib.request.Request(f"{VNPHIM_URL}/_internal/dub-source?u={quote(url, safe='')}",
+                                 headers={"X-Vnphim-Key": VNPHIM_KEY, "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            info = json.loads(r.read())
+    except Exception as e:  # noqa: BLE001
+        print(f"  dub source lookup failed ({e}); using the stream url", file=log, flush=True)
+        return url
+    origin = info.get("origin")
+    if not origin:
+        return url
+    if origin.startswith(VNPHIM_URL):
+        return origin  # /y/ or /h/: open segments, fetch as-is
+    mf = url.split("/_token_")[0]
+    params = [("d", origin)]
+    if MF_PASSWORD:
+        params.append(("api_password", MF_PASSWORD))
+    if info.get("referer"):
+        params.append(("h_Referer", info["referer"]))
+    wrapped = f"{mf}/proxy/stream?{urlencode(params)}"
+    print(f"  dub source: {origin[:70]} (via vnphim lookup)", file=log, flush=True)
+    return wrapped
+
+
 def cmd_extract(args):
     os.makedirs(CACHE, exist_ok=True)
     out = os.path.join(CACHE, args.name + ".m4a")
     meta = os.path.join(CACHE, args.name + ".json")
     t0 = time.time()
     fetch = None
+    args.url = dub_source(args.url)
     src = args.url
     if VN_EXTRACTOR and is_proxied_playlist(args.url):
         try:
