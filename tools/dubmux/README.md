@@ -154,3 +154,19 @@ coverage with a worst gap of 3 → accepted (`coverage_mode: "time"`).
 Runs never extend past their last confident window (+60 s) unless that is
 within two steps of the end, so (b) cannot be satisfied by a stretched
 tail. 34 stored `reject:coverage` records were purged for re-evaluation.
+
+## Aligner defects found by the 500-item evaluation (2026-09-27)
+
+Three fixes in `align.py`, found by re-reading the coarse evidence of every
+"no alignment accepted" item:
+- A run with a POSITIVE lag (the dub starts before the video — longer VN
+  streamer ident) was dropped because its `video_start` came out negative;
+  the run is now clipped to dub time `[lag, …)`. 89 stored rejections had
+  thrown away a solid match this way (LINK CLICK S02E02: 19/23 windows at
+  +34.6 s, coverage reported 0.0).
+- The lag search range was `skew + 15 s`; kkphim injects a ~30 s mid-roll
+  ad around 15 min, so after it the true lag exceeded the range and
+  correlation "died" (The First Frost E25, High School Return of a
+  Gangster E05). The range is now at least 75 s (`MIN_MAX_LAG`).
+- `MAX_SKEW` 180 → 360 s (Striking Rescue: 206 s of extra credits).
+172 affected records were purged for re-evaluation.
