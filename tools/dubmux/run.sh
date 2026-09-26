@@ -12,8 +12,13 @@ podman rm -f dubmux >/dev/null 2>&1 || true
 # hostname, and vnphim's proxied (kkphim/ophim) segments go through
 # mediaflow-vn.geniallark.box.ca, i.e. this very box. Host networking also
 # skips pasta's port restrictions; uvicorn binds 12500 directly.
+# Secrets/env for the container: ~/dubmux/.env (mode 600) — DUBMUX_VNPHIM_URL,
+# DUBMUX_VNPHIM_KEY (vnphim's /_internal/dub-source, to get back to the origin
+# playlist behind an encrypted MediaFlow url) and DUBMUX_MF_PASSWORD (VN
+# MediaFlow, for the seedbox-side extraction fallback only).
 podman run -d --name dubmux --restart unless-stopped \
   --network=host \
+  --env-file "$HOME/dubmux/.env" \
   -v "$HOME/dubmux/data:/data:Z" \
   --cpus 8 \
   localhost/dubmux:latest
