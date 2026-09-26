@@ -4,7 +4,8 @@
 POST /prepare      {"dub":{"id","url"},"video":{"id","url"}}  -> job state
 GET  /status/{dub_id}/{video_id}                               -> job state
 GET  /mux/{dub_id}/{video_id}/master.m3u8                      -> HLS (starts the mux)
-GET  /mux/{dub_id}/{video_id}/index.m3u8
+GET  /mux/{dub_id}/{video_id}/index.m3u8                       (VOD once the mux is done; waits up to MASTER_WAIT_S)
+POST /mux/{dub_id}/{video_id}/start                             -> start the mux, return at once
 GET  /mux/{dub_id}/{video_id}/seg{n}.ts
 GET  /health
 
@@ -33,6 +34,10 @@ RETENTION_DAYS = int(os.environ.get("DUBMUX_RETENTION_DAYS", "30"))
 HLS_BUDGET_GB = float(os.environ.get("DUBMUX_HLS_BUDGET_GB", "300"))
 WORKERS = int(os.environ.get("DUBMUX_FETCH_WORKERS", "128"))
 SEG_WAIT_S = 25
+# A player GET on the master/index waits this long for the mux to finish so
+# it gets a VOD playlist (duration + seeking); an EVENT playlist is served
+# only when the mux is still running after that.
+MASTER_WAIT_S = float(os.environ.get("DUBMUX_MASTER_WAIT_S", "50"))
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 
 app = FastAPI(title="dubmux")
@@ -291,13 +296,41 @@ def master(dub_id: str, video_id: str, request: Request):
     if request.method == "HEAD":
         return Response(status_code=200, media_type="application/vnd.apple.mpegurl",
                         headers={"Cache-Control": "no-store"})
-    if not (_session_dir(k) / ".done").exists():
-        m["video_url"] = video_url
-        json.dump(m, open(_match_path(k), "w"), indent=1)
-        _start_mux(k, dubmux.resolve_url(video_url), dub_id, m["lag"])
+    _ensure_mux(k, dub_id, m, video_url)
+    # Stream-copy muxes finish in seconds to a minute; VidHub treats an
+    # in-progress EVENT playlist as a live stream (length 0, no seeking,
+    # stops after the segments it first saw), so wait for the VOD playlist.
+    _wait_for(_session_dir(k) / ".done", MASTER_WAIT_S)
+    (_session_dir(k) / ".touched").write_text(str(int(time.time())))
     body = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=20000000\nindex.m3u8\n"
     return Response(body, media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-store"})
+
+
+def _ensure_mux(k, dub_id, m, video_url):
+    if (_session_dir(k) / ".done").exists():
+        return
+    m["video_url"] = video_url
+    json.dump(m, open(_match_path(k), "w"), indent=1)
+    _start_mux(k, dubmux.resolve_url(video_url), dub_id, m["lag"])
+
+
+@app.post("/mux/{dub_id}/{video_id}/start")
+def start(dub_id: str, video_id: str, request: Request):
+    """Start (or confirm) the mux for an accepted pair without waiting —
+    remux calls this for every row of the episode being played and for
+    the next episode's first pair, so a later player GET finds a VOD."""
+    k = _key(_check_id(dub_id), _check_id(video_id))
+    m = _load_match(k)
+    if not m or m.get("verdict") != "accept":
+        raise HTTPException(409, "dub not prepared or rejected for this source")
+    video_url = request.query_params.get("video") or m.get("video_url")
+    if not video_url:
+        raise HTTPException(400, "video url required (query ?video=)")
+    d = _session_dir(k)
+    if not (d / ".done").exists():
+        _ensure_mux(k, dub_id, m, video_url)
+    return {"ok": True, "done": (d / ".done").exists()}
 
 
 def _wait_for(path: Path, timeout: float):
@@ -318,8 +351,13 @@ def index(dub_id: str, video_id: str, request: Request):
                         media_type="application/vnd.apple.mpegurl")
     if not _wait_for(p, SEG_WAIT_S):
         raise HTTPException(503, "mux not started")
+    d = _session_dir(k)
+    if not (d / ".done").exists() and not (d / ".failed").exists():
+        _wait_for(d / ".done", MASTER_WAIT_S)
     text = p.read_text()
-    (_session_dir(k) / ".touched").write_text(str(int(time.time())))
+    if (d / ".done").exists():
+        text = text.replace("#EXT-X-PLAYLIST-TYPE:EVENT", "#EXT-X-PLAYLIST-TYPE:VOD", 1)
+    (d / ".touched").write_text(str(int(time.time())))
     return Response(text, media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-store"})
 
