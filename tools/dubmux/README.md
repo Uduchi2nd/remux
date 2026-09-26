@@ -170,3 +170,15 @@ Three fixes in `align.py`, found by re-reading the coarse evidence of every
   Gangster E05). The range is now at least 75 s (`MIN_MAX_LAG`).
 - `MAX_SKEW` 180 → 360 s (Striking Rescue: 206 s of extra credits).
 172 affected records were purged for re-evaluation.
+
+## HQ candidate rule widened (2026-09-27)
+
+The 500-item evaluation showed 55 of 59 "dub but no usable release" items
+had releases that remux's rule rejected: usenet (NzbDAV) streams are named
+like scene releases with NO file extension, and the rule demanded
+`.mkv`/`.mp4`. Names are now accepted unless their extension is a
+playlist/non-file kind (m3u8, ts, strm, avi, wmv, flv, iso, rar). vnphim's
+own rows are excluded by release-name tokens (`.kkphim.`, `.ophim.`,
+`.hotphim.`, `.yanhh3d.`, `ProxiedVN`, `.Vietsub.`) since their URLs are
+opaque MediaFlow addresses now. Unit test
+`hq_candidate_accepts_extensionless_usenet_names_and_rejects_vn_sources`.

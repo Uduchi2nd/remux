@@ -95,11 +95,23 @@ fn is_hq_candidate(stream: &db::Media) -> bool {
         return false;
     };
     let lower = name.to_ascii_lowercase();
+    // vnphim's own rows are recognised by their release-name tokens now that
+    // their URLs are opaque encrypted MediaFlow addresses.
+    let vn_source = [".kkphim.", ".ophim.", ".hotphim.", ".yanhh3d.", "proxiedvn", ".vietsub."]
+        .iter()
+        .any(|t| lower.contains(t));
+    // Usenet releases (NzbDAV) are named like scene releases with NO file
+    // extension; only playlist-style names are not files.
+    let file_like = lower.ends_with(".mkv")
+        || lower.ends_with(".mp4")
+        || !lower.rsplit('.').next().is_some_and(|ext| {
+            matches!(ext, "m3u8" | "m3u" | "ts" | "strm" | "avi" | "wmv" | "flv" | "iso" | "rar")
+        });
     !is_dubmux_row(stream)
         && !url.contains("vnphim")
+        && !vn_source
         && dub_provider(name).is_none()
-        && !lower.contains(".vietsub.")
-        && (lower.ends_with(".mkv") || lower.ends_with(".mp4"))
+        && file_like
         && stream
             .stream_info
             .as_ref()
@@ -644,6 +656,28 @@ pub(crate) async fn start_mux(url: &str, item: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hq_candidate_accepts_extensionless_usenet_names_and_rejects_vn_sources() {
+        fn mk(name: &str, url: &str) -> db::Media {
+            let mut m = db::Media::default();
+            m.stream_info = Some(crate::stream::StreamInfo {
+                filename: Some(name.into()),
+                descriptor: StreamDescriptor::Http {
+                    url: url.into(),
+                    request_headers: Default::default(),
+                    response_headers: Default::default(),
+                },
+                ..Default::default()
+            });
+            m
+        }
+        assert!(is_hq_candidate(&mk("The.Captain.2019.1080p.BluRay.DD+5.1.x264-PTer", "https://usenet.example/x")));
+        assert!(is_hq_candidate(&mk("Yolo.2024.1080p.WEB-DL.mkv", "https://cdn.example/y")));
+        assert!(!is_hq_candidate(&mk("Nguoi.Ban.S01E01.1080p.WEB-DL.Chinese.Vietsub.kkphim.ProxiedVN.mp4", "https://mf.example/_token_x/proxy/hls/manifest.m3u8")));
+        assert!(!is_hq_candidate(&mk("Tien.Nghich.S01E101.1080p.WEB-DL.Chinese.Vietsub.yanhh3d.mp4", "https://mf.example/_token_y/proxy/hls/manifest.m3u8")));
+        assert!(!is_hq_candidate(&mk("Some.Show.S01E01.m3u8", "https://x.example/a.m3u8")));
+    }
 
     #[test]
     fn provider_parsed_from_release_name() {
