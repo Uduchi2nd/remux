@@ -117,12 +117,29 @@ def http_get(url, rng=None, timeout=60, tries=4):
     raise last
 
 
+def _join(url, rel):
+    """urljoin that understands MediaFlow `/proxy/stream?d=<origin>&…` wraps:
+    a relative URI in a wrapped playlist is relative to the ORIGIN, and the
+    result is wrapped again with the same credentials/headers."""
+    if rel.startswith(("http://", "https://")):
+        return rel
+    if "/proxy/stream?" in url:
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+        parts = urlsplit(url)
+        q = parse_qsl(parts.query, keep_blank_values=True)
+        d = dict(q).get("d")
+        if d:
+            q = [(k, urljoin(d, rel) if k == "d" else v) for k, v in q]
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), ""))
+    return urljoin(url, rel)
+
+
 def parse_media_playlist(url):
     """Follow a master to its first variant; return (variant_url, [(seg_url, byterange|None)])."""
     text = http_get(url).decode("utf8", "replace")
     if "#EXT-X-STREAM-INF" in text:
         variant = next(l for l in text.splitlines() if l and not l.startswith("#"))
-        url = urljoin(url, variant)
+        url = _join(url, variant)
         text = http_get(url).decode("utf8", "replace")
     segs, br = [], None
     for line in text.splitlines():
@@ -130,7 +147,7 @@ def parse_media_playlist(url):
             n, o = line[17:].split("@")
             br = (int(o), int(n))
         elif line and not line.startswith("#"):
-            segs.append((urljoin(url, line), br))
+            segs.append((_join(url, line), br))
             br = None
     if not segs:
         raise RuntimeError("no segments in playlist")
