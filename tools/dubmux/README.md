@@ -138,3 +138,19 @@ re-POST of `/prepare` with a better number bumps a queued job in place.
 so every episode's FIRST dub version in the walk is prepared before anyone's
 second variant, and the series being watched never waits behind another
 series' upkeep. Jobs submitted by older remux builds get 500.
+
+## Acceptance by time coverage (2026-09-26)
+
+`align.py` accepts a piecewise match on either of two criteria: (a) ≥ 85 %
+of the coarse windows are confident and inside runs, or (b) the runs span
+≥ 85 % of the dub's timeline, every run has ≥ 2 confident windows, and no
+run has more than 4 unconfident windows (240 s) between confident ones.
+(b) exists for dialogue-sparse stretches — music, effects the dub re-mixed —
+whose windows correlate with nothing although the offset is constant across
+them (their lags come out random, i.e. they are true no-match windows, not
+weak matches); a small cut inside such a gap would have split the run.
+Queen of News E03 vs the DDHDTV 4K: 25/42 confident windows but 94 % time
+coverage with a worst gap of 3 → accepted (`coverage_mode: "time"`).
+Runs never extend past their last confident window (+60 s) unless that is
+within two steps of the end, so (b) cannot be satisfied by a stretched
+tail. 34 stored `reject:coverage` records were purged for re-evaluation.

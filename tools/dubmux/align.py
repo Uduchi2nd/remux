@@ -27,7 +27,8 @@ STRONG_RATIO = 30.0     # a lone window needs this to stand as its own run
 RUN_TOL = 0.25          # lags within this are the same run
 MAX_RUNS = 8
 MAX_SKEW = 180.0        # give up beyond this much total difference
-MIN_COVERAGE = 0.85     # dub time that must be covered by accepted runs
+MIN_COVERAGE = 0.85     # dub time / windows that must be covered by accepted runs
+MAX_GAP_WINDOWS = 4     # inside a run: up to 4 unconfident windows (240 s) between confident ones
 R = dubmux.RATE
 
 
@@ -122,9 +123,10 @@ def analyse(video_pcm, dub_pcm):
             r["last"] = s
             r["lags"].append(lag)
             r["ratios"].append(ratio)
+            r["starts"].append(s)
             r["lag_med"] = sorted(r["lags"])[len(r["lags"]) // 2]
         else:
-            runs.append({"first": s, "last": s, "lags": [lag], "ratios": [ratio], "lag_med": lag})
+            runs.append({"first": s, "last": s, "lags": [lag], "ratios": [ratio], "starts": [s], "lag_med": lag})
     # A single window at some odd lag is noise, not a cut: drop it unless it
     # is very strong, then re-merge neighbours that now agree.
     kept = [r for r in runs if len(r["lags"]) >= 2 or max(r["ratios"]) >= STRONG_RATIO]
@@ -135,6 +137,7 @@ def analyse(video_pcm, dub_pcm):
             p["last"] = r["last"]
             p["lags"] += r["lags"]
             p["ratios"] += r["ratios"]
+            p["starts"] += r["starts"]
             p["lag_med"] = sorted(p["lags"])[len(p["lags"]) // 2]
         else:
             runs.append(r)
@@ -189,7 +192,29 @@ def analyse(video_pcm, dub_pcm):
     coverage = in_runs / len(coarse) if coarse else 0.0
     covered = sum(r["dub_end"] - r["dub_start"] for r in out)
     verdict = "accept" if out and coverage >= MIN_COVERAGE else "reject:coverage"
-    return {"verdict": verdict, "coverage": round(coverage, 3), "confident_windows": confident,
+    # Second criterion — TIME coverage by well-anchored runs. Dialogue-sparse
+    # stretches (music, effects the dub re-mixed) correlate with nothing, so
+    # their windows are "unconfident" even though the offset is constant
+    # across them; a run whose confident windows bracket such a gap is still
+    # trustworthy. Accept when the runs span >= MIN_COVERAGE of the dub, every
+    # run has >= 2 confident windows, and no gap inside a run exceeds
+    # MAX_GAP_WINDOWS (a small cut inside a longer gap would have split the
+    # run). Queen of News E03 vs the DDHDTV 4K: 25/42 windows confident but
+    # runs cover 94 % of the timeline with the biggest gap 3 windows.
+    coverage_mode = "windows"
+    if verdict != "accept" and out and ddur:
+        time_cov = covered / ddur
+        anchored = all(r["windows"] >= 2 for r in out)
+        max_gap = 0
+        for r in runs:
+            ws = sorted(r["starts"]) if "starts" in r else []
+            for a, b in zip(ws, ws[1:]):
+                max_gap = max(max_gap, int(round((b - a) / COARSE_STEP)) - 1)
+        if time_cov >= MIN_COVERAGE and anchored and max_gap <= MAX_GAP_WINDOWS:
+            verdict, coverage_mode = "accept", "time"
+            coverage = round(time_cov, 3)
+    return {"verdict": verdict, "coverage": round(coverage, 3), "coverage_mode": coverage_mode,
+            "confident_windows": confident,
             "total_windows": len(coarse), "covered_seconds": round(covered, 1), "runs": out,
             "video_duration": round(vdur, 3), "dub_duration": round(ddur, 3),
             "max_lag": max_lag,
