@@ -399,10 +399,12 @@ pub(crate) async fn ensure_dub_rows(
             // list (dub first, default) from the moment it exists; the next
             // refresh rebuilds it from the HQ's real probe. Without it a
             // just-created row showed no Vietnamese track until then.
-            row.probe_data = hq
-                .probe_data
-                .as_ref()
-                .map(|p| mux_probe(p, provider));
+            row.probe_data = Some(
+                hq.probe_data
+                    .as_ref()
+                    .map(|p| mux_probe(p, provider))
+                    .unwrap_or_else(|| minimal_probe(provider)),
+            );
             rows.push(row);
             // HQ releases are walked in quality order, so the cap keeps the
             // best video and its dub variants (backups against a bad dub)
@@ -498,6 +500,35 @@ async fn existing_dub_rows(ctx: &AppContext, media: &db::Media) -> Vec<db::Media
     rows
 }
 
+/// Provider label of a "[+VN dub · <provider>] …" row title.
+fn row_provider(row: &db::Media) -> String {
+    row.title
+        .split("[+VN dub · ")
+        .nth(1)
+        .and_then(|r| r.split(']').next())
+        .unwrap_or("vnphim")
+        .to_string()
+}
+
+pub(crate) fn row_provider_pub(row: &db::Media) -> String {
+    row_provider(row)
+}
+
+/// A dub row's track list when its HQ release has no probe yet: the video
+/// as a guess plus the dub as the default `vie` track. Rows must never be
+/// live-probed (the master would start a mux and the result races the
+/// muxer), so every row carries SOME probe from the moment it exists.
+pub(crate) fn minimal_probe(provider: &str) -> api::MediaSourceInfo {
+    let mut base = api::MediaSourceInfo::default();
+    base.media_streams = vec![MediaStream {
+        type_: Some(MediaStreamType::Video),
+        index: 0,
+        is_default: Some(true),
+        ..Default::default()
+    }];
+    mux_probe(&base, provider)
+}
+
 /// The HQ source id a dub row was built on (the `/mux/<dub>/<hq>/` path).
 fn hq_id_of(row: &db::Media) -> Option<Uuid> {
     let url = http_url(row)?;
@@ -538,6 +569,18 @@ fn carried_rows(
         };
         let mut row = (*row).clone();
         row.updated_at = now;
+        // Rebuild the track list from the release's CURRENT probe: a row
+        // carried over from before its release was probed (or from a build
+        // that left rows without one) would otherwise be live-probed on
+        // play — the mux master answers only once the mux is done and the
+        // first PlaybackInfo listed no Vietnamese track (Pursuit of Jade E12).
+        let provider = row_provider(&row);
+        row.probe_data = Some(
+            hq.probe_data
+                .as_ref()
+                .map(|p| mux_probe(p, &provider))
+                .unwrap_or_else(|| minimal_probe(&provider)),
+        );
         if let Some(si) = row
             .stream_info
             .as_mut()

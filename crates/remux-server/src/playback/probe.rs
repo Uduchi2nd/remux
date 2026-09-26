@@ -1261,6 +1261,22 @@ pub(crate) async fn probe_stream(
     port: u16,
     db: &sqlx::SqlitePool,
 ) -> axum_anyhow::ApiResult<(api::MediaSourceInfo, db::Media)> {
+    // Dub rows already carry a synthetic track list derived from their HQ
+    // release. Probing the mux master starts a full episode job and blocks
+    // PlaybackInfo, so always return the stored or minimal list directly.
+    if crate::services::dubmux::is_dubmux_row(stream) {
+        let mut row = stream.clone();
+        if row.probe_data.is_none() {
+            row.probe_data = Some(crate::services::dubmux::minimal_probe(
+                &crate::services::dubmux::row_provider_pub(&row),
+            ));
+        }
+        record_probe_verification(&row, true);
+        let mut info = api::MediaSourceInfo::from(row.clone());
+        apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
+        return Ok((info, row));
+    }
+
     if skip_probe {
         let mut info = api::MediaSourceInfo::from(stream.clone());
         // No real probe (RemuxDB miss, and this candidate isn't the one that
