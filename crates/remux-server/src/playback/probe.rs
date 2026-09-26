@@ -1028,6 +1028,25 @@ pub(crate) async fn probe_stream(
     if skip_probe {
         return Ok((api::MediaSourceInfo::from(stream.clone()), stream.clone()));
     }
+    // PATCH (uduchi2nd): a "[+VN dub]" row's tracks are known by construction
+    // and its master playlist starts a full-episode mux when fetched, so it
+    // is never ffprobed. Rows without a stored probe (legacy) get the minimal
+    // one (video + Vietnamese dub) — the next refresh rebuilds it from the HQ.
+    if crate::services::dubmux::is_dubmux_row(stream) {
+        let mut row = stream.clone();
+        if row
+            .probe_data
+            .is_none()
+        {
+            row.probe_data = Some(crate::services::dubmux::minimal_probe(
+                &crate::services::dubmux::row_provider_pub(&row),
+            ));
+        }
+        record_probe_verification(&row, true);
+        let mut info = api::MediaSourceInfo::from(row.clone());
+        apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
+        return Ok((info, row));
+    }
     if let Some(cached) = &stream.probe_data {
         if is_reusable_probe_cache(cached) {
             let alive = match stream
