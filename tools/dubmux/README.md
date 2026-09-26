@@ -120,3 +120,21 @@ wraps (a plain urljoin produced `…/proxy/2000kb/hls/…` → MediaFlow 401 —
 every extraction failed that way for ~20 minutes on 2026-09-26). Without
 the lookup the muxer silently extracted whole dubs THROUGH the VN
 MediaFlow (part of what blew its memory up to 800 MB that day).
+
+## Priority queue (2026-09-26)
+
+Extraction (2 slots, = what the VN extractor runs in parallel) and matching
+(3 slots) are `PriorityGate`s: lowest `priority` first, FIFO on ties, and a
+re-POST of `/prepare` with a better number bumps a queued job in place.
+`GET /queue` shows occupancy and the waiting pairs. remux sends:
+
+| caller | priority |
+| --- | --- |
+| playback request for the episode being played | 0 |
+| on-play walk, next episode … 10th next, then 2 previous | 100 + position |
+| hourly background refresh | 300 |
+| (any) second dub provider / second-best release of an episode | base + 50 + rank |
+
+so every episode's FIRST dub version in the walk is prepared before anyone's
+second variant, and the series being watched never waits behind another
+series' upkeep. Jobs submitted by older remux builds get 500.
