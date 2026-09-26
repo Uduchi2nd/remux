@@ -255,9 +255,22 @@ pub(crate) async fn ensure_dub_rows(
     if !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
         return vec![];
     }
+    // Existing dub rows come from the DB, not from `streams`: on a refresh
+    // the caller passes the freshly fetched addon list, which never
+    // contains our synthetic rows (that is exactly when carry-over matters).
+    let stored = existing_dub_rows(ctx, media).await;
     let existing: Vec<&db::Media> = streams
         .iter()
         .filter(|s| is_dubmux_row(s))
+        .chain(
+            stored
+                .iter()
+                .filter(|r| {
+                    !streams
+                        .iter()
+                        .any(|s| s.id == r.id)
+                }),
+        )
         .collect();
     let dubs: Vec<(&db::Media, String, String)> = streams
         .iter()
@@ -437,6 +450,27 @@ pub(crate) async fn ensure_dub_rows(
                 start_mux(&url, item).await;
             }
         });
+    }
+    rows
+}
+
+/// Every "[+VN dub]" row stored for an item, fresh or stale (`Media::streams`
+/// hides rows older than the last refresh, which is what carry-over needs).
+async fn existing_dub_rows(ctx: &AppContext, media: &db::Media) -> Vec<db::Media> {
+    let ids: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM media WHERE parent_id = ? AND title LIKE '[+VN dub%'",
+    )
+    .bind(media.id)
+    .fetch_all(&ctx.db)
+    .await
+    .unwrap_or_default();
+    let mut rows = Vec::new();
+    for id in ids {
+        if let Ok(Some(row)) = db::Media::get_by_id(&ctx.db, &id).await {
+            if is_dubmux_row(&row) {
+                rows.push(row);
+            }
+        }
     }
     rows
 }
