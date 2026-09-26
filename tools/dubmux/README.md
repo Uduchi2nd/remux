@@ -53,6 +53,12 @@ front of the source list for every accepted pair.
   mux, and one prefetch sweep produced 108 muxes / 298 GB. HEAD requests
   never start a mux; `DUBMUX_HLS_BUDGET_GB` is 150 and retention also runs
   at startup (`POST /sweep` applies it on demand).
+- Players must receive a finished VOD playlist: VidHub treats the
+  in-progress EVENT playlist as live (length 0, no seeking, stops after the
+  first segments). Master/index GETs wait up to `DUBMUX_MASTER_WAIT_S`
+  (50 s) for `.done` and rewrite the type to VOD; remux POSTs
+  `/mux/{dub}/{video}/start` for every row at playback time so the wait
+  is normally zero. Cold 1.5–2.3 GB releases mux in 7–40 s.
 - Never edit repo files while a build chain is still in its format/copy-back
   step: the copy-back clobbered a later edit once (the 2-previous walk).
 - Piecewise acceptance must be judged on confident windows, not on run
