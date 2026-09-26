@@ -104,3 +104,19 @@ the donghuavip CDN pulls a cold segment through Cloudflare's LAX edge at
 
 HLS retention budget is 500 GB (`DUBMUX_HLS_BUDGET_GB`, raised from 150
 on 2026-09-26 at the user's request; ~2.3 GB per muxed episode).
+
+## Encrypted stream addresses → origin (2026-09-26)
+
+vnphim now hands out opaque encrypted MediaFlow URLs, so the dub `url`
+remux passes to `/prepare` cannot be unwrapped locally. `dubmux.dub_source`
+asks vnphim (`GET /_internal/dub-source?u=…`, header `X-Vnphim-Key`; env
+`DUBMUX_VNPHIM_URL`/`DUBMUX_VNPHIM_KEY` in `~/dubmux/.env`, loaded by
+`run.sh --env-file`) for the origin master + Referer behind it and rebuilds
+a MediaFlow-style wrap (`/proxy/stream?d=<origin>&api_password&h_Referer`,
+password from `DUBMUX_MF_PASSWORD`) so the VN extractor unwraps it and pulls
+from the origin as before, and the seedbox-side fallback still works.
+`_join` resolves relative playlist URIs against the `d=` origin inside such
+wraps (a plain urljoin produced `…/proxy/2000kb/hls/…` → MediaFlow 401 —
+every extraction failed that way for ~20 minutes on 2026-09-26). Without
+the lookup the muxer silently extracted whole dubs THROUGH the VN
+MediaFlow (part of what blew its memory up to 800 MB that day).
