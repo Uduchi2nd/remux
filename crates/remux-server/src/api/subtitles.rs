@@ -2512,6 +2512,27 @@ pub(super) async fn validate_external_subtitles_for_advertising(
 /// `is_external = false` so alignment still treats them as an embedded
 /// reference, but VidHub/Infuse only list tracks that look external AND have
 /// a `Path`, so present them that way in every client-facing document.
+/// Labels for addon-provided subtitle tracks, in list order: `<lang> (vnphim N)`
+/// with N counting tracks of the same language (1-based), so two Vietnamese
+/// files — and the release's own "(release)" track — can be told apart.
+fn external_subtitle_labels<'a>(
+    langs: impl Iterator<Item = Option<&'a str>>,
+) -> Vec<String> {
+    let mut seen: std::collections::HashMap<String, usize> = Default::default();
+    langs
+        .map(|l| {
+            let lang = l
+                .unwrap_or("und")
+                .to_ascii_lowercase();
+            let n = seen
+                .entry(lang.clone())
+                .or_insert(0);
+            *n += 1;
+            format!("{lang} (vnphim {n})")
+        })
+        .collect()
+}
+
 pub(crate) fn present_dub_row_embedded_subtitles(
     media_sources: &mut [api::MediaSourceInfo],
     item_id: Uuid,
@@ -2546,17 +2567,25 @@ pub(crate) fn present_dub_row_embedded_subtitles(
             stream.delivery_url = Some(format!(
                 "/Videos/{item_id}/{source_id}/Subtitles/{idx}/0/Stream.vtt?ApiKey={api_key}"
             ));
+            // "(release)": tells the viewer this is the HQ release's own
+            // text track, not the addon one (both show as external here).
+            let lang = stream
+                .language
+                .clone()
+                .unwrap_or_else(|| "und".into());
             if stream
                 .path
                 .is_none()
             {
-                stream.path = Some(format!(
-                    "{}.vtt",
-                    stream
-                        .language
-                        .as_deref()
-                        .unwrap_or("und")
-                ));
+                stream.path = Some(format!("{lang} (release).vtt"));
+            }
+            if let Some(t) = stream
+                .display_title
+                .as_mut()
+            {
+                if !t.contains("(release)") {
+                    t.push_str(" (release)");
+                }
             }
         }
     }
@@ -2621,6 +2650,14 @@ pub(crate) async fn inject_external_subtitles(
             device_profile,
             dedup,
         );
+        let labels = external_subtitle_labels(
+            scored
+                .iter()
+                .map(|s| {
+                    s.lang
+                        .as_deref()
+                }),
+        );
         let wants_default = !sub_langs.is_empty()
             && source.default_subtitle_stream_index.is_none();
         for (i, sub) in scored.into_iter().enumerate() {
@@ -2631,10 +2668,13 @@ pub(crate) async fn inject_external_subtitles(
                 "/Videos/{item_id}/{source_id}/Subtitles/{idx}/0/Stream.vtt?ApiKey={api_key}",
                 source_id = source.id,
             ));
-            stream.path = Some(format!(
-                "{}.vtt",
-                stream.language.as_deref().unwrap_or("und")
-            ));
+            // Vidhub requires Path to discover external subtitles and uses its
+            // basename as the label. Keep credentials in DeliveryUrl only.
+            // "(vnphim N)": addon tracks are numbered per language so two
+            // Vietnamese files (and the release's own) can be told apart.
+            let label = labels[i].clone();
+            stream.path = Some(format!("{label}.vtt"));
+            stream.display_title = Some(label);
             if let Some(descriptor) = sub
                 .url
                 .as_ref()
@@ -2811,6 +2851,25 @@ pub(crate) fn drop_unsupported_embedded_subtitles_with_external_match(
                 });
             !has_replacement
         });
+}
+
+#[cfg(test)]
+mod label_tests {
+    #[test]
+    fn external_labels_number_same_language_tracks() {
+        let l = super::external_subtitle_labels(
+            [Some("vie"), Some("vie"), Some("eng"), None].into_iter(),
+        );
+        assert_eq!(
+            l,
+            [
+                "vie (vnphim 1)",
+                "vie (vnphim 2)",
+                "eng (vnphim 1)",
+                "und (vnphim 1)"
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
