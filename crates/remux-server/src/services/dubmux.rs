@@ -383,7 +383,49 @@ pub(crate) async fn ensure_dub_rows(
         return vec![];
     }
     info!(item = %media.id, rows = rows.len(), "dubmux rows ready");
+    // A playback request (wait > 0) means the viewer is about to pick one of
+    // these rows: start every mux now so the player's GET finds a finished
+    // VOD playlist instead of an in-progress EVENT one (VidHub shows those
+    // as a 0-length live stream and stops after a few segments).
+    if wait_secs > 0 {
+        let urls: Vec<String> = rows
+            .iter()
+            .filter_map(http_url)
+            .map(|u| u.replacen(cfg.public, cfg.api, 1))
+            .collect();
+        let item = media.id;
+        tokio::spawn(async move {
+            for url in urls {
+                start_mux(&url, item).await;
+            }
+        });
+    }
     rows
+}
+
+/// Ask the muxer to start (or confirm) the mux behind a dub row's master URL
+/// without waiting for it. `url` must already point at the API host.
+pub(crate) async fn start_mux(url: &str, item: Uuid) {
+    let start = url.replacen("/master.m3u8", "/start", 1);
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap_or_default();
+    match client
+        .post(&start)
+        .send()
+        .await
+    {
+        Ok(r)
+            if r.status()
+                .is_success() =>
+        {
+            debug!(item = %item, "dubmux mux started")
+        }
+        Ok(r) => warn!(item = %item, status = %r.status(), "dubmux mux start refused"),
+        Err(e) => warn!(item = %item, "dubmux mux start failed: {e:#}"),
+    }
 }
 
 #[cfg(test)]
@@ -713,19 +755,6 @@ async fn premux_first_pair(ctx: &AppContext, ep: &mut db::Media, user: Uuid) {
     };
     // Reach the muxer over the tailnet API host, not the public hostname.
     let url = url.replacen(cfg.public, cfg.api, 1);
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(20))
-        .build()
-        .unwrap_or_default();
-    match client
-        .get(&url)
-        .send()
-        .await
-    {
-        Ok(r) => {
-            info!(episode = %ep.id, status = %r.status(), user = %user, "dub prefetch: next episode mux started")
-        }
-        Err(e) => warn!(episode = %ep.id, "dub prefetch: mux start failed: {e:#}"),
-    }
+    info!(episode = %ep.id, user = %user, "dub prefetch: starting next episode mux");
+    start_mux(&url, ep.id).await;
 }
