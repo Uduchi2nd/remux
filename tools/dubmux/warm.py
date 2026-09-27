@@ -173,7 +173,8 @@ def warm(it):
     dubs = [s for s in vs if is_dub(s)][:MAX_DUBS]
     if not dubs:
         return "no_dub"
-    time.sleep(AIO_PACE_S)
+    sys.path.insert(0, "/root/dubmux-eval")
+    import aiopace; aiopace.wait_turn()
     aio = get(f"{AIO}/stream/{it['type']}/{sid(it)}.json", 120).get("streams", [])
     hqs = [s for s in aio if is_hq(s)][:MAX_HQ]
     if not hqs:
