@@ -74,50 +74,54 @@ _extract_locks: dict[str, threading.Lock] = {}
 
 
 class PriorityGate:
-    """N concurrent slots handed out lowest-`priority` first (ties: FIFO).
-    A waiter's priority can be raised later (`bump`) — remux re-submits a
-    pair with a better priority when the viewer gets closer to it."""
+    """Two separate concurrency pools per stage, each handed out lowest-
+    `priority` first (ties: FIFO):
+      * `live` slots — ONLY the episode being played and the next one
+        (priority <= live_max, i.e. their best pairs; variants carry +50);
+        they may also spill into the general pool, ahead of everyone.
+      * `slots` general — everything else (item-open pairs, the rest of the
+        walk, background refresh, cache warming, evaluation), so background
+        work has a hard concurrency cap and can never crowd out playback.
+    Running jobs are never preempted. A waiter's priority can be raised
+    later (`bump`) — remux re-submits a pair with a better priority when the
+    viewer gets closer to it."""
 
-    def __init__(self, slots, reserved=0, reserved_max_priority=99, express=1, express_max_priority=9):
-        # `reserved` extra slots may only be taken by jobs whose priority is
-        # <= reserved_max_priority (interactive: playback 0, item-open 10+…),
-        # so they never wait behind a queue of background / evaluation jobs
-        # that already hold the shared slots; `express` extra slots are for
-        # priority <= express_max_priority only (a PLAYBACK pair), so a
-        # viewer who pressed play never waits behind the on-open / walk
-        # pairs of everything else they browsed (2026-09-27: a playback pair
-        # sat 6 min behind 56 open-time pairs on the single reserved slot).
+    def __init__(self, slots, live=2, live_max_priority=9):
         self.slots = slots
-        self.tiers = [(reserved, reserved_max_priority), (express, express_max_priority)]
+        self.live = live
+        self.live_max = live_max_priority
         self.cv = threading.Condition()
         self.waiting: dict[str, list] = {}   # key -> [priority, seq]
+        self.holding: dict[str, str] = {}    # key -> "live" | "general"
         self.seq = 0
-        self.active = 0
 
-    def _capacity(self, priority):
-        return self.slots + sum(extra for extra, cap in self.tiers if priority <= cap)
+    def _active(self, pool):
+        return sum(1 for p in self.holding.values() if p == pool)
+
+    def _pool_for(self, priority):
+        """Pool a job of this priority could take a slot in right now."""
+        if priority <= self.live_max and self._active("live") < self.live:
+            return "live"
+        if self._active("general") < self.slots:
+            return "general"
+        return None
 
     def acquire(self, key, priority):
         with self.cv:
             self.seq += 1
             self.waiting[key] = [priority, self.seq]
             while True:
-                prio = self.waiting[key][0]
-                if self.active < self._capacity(prio):
-                    # lowest-priority-number waiter that fits in the capacity
-                    # its own priority allows
-                    eligible = [(v[0], v[1], k) for k, v in self.waiting.items()
-                                if self.active < self._capacity(v[0])]
-                    best = min(eligible)[2]
-                    if best == key:
-                        del self.waiting[key]
-                        self.active += 1
-                        return
+                eligible = [(v[0], v[1], k) for k, v in self.waiting.items()
+                            if self._pool_for(v[0]) is not None]
+                if eligible and min(eligible)[2] == key:
+                    self.holding[key] = self._pool_for(self.waiting[key][0])
+                    del self.waiting[key]
+                    return
                 self.cv.wait(1.0)
 
-    def release(self):
+    def release(self, key):
         with self.cv:
-            self.active -= 1
+            self.holding.pop(key, None)
             self.cv.notify_all()
 
     def bump(self, key, priority):
@@ -129,7 +133,8 @@ class PriorityGate:
 
     def snapshot(self):
         with self.cv:
-            return {"active": self.active, "slots": self.slots, "tiers": self.tiers,
+            return {"active": {"live": self._active("live"), "general": self._active("general")},
+                    "slots": {"live": self.live, "general": self.slots, "live_max_priority": self.live_max},
                     "waiting": sorted((p, k[:8]) for k, (p, _s) in self.waiting.items())}
 
 
@@ -138,10 +143,10 @@ class PriorityGate:
 # the event loop keeps answering /prepare and /mux promptly. Extraction is
 # bounded to what the VN extractor runs in parallel, so ITS queue never
 # holds work this gate would have ordered differently.
-MATCH_GATE = PriorityGate(int(os.environ.get("DUBMUX_MATCH_SLOTS", "3")), reserved=1)
-EXTRACT_GATE = PriorityGate(int(os.environ.get("DUBMUX_EXTRACT_SLOTS", "2")), reserved=1)
+MATCH_GATE = PriorityGate(int(os.environ.get("DUBMUX_MATCH_SLOTS", "3")), live=int(os.environ.get("DUBMUX_LIVE_SLOTS", "2")))
+EXTRACT_GATE = PriorityGate(int(os.environ.get("DUBMUX_EXTRACT_SLOTS", "2")), live=int(os.environ.get("DUBMUX_LIVE_SLOTS", "2")))
 # Raw local copies of releases (two-pass mux): bounded downloads.
-RAW_GATE = PriorityGate(int(os.environ.get("DUBMUX_RAW_SLOTS", "2")), reserved=1)
+RAW_GATE = PriorityGate(int(os.environ.get("DUBMUX_RAW_SLOTS", "2")), live=int(os.environ.get("DUBMUX_LIVE_SLOTS", "2")))
 RAW_KEEP_S = int(os.environ.get("DUBMUX_RAW_KEEP_S", str(2 * 3600)))
 _raw_locks: dict[str, threading.Lock] = {}
 _raw_refs: dict[str, set] = {}      # hq_id -> pair keys currently using the raw copy
@@ -234,7 +239,7 @@ def _raw_copy(hq_id, video_url, k, priority):
             _record_segtab(hq_id, d)
             return d
         finally:
-            RAW_GATE.release()
+            RAW_GATE.release("raw:" + k)
 
 
 def _raw_start_time(d):
@@ -294,7 +299,7 @@ def _prepare_worker(dub, video, k):
                                           "parallel": WORKERS})
                     dubmux.cmd_extract(args)
                 finally:
-                    EXTRACT_GATE.release()
+                    EXTRACT_GATE.release(k)
         job["stage"] = "match:queued"
         MATCH_GATE.acquire(k, job["priority"])
         slot_held = True
@@ -369,9 +374,12 @@ def _prepare_worker(dub, video, k):
         json.dump(result, open(_match_path(k), "w"), indent=1)
         job.update(status="ready" if result["verdict"] == "accept" else "rejected",
                    stage="done", result=result)
-        # Interactive + accepted: the raw copy is (being) downloaded — finish
-        # the final mux right away so the row plays without a cold wait.
-        if not rejected and job["priority"] <= 99:
+        # Playing / next episode + accepted: the raw copy is (being)
+        # downloaded — build the play-cache session right away so the row
+        # plays without a cold wait. Merely opened/walked items stop at the
+        # aligned audio + segment table (JIT playback then starts in ~1 s),
+        # so browsing never fills the play cache.
+        if not rejected and job["priority"] <= 9:
             if raw_thread is not None:
                 raw_thread.join()
                 raw_thread = None
@@ -382,7 +390,7 @@ def _prepare_worker(dub, video, k):
         job.update(status="error", stage="done", error=str(e)[-500:])
     finally:
         if slot_held:
-            MATCH_GATE.release()
+            MATCH_GATE.release(k)
         if raw_thread is not None:
             raw_thread.join()
         _raw_release(hq_id, k, rejected)

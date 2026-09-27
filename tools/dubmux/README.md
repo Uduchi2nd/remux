@@ -144,10 +144,16 @@ remux → muxer priorities: current episode (playback) 0, NEXT episode 2, item
 opened in the app 10, the rest of the on-play walk 100+n (upcoming first,
 previous last), background refresh 300, evaluation 400; a pair that is not
 the best of its episode adds 50+rank, so every episode's first dub version
-lands before any variant. Gates (`PriorityGate`): match 3 shared slots + 1
-reserved for ≤99 + 1 express for ≤9 (playback/next only); extract 2+1+1; raw
-copy (the full-release fetch) 2+1+1 → at most 4 releases downloading at
-once. Running jobs are never preempted; priority only orders the waiting.
+lands before any variant. Gates (`PriorityGate`) are TWO separate pools per
+stage: `live` slots (2, `DUBMUX_LIVE_SLOTS`) only for priority ≤9 = the
+best pair of the episode being played and of the next one (they may also
+spill into the general pool, ahead of everyone), and a general pool with a
+hard cap for everything else — match 3, extract 2, raw copy (the
+full-release fetch) 2 — so background/walk/warm/eval work can never crowd
+out playback and never downloads more than 2 releases at once (4 with the
+live pool). Running jobs are never preempted; priority only orders the
+waiting. Only ≤9 pairs get a play-cache session built after acceptance;
+opened/walked items stop at aligned audio + segment table.
 
 ## Acceptance by time coverage (2026-09-26)
 
