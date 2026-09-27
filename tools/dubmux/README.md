@@ -182,3 +182,26 @@ own rows are excluded by release-name tokens (`.kkphim.`, `.ophim.`,
 `.hotphim.`, `.yanhh3d.`, `ProxiedVN`, `.Vietsub.`) since their URLs are
 opaque MediaFlow addresses now. Unit test
 `hq_candidate_accepts_extensionless_usenet_names_and_rejects_vn_sources`.
+
+## Two-pass mux, pre-screen, self-check (2026-09-27)
+
+Pipeline per pair now: extract dub (VN) → **pre-screen** (8 × 60 s windows of
+the release by byte range, ~1 % of the file; < 3 confident windows →
+`reject:prescreen`, no download; ≥ 5 agreeing within 0.15 s and equal
+durations → same-cut accept with that lag, no full read) → otherwise
+**raw copy**: the release is stream-copied ONCE into `hls/raw-<hq>/`
+(video + all original audio, shared by every dub of that release; for
+interactive priorities it downloads in parallel with the extraction) →
+piecewise alignment against `raw-<hq>/audio.mka` on local disk → **final
+mux is a local remux** from the raw copy (18 s measured; falls back to the
+remote release when no copy exists). Measured on Speed and Love E03 ×
+TorBox 2160p: 202 s end to end (was 3–4.5 min sequential, 8–13 min under
+the day's incidents).
+Garbage rules: a rejected pair drops the raw copy at once unless another
+job uses it or an accepted match for that release exists; raw copies go
+`DUBMUX_RAW_KEEP_S` (2 h) after their last use, failed ones after 30 min,
+and they count toward the HLS budget. `health` reports `raw_copies`.
+Every finished mux runs `_verify_sync`: the dub track is cross-correlated
+against the release's first audio track at three points; a confident
+disagreement > 0.35 s marks the session `.failed` (`.verify` holds the
+numbers). It caught a +1.6 s double clock shift in the first build.

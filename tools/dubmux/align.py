@@ -272,9 +272,11 @@ def build_track(hq_audio, dubfile, runs, vdur, out_path, bitrate="160k"):
     return pieces
 
 
-def align(video_url, dubfile, workdir, key, bitrate="160k"):
-    """Full pipeline; returns the report (with 'aligned' path on accept)."""
-    hq = fetch_hq_audio(video_url, os.path.join(workdir, f"{key}.hq.mka"))
+def align(video_url, dubfile, workdir, key, bitrate="160k", hq_audio=None):
+    """Full pipeline; returns the report (with 'aligned' path on accept).
+    `hq_audio` = a local audio file of the release (from the raw local copy
+    the muxer keeps, see server._raw_copy) — skips the remote fetch."""
+    hq = hq_audio or fetch_hq_audio(video_url, os.path.join(workdir, f"{key}.hq.mka"))
     rep = analyse(decode_all(hq), decode_all(dubfile))
     if rep["verdict"] == "accept":
         out = os.path.join(workdir, f"{key}.aligned.m4a")
