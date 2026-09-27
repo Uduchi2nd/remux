@@ -15,7 +15,7 @@ State on disk under DUBMUX_DATA:
   match/<dub_id>__<video_id>.json cross-correlation result
   hls/<dub_id>__<video_id>/       segments + playlist (+ .done when VOD)
 """
-import asyncio, json, os, re, shutil, subprocess, sys, threading, time
+import asyncio, hashlib, json, os, re, shutil, subprocess, sys, threading, time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -267,6 +267,122 @@ def _raw_release(hq_id, k, rejected):
     shutil.rmtree(_raw_dir(hq_id), ignore_errors=True)
 
 
+# --- content identity: the same dub (origin playlist) x the same release
+# (file name) is the same alignment whatever ids the caller uses. remux keys
+# pairs by its own row uuids, the cache warmer / evaluation by hashes of the
+# stream documents; the index below lets a prepare under new ids reuse the
+# audio, verdict, aligned track and segment table of an earlier one.
+INDEX = MATCH / "index"
+
+
+def _dub_origin(url):
+    """Stable identity of a dub stream: its origin playlist URL (query
+    stripped); falls back to the given URL."""
+    try:
+        src = dubmux.dub_source(url, log=open(os.devnull, "w"))
+    except Exception:  # noqa: BLE001
+        src = url
+    return _unwrap_origin(src)
+
+
+def _unwrap_origin(src):
+    from urllib.parse import urlparse, parse_qs, unquote
+    if "/proxy/stream?" in src or "/proxy/hls/" in src:
+        q = parse_qs(urlparse(src).query)
+        if q.get("d"):
+            src = unquote(q["d"][0])
+    return src.split("?")[0]
+
+
+def _hq_name(video_url):
+    """Release identity: the file name at the end of the (unresolved) stream
+    URL, or None when the URL carries none (opaque CDN addresses)."""
+    from urllib.parse import unquote
+    name = unquote(video_url.split("?")[0].rstrip("/").rsplit("/", 1)[-1])
+    if len(name) < 8 or "." not in name or "/" in name:
+        return None
+    return name[:200]
+
+
+def _index_key(origin, name):
+    return hashlib.sha1(f"{origin}|{name}".encode()).hexdigest()[:32]
+
+
+def _index_get(origin, name):
+    p = INDEX / f"{_index_key(origin, name)}.json"
+    try:
+        return json.load(open(p))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _index_put(origin, name, k, verdict):
+    INDEX.mkdir(parents=True, exist_ok=True)
+    p = INDEX / f"{_index_key(origin, name)}.json"
+    json.dump({"pair": k, "verdict": verdict, "origin": origin[:300], "name": name,
+               "at": int(time.time())}, open(p, "w"))
+
+
+def _alias_from(k_old, dub_new, hq_new, video_url):
+    """Materialise pair dub_new__hq_new from an existing pair's records
+    (hardlinks for the audio and segment table, a rewritten match record
+    that points at the existing aligned track). Returns the new result or
+    None when the old records are gone."""
+    old = _load_match(k_old)
+    if not old:
+        return None
+    dub_old, hq_old = k_old.split("__", 1)
+    if old.get("verdict") == "accept":
+        if old.get("aligned") and not (MATCH / old["aligned"]).exists():
+            return None
+        if not old.get("aligned") and not (AUDIO / f"{dub_old}.m4a").exists():
+            return None
+    k_new = _key(dub_new, hq_new)
+    for ext in (".m4a", ".json"):
+        src, dst = AUDIO / f"{dub_old}{ext}", AUDIO / f"{dub_new}{ext}"
+        if src.exists() and not dst.exists():
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copyfile(src, dst)
+    src, dst = _segtab_path(hq_old), _segtab_path(hq_new)
+    if src.exists() and not dst.exists():
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copyfile(src, dst)
+    result = dict(old)
+    result.update({"dub": dub_new, "video": hq_new, "video_url": video_url,
+                   "aliased_from": k_old, "created": int(time.time())})
+    json.dump(result, open(_match_path(k_new), "w"), indent=1)
+    _touch_pair(k_old, dub_old)
+    return result
+
+
+def _index_backfill():
+    """Index every existing match record once (records from before the
+    index existed)."""
+    n = 0
+    for p in MATCH.glob("*__*.json"):
+        if p.name.endswith(".aligned.json"):
+            continue
+        try:
+            m = json.load(open(p))
+            k = p.name[:-5]
+            dub_id = k.split("__", 1)[0]
+            meta = json.load(open(AUDIO / f"{dub_id}.json"))
+            origin = _unwrap_origin(meta.get("source") or "")
+            name = _hq_name(m.get("video_url") or "")
+            if not origin or not name or _index_get(origin, name):
+                continue
+            _index_put(origin, name, k, m.get("verdict"))
+            n += 1
+        except Exception:  # noqa: BLE001
+            continue
+    if n:
+        print(f"content index: {n} match records indexed", file=sys.stderr, flush=True)
+
+
 def _prepare_worker(dub, video, k):
     job = _jobs[k]
     slot_held = False
@@ -278,6 +394,21 @@ def _prepare_worker(dub, video, k):
         # Interactive requests (someone is waiting): download the release in
         # parallel with the dub extraction. Background/evaluation ones wait
         # for the pre-screen so a rejected pair never downloads the file.
+        # Same dub x same release already prepared under other ids? Reuse.
+        hq_name = _hq_name(video["url"])
+        origin = _dub_origin(dub["url"]) if hq_name else None
+        hit = _index_get(origin, hq_name) if origin else None
+        if hit and hit.get("pair") != k:
+            result = _alias_from(hit["pair"], dub["id"], hq_id, video["url"])
+            if result is not None:
+                rejected = result["verdict"] != "accept"
+                job.update(status="ready" if not rejected else "rejected", stage="done",
+                           result=result, aliased_from=hit["pair"])
+                print(f"prepare {k}: reused {hit['pair']} ({result['verdict']})", file=sys.stderr, flush=True)
+                if not rejected and job["priority"] <= 9:
+                    _start_mux(k, dubmux.resolve_url(video["url"]), dub["id"], result["lag"])
+                return
+        orig_url = video["url"]   # kept in the record: the release identity (file name)
         video["url"] = dubmux.resolve_url(video["url"])
         job["video_url"] = video["url"]
         _raw_ref(hq_id, k)
@@ -309,7 +440,7 @@ def _prepare_worker(dub, video, k):
         dubfile = str(AUDIO / f"{dub['id']}.m4a")
         result = {"dub": dub["id"], "video": video["id"], "video_duration": vdur,
                   "dub_duration": ddur, "duration_delta": round(vdur - ddur, 3),
-                  "created": int(time.time())}
+                  "created": int(time.time()), "video_url": orig_url}
         # Pre-screen: 8 windows by byte range (~1 % of the file). Fewer than
         # 3 confident windows = a different edit or the wrong episode; stop
         # before reading the whole release.
@@ -372,6 +503,8 @@ def _prepare_worker(dub, video, k):
                         hq.unlink()
         rejected = result["verdict"] != "accept"
         json.dump(result, open(_match_path(k), "w"), indent=1)
+        if origin and hq_name:
+            _index_put(origin, hq_name, k, result["verdict"])
         job.update(status="ready" if result["verdict"] == "accept" else "rejected",
                    stage="done", result=result)
         # Playing / next episode + accepted: the raw copy is (being)
@@ -1110,6 +1243,7 @@ def _resume_session(k):
 
 def _startup():
     _sweep()
+    _index_backfill()
     # producers do not survive a restart: resume every unfinished session
     for d in sorted(HLS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
         if d.is_dir() and not d.name.startswith("raw-"):
