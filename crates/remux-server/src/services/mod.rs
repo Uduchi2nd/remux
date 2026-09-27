@@ -6,8 +6,8 @@ pub mod media_tracker;
 pub(crate) mod resolve;
 pub mod stream_provider;
 pub(crate) mod stream_service;
-pub(crate) mod upstream_budget;
 pub mod stremio;
+pub(crate) mod upstream_budget;
 
 pub use resolve::MediaResolveService;
 pub(crate) use resolve::ResolvedItem;

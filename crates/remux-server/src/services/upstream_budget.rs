@@ -42,7 +42,8 @@ static STATE: Mutex<State> = Mutex::new(State {
     recent_placeholders: Vec::new(),
 });
 
-static NEXT_SLOT: tokio::sync::Mutex<Option<Instant>> = tokio::sync::Mutex::const_new(None);
+static NEXT_SLOT: tokio::sync::Mutex<Option<Instant>> =
+    tokio::sync::Mutex::const_new(None);
 
 /// True while background work that mints debrid links must not run.
 pub(crate) fn breaker_open() -> bool {

@@ -28,7 +28,6 @@ fn add_refresh_target(
     }
 }
 
-
 fn has_expected_media_stream(
     item_kind: &db::MediaKind,
     source: &crate::api::MediaSourceInfo,
@@ -115,7 +114,8 @@ async fn probe_background_candidate(
 /// episode every 12 minutes (~15 TorBox link requests a minute), which kept a
 /// TorBox rate limit alive for hours on 2026-09-27.
 const BACKGROUND_PROBE_TOP: usize = 2;
-const BACKGROUND_VERIFIED_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const BACKGROUND_VERIFIED_TTL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 3600);
 
 static BACKGROUND_VERIFIED: std::sync::Mutex<
     Option<std::collections::HashMap<uuid::Uuid, std::time::Instant>>,

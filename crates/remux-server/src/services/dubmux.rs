@@ -97,16 +97,37 @@ fn is_hq_candidate(stream: &db::Media) -> bool {
     let lower = name.to_ascii_lowercase();
     // vnphim's own rows are recognised by their release-name tokens now that
     // their URLs are opaque encrypted MediaFlow addresses.
-    let vn_source = [".kkphim.", ".ophim.", ".hotphim.", ".yanhh3d.", "proxiedvn", ".vietsub."]
-        .iter()
-        .any(|t| lower.contains(t));
+    let vn_source = [
+        ".kkphim.",
+        ".ophim.",
+        ".hotphim.",
+        ".yanhh3d.",
+        "proxiedvn",
+        ".vietsub.",
+    ]
+    .iter()
+    .any(|t| lower.contains(t));
     // Usenet releases (NzbDAV) are named like scene releases with NO file
     // extension; only playlist-style names are not files.
     let file_like = lower.ends_with(".mkv")
         || lower.ends_with(".mp4")
-        || !lower.rsplit('.').next().is_some_and(|ext| {
-            matches!(ext, "m3u8" | "m3u" | "ts" | "strm" | "avi" | "wmv" | "flv" | "iso" | "rar")
-        });
+        || !lower
+            .rsplit('.')
+            .next()
+            .is_some_and(|ext| {
+                matches!(
+                    ext,
+                    "m3u8"
+                        | "m3u"
+                        | "ts"
+                        | "strm"
+                        | "avi"
+                        | "wmv"
+                        | "flv"
+                        | "iso"
+                        | "rar"
+                )
+            });
     !is_dubmux_row(stream)
         && !url.contains("vnphim")
         && !vn_source
@@ -362,10 +383,19 @@ pub(crate) async fn ensure_dub_rows(
             // first BACKGROUND_NEW_PAIRS pairs of an episode may start a new
             // preparation (each costs a debrid link); later pairs are only
             // reported when the muxer already has them.
-            let cached_only = priority > PRIORITY_LIVE_MAX && pairs_seen >= BACKGROUND_NEW_PAIRS;
+            let cached_only =
+                priority > PRIORITY_LIVE_MAX && pairs_seen >= BACKGROUND_NEW_PAIRS;
             pairs_seen += 1;
             let reply = match prepare(
-                &client, &cfg, dub_id, dub_url, &hq_id, hq_url, wait, pair_priority, cached_only,
+                &client,
+                &cfg,
+                dub_id,
+                dub_url,
+                &hq_id,
+                hq_url,
+                wait,
+                pair_priority,
+                cached_only,
             )
             .await
             {
@@ -532,7 +562,10 @@ fn row_provider(row: &db::Media) -> String {
     row.title
         .split("[+VN dub · ")
         .nth(1)
-        .and_then(|r| r.split(']').next())
+        .and_then(|r| {
+            r.split(']')
+                .next()
+        })
         .unwrap_or("vnphim")
         .to_string()
 }
@@ -655,7 +688,8 @@ pub(crate) const PRIORITY_OPEN: u32 = 10;
 pub(crate) fn prepare_on_open(ctx: &AppContext, media: &db::Media, user: Uuid) {
     use std::sync::Mutex;
     use std::time::{Duration as StdDuration, Instant};
-    static SEEN: Mutex<Option<std::collections::HashMap<Uuid, Instant>>> = Mutex::new(None);
+    static SEEN: Mutex<Option<std::collections::HashMap<Uuid, Instant>>> =
+        Mutex::new(None);
     if DubmuxConfig::from(&ctx.config).is_none()
         || !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
     {
@@ -744,11 +778,26 @@ mod tests {
             });
             m
         }
-        assert!(is_hq_candidate(&mk("The.Captain.2019.1080p.BluRay.DD+5.1.x264-PTer", "https://usenet.example/x")));
-        assert!(is_hq_candidate(&mk("Yolo.2024.1080p.WEB-DL.mkv", "https://cdn.example/y")));
-        assert!(!is_hq_candidate(&mk("Nguoi.Ban.S01E01.1080p.WEB-DL.Chinese.Vietsub.kkphim.ProxiedVN.mp4", "https://mf.example/_token_x/proxy/hls/manifest.m3u8")));
-        assert!(!is_hq_candidate(&mk("Tien.Nghich.S01E101.1080p.WEB-DL.Chinese.Vietsub.yanhh3d.mp4", "https://mf.example/_token_y/proxy/hls/manifest.m3u8")));
-        assert!(!is_hq_candidate(&mk("Some.Show.S01E01.m3u8", "https://x.example/a.m3u8")));
+        assert!(is_hq_candidate(&mk(
+            "The.Captain.2019.1080p.BluRay.DD+5.1.x264-PTer",
+            "https://usenet.example/x"
+        )));
+        assert!(is_hq_candidate(&mk(
+            "Yolo.2024.1080p.WEB-DL.mkv",
+            "https://cdn.example/y"
+        )));
+        assert!(!is_hq_candidate(&mk(
+            "Nguoi.Ban.S01E01.1080p.WEB-DL.Chinese.Vietsub.kkphim.ProxiedVN.mp4",
+            "https://mf.example/_token_x/proxy/hls/manifest.m3u8"
+        )));
+        assert!(!is_hq_candidate(&mk(
+            "Tien.Nghich.S01E101.1080p.WEB-DL.Chinese.Vietsub.yanhh3d.mp4",
+            "https://mf.example/_token_y/proxy/hls/manifest.m3u8"
+        )));
+        assert!(!is_hq_candidate(&mk(
+            "Some.Show.S01E01.m3u8",
+            "https://x.example/a.m3u8"
+        )));
     }
 
     #[test]
