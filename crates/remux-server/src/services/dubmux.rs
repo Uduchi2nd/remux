@@ -147,12 +147,14 @@ async fn prepare(
     hq_url: &str,
     wait: u64,
     priority: u32,
+    cached_only: bool,
 ) -> anyhow::Result<PrepareReply> {
     let body = serde_json::json!({
         "dub": {"id": dub_id, "url": dub_url},
         "video": {"id": hq_id, "url": hq_url},
         "wait": wait,
         "priority": priority,
+        "cached_only": cached_only,
     });
     let reply = client
         .post(format!("{}/prepare", cfg.api))
@@ -270,6 +272,10 @@ pub(crate) const PRIORITY_BACKGROUND: u32 = 300;
 /// Variants (second dub provider / second-best release) of an episode rank
 /// behind the first pairs of the whole walk (up to 12 episodes).
 const VARIANT_PENALTY: u32 = 50;
+/// Priorities at or below this are the episode being played and the next one.
+const PRIORITY_LIVE_MAX: u32 = 9;
+/// New (uncached) preparations per episode at any other priority.
+const BACKGROUND_NEW_PAIRS: u32 = 2;
 
 pub(crate) async fn ensure_dub_rows(
     ctx: &AppContext,
@@ -352,9 +358,14 @@ pub(crate) async fn ensure_dub_rows(
             } else {
                 priority + VARIANT_PENALTY + pairs_seen.min(40)
             };
+            // PATCH (uduchi2nd): outside playback / the next episode, only the
+            // first BACKGROUND_NEW_PAIRS pairs of an episode may start a new
+            // preparation (each costs a debrid link); later pairs are only
+            // reported when the muxer already has them.
+            let cached_only = priority > PRIORITY_LIVE_MAX && pairs_seen >= BACKGROUND_NEW_PAIRS;
             pairs_seen += 1;
             let reply = match prepare(
-                &client, &cfg, dub_id, dub_url, &hq_id, hq_url, wait, pair_priority,
+                &client, &cfg, dub_id, dub_url, &hq_id, hq_url, wait, pair_priority, cached_only,
             )
             .await
             {

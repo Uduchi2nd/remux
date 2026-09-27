@@ -58,6 +58,25 @@ RESOLVE_TTL_S = 3 * 3600      # debrid CDN links stay valid for hours
 BG_RESOLVE_GAP_S = float(os.environ.get("DUBMUX_BG_RESOLVE_GAP_S", "20"))
 
 
+# Circuit breaker for BACKGROUND resolves: the first placeholder answer pauses
+# them 30 min, doubling per consecutive trip up to 4 h; a real answer resets.
+_breaker = {"until": 0.0, "last": 0.0}
+BREAKER_FIRST_S, BREAKER_MAX_S = 1800, 4 * 3600
+
+
+def breaker_remaining():
+    return max(0, int(_breaker["until"] - time.time()))
+
+
+def _trip_breaker():
+    if time.time() < _breaker["until"]:
+        return
+    last = _breaker["last"]
+    pause = BREAKER_FIRST_S if not last else min(last * 2, BREAKER_MAX_S)
+    _breaker.update(until=time.time() + pause, last=pause)
+    print(f"  resolver rate-limited: background resolves paused {pause // 60} min", file=sys.stderr, flush=True)
+
+
 def resolve_url(url, timeout=20, background=False):
     """Follow addon/debrid redirectors (AIOStreams playback URLs, Torrentio
     resolvers, TorBox API) to the final CDN URL. ffmpeg can follow redirects
@@ -72,6 +91,8 @@ def resolve_url(url, timeout=20, background=False):
     if hit and now - hit[1] < RESOLVE_TTL_S:
         return hit[0]
     if background:
+        if breaker_remaining():
+            raise SourceUnavailable(f"background resolves paused {breaker_remaining()}s (resolver rate limit)")
         with _resolve_lock:
             gap = _last_bg_resolve[0] + BG_RESOLVE_GAP_S - time.time()
             if gap > 0:
@@ -87,7 +108,10 @@ def resolve_url(url, timeout=20, background=False):
     except Exception:  # noqa: BLE001
         return url
     if _PLACEHOLDER.search(final.split("?")[0]):
+        _trip_breaker()
         raise SourceUnavailable(f"resolver returned a placeholder ({final.rsplit('/', 1)[-1]})")
+    if time.time() >= _breaker["until"]:
+        _breaker["last"] = 0.0          # answering normally again: reset the backoff
     if final != url:
         _resolved[url] = (final, now)
         if len(_resolved) > 5000:

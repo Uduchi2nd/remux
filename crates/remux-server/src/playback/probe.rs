@@ -1419,10 +1419,16 @@ where
                             "stream is suspiciously short, treating as probe failure"
                         );
                         note_probe_failure(&stream);
+                        // PATCH (uduchi2nd): a debrid rate limit shows up as
+                        // AIOStreams' 2-minute error clip — feed the breaker.
+                        crate::services::upstream_budget::note_short_probe(
+                            probed_ticks / 10_000_000,
+                        );
                         continue;
                     }
                 }
                 clear_probe_failure(&stream);
+                crate::services::upstream_budget::note_success();
 
                 if probed
                     .video_stream()

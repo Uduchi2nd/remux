@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use futures::{StreamExt, stream};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -29,7 +28,6 @@ fn add_refresh_target(
     }
 }
 
-const BACKGROUND_PROBE_CONCURRENCY: usize = 2;
 
 fn has_expected_media_stream(
     item_kind: &db::MediaKind,
@@ -109,21 +107,68 @@ async fn probe_background_candidate(
     }
 }
 
+/// PATCH (uduchi2nd): background probing only verifies what a player would
+/// actually pick — the first [`BACKGROUND_PROBE_TOP`] non-dub versions — and
+/// only when not verified within [`BACKGROUND_VERIFIED_TTL`]; each probe waits
+/// for a slot in the shared upstream budget and nothing is probed while its
+/// breaker is open. It used to force-probe EVERY version of every tracked
+/// episode every 12 minutes (~15 TorBox link requests a minute), which kept a
+/// TorBox rate limit alive for hours on 2026-09-27.
+const BACKGROUND_PROBE_TOP: usize = 2;
+const BACKGROUND_VERIFIED_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+static BACKGROUND_VERIFIED: std::sync::Mutex<
+    Option<std::collections::HashMap<uuid::Uuid, std::time::Instant>>,
+> = std::sync::Mutex::new(None);
+
+fn verified_recently(id: &uuid::Uuid) -> bool {
+    BACKGROUND_VERIFIED
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .and_then(|m| m.get(id))
+                .map(|t| t.elapsed() < BACKGROUND_VERIFIED_TTL)
+        })
+        .unwrap_or(false)
+}
+
+fn mark_verified(id: uuid::Uuid) {
+    if let Ok(mut g) = BACKGROUND_VERIFIED.lock() {
+        let m = g.get_or_insert_with(Default::default);
+        m.retain(|_, t| t.elapsed() < BACKGROUND_VERIFIED_TTL);
+        if m.len() > 20_000 {
+            m.clear();
+        }
+        m.insert(id, std::time::Instant::now());
+    }
+}
+
 async fn probe_background_streams(
     ctx: &AppContext,
     item: &mut db::Media,
 ) -> anyhow::Result<(usize, usize)> {
+    use crate::services::upstream_budget;
+    if upstream_budget::breaker_open() {
+        debug!(
+            item = %item.id,
+            paused_secs = upstream_budget::breaker_remaining_secs(),
+            "background probing paused (upstream rate limit)"
+        );
+        return Ok((0, 0));
+    }
     let sources: Vec<db::Media> = item
         .streams(&ctx.db)
         .await?
         .into_iter()
-        // PATCH (uduchi2nd): a "[+VN dub]" row already carries a synthesized
-        // probe, and ffprobe-ing its master playlist would make the seedbox
-        // mux the whole episode just to verify it — 100+ muxes / 300 GB in
-        // one prefetch sweep. Its HQ source is verified on its own.
+        // A "[+VN dub]" row already carries a synthesized probe, and
+        // ffprobe-ing its master playlist would make the seedbox mux the
+        // whole episode just to verify it. Its HQ source is verified on its
+        // own.
         .filter(|s| !crate::services::dubmux::is_dubmux_row(s))
+        .take(BACKGROUND_PROBE_TOP)
+        .filter(|s| !verified_recently(&s.id))
         .collect();
-    let checked = sources.len();
     let item_kind = item
         .kind
         .clone();
@@ -138,36 +183,29 @@ async fn probe_background_streams(
         .config
         .port;
 
-    let results = stream::iter(
-        sources
-            .into_iter()
-            .map(|source| {
-                let ctx = ctx.clone();
-                let item_kind = item_kind.clone();
-                async move {
-                    probe_background_candidate(
-                        ctx,
-                        source,
-                        item_kind,
-                        timeout_secs,
-                        timeout_p2p_secs,
-                        port,
-                    )
-                    .await
-                }
-            }),
-    )
-    .buffer_unordered(BACKGROUND_PROBE_CONCURRENCY)
-    .collect::<Vec<_>>()
-    .await;
-
-    Ok((
-        checked,
-        results
-            .into_iter()
-            .filter(|playable| *playable)
-            .count(),
-    ))
+    let mut checked = 0;
+    let mut playable = 0;
+    for source in sources {
+        if !upstream_budget::background_slot().await {
+            break;
+        }
+        checked += 1;
+        let id = source.id;
+        if probe_background_candidate(
+            ctx.clone(),
+            source,
+            item_kind.clone(),
+            timeout_secs,
+            timeout_p2p_secs,
+            port,
+        )
+        .await
+        {
+            playable += 1;
+            mark_verified(id);
+        }
+    }
+    Ok((checked, playable))
 }
 
 pub struct BackgroundPrepareSubscriber {
