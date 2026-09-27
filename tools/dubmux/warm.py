@@ -22,7 +22,7 @@ ran while anything had been watched in the last 24 h (2026-09-27).
 Pacing: one pair at a time, at most WARM_BATCH episodes per run, skipped
 while the muxer's general pool has a deep backlog; an episode is not
 re-warmed within WARM_REPEAT_DAYS. AIOStreams calls are spaced (it 403s
-bursts). Root cron on nimo every 2 h.
+bursts). Root cron on nimo once a day (03:40 local); `PAUSED` file in this dir skips runs.
 """
 import hashlib, json, os, sys, time, urllib.parse, urllib.request
 from datetime import datetime, timezone
@@ -40,7 +40,7 @@ LIBRARIES = [  # remux view names, in priority order
 COUNTRIES = {"China", "Hong Kong", "Taiwan", "South Korea", "Korea"}
 MAX_TITLES = int(os.environ.get("WARM_MAX_TITLES", "100"))
 EPISODES = int(os.environ.get("WARM_EPISODES", "10"))      # latest aired per series
-BATCH = int(os.environ.get("WARM_BATCH", "40"))             # episodes per run
+BATCH = int(os.environ.get("WARM_BATCH", "12"))             # episodes per run
 REPEAT_DAYS = int(os.environ.get("WARM_REPEAT_DAYS", "7"))
 MUXER_MAX_WAITING = int(os.environ.get("WARM_MUXER_MAX_WAITING", "30"))
 PRIORITY = 300
@@ -96,7 +96,8 @@ def candidates():
     for lib, it, tmdb in titles[:MAX_TITLES]:
         if it["Type"] == "Movie":
             if aired(it, now):
-                out.append({"key": it["Id"], "type": "movie", "tmdb": tmdb, "label": f"{it['Name']} ({lib})"})
+                out.append({"key": it["Id"], "type": "movie", "tmdb": tmdb, "label": f"{it['Name']} ({lib})",
+                            "aired": it.get("PremiereDate") or ""})
             continue
         try:
             eps = remux(f"/Shows/{it['Id']}/Episodes?UserId={user}&Fields=PremiereDate")["Items"]
@@ -107,7 +108,11 @@ def candidates():
         eps.sort(key=lambda e: (e.get("ParentIndexNumber") or 0, e.get("IndexNumber") or 0))
         for e in eps[-EPISODES:]:
             out.append({"key": e["Id"], "type": "series", "tmdb": tmdb, "season": e.get("ParentIndexNumber"),
-                        "episode": e.get("IndexNumber"), "label": f"{it['Name']} S{e.get('ParentIndexNumber')}E{e.get('IndexNumber')} ({lib})"})
+                        "episode": e.get("IndexNumber"), "label": f"{it['Name']} S{e.get('ParentIndexNumber')}E{e.get('IndexNumber')} ({lib})",
+                        "aired": e.get("PremiereDate") or ""})
+    # With a small daily batch the NEWEST aired episodes across all titles go
+    # first (what people open next), older back-catalogue fills later days.
+    out.sort(key=lambda c: c["aired"], reverse=True)
     return out
 
 
@@ -194,7 +199,13 @@ def warm(it):
     return "no_match"
 
 
+PAUSE_FLAG = os.path.join(HERE, "PAUSED")
+
+
 def main():
+    if os.path.exists(PAUSE_FLAG):
+        log(f"paused ({PAUSE_FLAG} exists); skipping this run")
+        return
     state = {}
     if os.path.exists(STATE):
         try:
