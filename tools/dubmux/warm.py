@@ -45,7 +45,7 @@ REPEAT_DAYS = int(os.environ.get("WARM_REPEAT_DAYS", "7"))
 MUXER_MAX_WAITING = int(os.environ.get("WARM_MUXER_MAX_WAITING", "30"))
 PRIORITY = 300
 DUB_TOKENS = (".ThuyetMinh.", ".LongTieng.")
-MAX_HQ, MAX_DUBS, MAX_PAIRS = 3, 2, 4
+MAX_HQ, MAX_DUBS, MAX_PAIRS = 2, 2, 2   # each new pair costs a debrid link
 AIO_PACE_S = 3.0
 
 
@@ -212,6 +212,13 @@ def main():
             state = json.load(open(STATE))
         except Exception:  # noqa: BLE001
             state = {}
+    try:
+        brk = get(f"{MUXER}/health", 20).get("breaker_secs", 0)
+    except Exception:  # noqa: BLE001
+        brk = 0
+    if brk:
+        log(f"muxer resolver breaker open ({brk}s left: debrid rate limit); skipping this run")
+        return
     b = muxer_backlog()
     if b is None or b > MUXER_MAX_WAITING:
         log(f"muxer has {b} pairs waiting at or ahead of warm priority (> {MUXER_MAX_WAITING}); skipping this run")

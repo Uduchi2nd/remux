@@ -90,6 +90,15 @@ pub async fn claim_due_stream_refresh(db: &SqlitePool) -> Result<Option<StreamRe
     }))
 }
 
+/// How long until an active series' episode is refreshed again.
+pub(crate) fn refresh_interval(priority: i64) -> Duration {
+    if priority >= PRIORITY_CURRENT_EPISODE {
+        Duration::minutes(30)
+    } else {
+        Duration::hours(3)
+    }
+}
+
 pub async fn finish_stream_refresh(
     db: &SqlitePool,
     job: &StreamRefreshJob,
@@ -97,14 +106,12 @@ pub async fn finish_stream_refresh(
 ) -> Result<()> {
     let now = Utc::now().naive_utc();
     if active_series && job.series_id.is_some() {
-        // Spread work across the 12–14 minute pre-expiry window. Stable-ish
-        // per-row jitter prevents every queued item from refreshing together.
-        let jitter_secs = if job.priority >= PRIORITY_NEXT_EPISODE {
-            0
-        } else {
-            (job.media_id.as_bytes()[0] as i64) % 121
-        };
-        let next = now + Duration::minutes(12) + Duration::seconds(jitter_secs);
+        // PATCH (uduchi2nd): the episode being watched and the next one are
+        // re-listed every 30 min, everything else every 3 h (was every 12 min
+        // for all, 2026-09-27 — each refresh also probed debrid links).
+        // Stable-ish per-row jitter keeps queued items from firing together.
+        let jitter_secs = (job.media_id.as_bytes()[0] as i64) % 121;
+        let next = now + refresh_interval(job.priority) + Duration::seconds(jitter_secs);
         sqlx::query(
             "UPDATE background_stream_refresh_jobs \
              SET run_after = ?, lease_until = NULL, attempts = 0, last_error = NULL, updated_at = ? \
@@ -174,6 +181,14 @@ pub async fn series_recently_played(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_interval_by_priority() {
+        assert_eq!(refresh_interval(PRIORITY_NEXT_EPISODE), Duration::minutes(30));
+        assert_eq!(refresh_interval(PRIORITY_CURRENT_EPISODE), Duration::minutes(30));
+        assert_eq!(refresh_interval(PRIORITY_UPCOMING_EPISODE), Duration::hours(3));
+        assert_eq!(refresh_interval(PRIORITY_RECENT_EPISODE), Duration::hours(3));
+    }
 
     async fn test_db() -> SqlitePool {
         let db = crate::db::connect("sqlite::memory:", 10_000).await.unwrap();

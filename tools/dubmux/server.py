@@ -604,6 +604,17 @@ async def prepare(req: Request):
         priority = int(body.get("priority", DEFAULT_PRIORITY))
     except (TypeError, ValueError):
         priority = DEFAULT_PRIORITY
+    if body.get("cached_only") and not _jobs.get(k):
+        # a background variant pair: report it only if it already exists
+        # (under these ids or, via the content index, under others) — never
+        # start a new preparation, which would cost a debrid link
+        name = _hq_name(video["url"])
+        origin = await asyncio.to_thread(_dub_origin, dub["url"]) if name else None
+        hit = _index_get(origin, name) if origin else None
+        if not hit or hit.get("pair") == k:
+            return {"status": "skipped", "stage": "cached_only"}
+    if priority > 9 and dubmux.breaker_remaining() and not _jobs.get(k):
+        return {"status": "skipped", "stage": f"paused {dubmux.breaker_remaining()}s (resolver rate limit)"}
     with _lock:
         job = _jobs.get(k)
         if not job or (job["status"] in ("error",) and time.time() - job.get("finished", 0) > 60):
@@ -1337,4 +1348,4 @@ def health():
             "running": sum(1 for s in _sessions.values() if s["proc"].poll() is None),
             "hls_bytes": sum(_dir_bytes(d) for d in hls),
             "durable_bytes": sum(f.stat().st_size for f in list(AUDIO.iterdir()) + list(MATCH.iterdir()) if f.is_file()),
-            "segtabs": len(list(MATCH.glob("segtab-*.json")))}
+            "segtabs": len(list(MATCH.glob("segtab-*.json"))), "breaker_secs": dubmux.breaker_remaining()}
