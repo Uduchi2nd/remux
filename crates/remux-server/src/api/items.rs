@@ -1683,6 +1683,15 @@ async fn item_for_user(
             )
             .await
             .log_err("failed to refresh sources");
+        // PATCH (uduchi2nd): opening the detail page starts dub preparation
+        // (see services::dubmux::prepare_on_open); background, throttled.
+        crate::services::dubmux::prepare_on_open(
+            &state.ctx,
+            &media,
+            session
+                .user
+                .id,
+        );
     }
 
     let user_stream_filter = session

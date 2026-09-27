@@ -280,3 +280,7 @@ Also observed: hosted AIOStreams sometimes answers remux without the vnphim stre
 ### Source ordering stays in AIOStreams — 2026-09-27
 
 A remux-side transport re-rank (debrid before usenet, unverified usenet last; `089956f5`) was reverted the same day at the user's request: sorting and behaviour belong in the AIOStreams config so the setup stays portable, and the fork should carry the minimum (dub rows first is achieved by their negative `idx`, no code). The equivalent lives in AIOStreams: the "Boost Cached Usenet" preferred expression no longer includes usenet stream types, so cached debrid ranks above usenet.
+
+### Dub preparation starts when the item is opened — 2026-09-27
+
+A cold episode takes 3–6 min end to end (extraction 1–2 min, match 1–3 min, mux 15–40 s), far beyond the 12 s PlaybackInfo waits, so a first episode of a new show had no dub row until reopened. `item_for_user` now calls `services::dubmux::prepare_on_open` after refreshing streams: background, throttled to once per item per 10 min, submits the pairs at priority 10 (between playback 0 and the walk 100) and pre-muxes the first accepted pair. By the time the viewer presses play the row usually exists; sequential watching stays covered by the walk. Retirement evidence: stock prepares addon-side work on item open.
