@@ -48,8 +48,12 @@ pub async fn enqueue_stream_refresh(
     Ok(())
 }
 
-pub async fn claim_due_stream_refresh(db: &SqlitePool) -> Result<Option<StreamRefreshJob>> {
-    let mut tx = db.begin().await?;
+pub async fn claim_due_stream_refresh(
+    db: &SqlitePool,
+) -> Result<Option<StreamRefreshJob>> {
+    let mut tx = db
+        .begin()
+        .await?;
     let now = Utc::now().naive_utc();
     let now_s = now.to_string();
     let row = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, i64, i64)>(
@@ -64,7 +68,8 @@ pub async fn claim_due_stream_refresh(db: &SqlitePool) -> Result<Option<StreamRe
     .await?;
 
     let Some((user_id, media_id, series_id, attempts, priority)) = row else {
-        tx.commit().await?;
+        tx.commit()
+            .await?;
         return Ok(None);
     };
     let lease_until = (now + Duration::minutes(5)).to_string();
@@ -79,7 +84,8 @@ pub async fn claim_due_stream_refresh(db: &SqlitePool) -> Result<Option<StreamRe
     .bind(media_id)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
+    tx.commit()
+        .await?;
 
     Ok(Some(StreamRefreshJob {
         user_id,
@@ -105,13 +111,21 @@ pub async fn finish_stream_refresh(
     active_series: bool,
 ) -> Result<()> {
     let now = Utc::now().naive_utc();
-    if active_series && job.series_id.is_some() {
+    if active_series
+        && job
+            .series_id
+            .is_some()
+    {
         // PATCH (uduchi2nd): the episode being watched and the next one are
         // re-listed every 30 min, everything else every 3 h (was every 12 min
         // for all, 2026-09-27 — each refresh also probed debrid links).
         // Stable-ish per-row jitter keeps queued items from firing together.
-        let jitter_secs = (job.media_id.as_bytes()[0] as i64) % 121;
-        let next = now + refresh_interval(job.priority) + Duration::seconds(jitter_secs);
+        let jitter_secs = (job
+            .media_id
+            .as_bytes()[0] as i64)
+            % 121;
+        let next =
+            now + refresh_interval(job.priority) + Duration::seconds(jitter_secs);
         sqlx::query(
             "UPDATE background_stream_refresh_jobs \
              SET run_after = ?, lease_until = NULL, attempts = 0, last_error = NULL, updated_at = ? \
@@ -141,7 +155,12 @@ pub async fn fail_stream_refresh(
     error: &str,
 ) -> Result<()> {
     let now = Utc::now().naive_utc();
-    let backoff = (30_i64 * 2_i64.pow(job.attempts.min(8) as u32)).min(900);
+    let backoff = (30_i64
+        * 2_i64.pow(
+            job.attempts
+                .min(8) as u32,
+        ))
+    .min(900);
     let next = now + Duration::seconds(backoff);
     sqlx::query(
         "UPDATE background_stream_refresh_jobs \
@@ -149,7 +168,12 @@ pub async fn fail_stream_refresh(
              last_error = ?, updated_at = ? WHERE user_id = ? AND media_id = ?",
     )
     .bind(next.to_string())
-    .bind(error.chars().take(400).collect::<String>())
+    .bind(
+        error
+            .chars()
+            .take(400)
+            .collect::<String>(),
+    )
     .bind(now.to_string())
     .bind(job.user_id)
     .bind(job.media_id)
@@ -184,15 +208,31 @@ mod tests {
 
     #[test]
     fn refresh_interval_by_priority() {
-        assert_eq!(refresh_interval(PRIORITY_NEXT_EPISODE), Duration::minutes(30));
-        assert_eq!(refresh_interval(PRIORITY_CURRENT_EPISODE), Duration::minutes(30));
-        assert_eq!(refresh_interval(PRIORITY_UPCOMING_EPISODE), Duration::hours(3));
-        assert_eq!(refresh_interval(PRIORITY_RECENT_EPISODE), Duration::hours(3));
+        assert_eq!(
+            refresh_interval(PRIORITY_NEXT_EPISODE),
+            Duration::minutes(30)
+        );
+        assert_eq!(
+            refresh_interval(PRIORITY_CURRENT_EPISODE),
+            Duration::minutes(30)
+        );
+        assert_eq!(
+            refresh_interval(PRIORITY_UPCOMING_EPISODE),
+            Duration::hours(3)
+        );
+        assert_eq!(
+            refresh_interval(PRIORITY_RECENT_EPISODE),
+            Duration::hours(3)
+        );
     }
 
     async fn test_db() -> SqlitePool {
-        let db = crate::db::connect("sqlite::memory:", 10_000).await.unwrap();
-        crate::db::migrate(&db).await.unwrap();
+        let db = crate::db::connect("sqlite::memory:", 10_000)
+            .await
+            .unwrap();
+        crate::db::migrate(&db)
+            .await
+            .unwrap();
         db
     }
 
@@ -202,9 +242,15 @@ mod tests {
         let user = Uuid::new_v4();
         let item = Uuid::new_v4();
         let series = Uuid::new_v4();
-        enqueue_stream_refresh(&db, user, item, Some(series), 20).await.unwrap();
-        enqueue_stream_refresh(&db, user, item, Some(series), 80).await.unwrap();
-        enqueue_stream_refresh(&db, user, item, Some(series), 40).await.unwrap();
+        enqueue_stream_refresh(&db, user, item, Some(series), 20)
+            .await
+            .unwrap();
+        enqueue_stream_refresh(&db, user, item, Some(series), 80)
+            .await
+            .unwrap();
+        enqueue_stream_refresh(&db, user, item, Some(series), 40)
+            .await
+            .unwrap();
 
         let stored_priority: i64 = sqlx::query_scalar(
             "SELECT priority FROM background_stream_refresh_jobs WHERE user_id = ? AND media_id = ?",
@@ -214,15 +260,33 @@ mod tests {
         .fetch_one(&db)
         .await
         .unwrap();
-        assert_eq!(stored_priority, 40, "a new playback scope must replace stale priority");
+        assert_eq!(
+            stored_priority, 40,
+            "a new playback scope must replace stale priority"
+        );
 
-        let claimed = claim_due_stream_refresh(&db).await.unwrap().unwrap();
+        let claimed = claim_due_stream_refresh(&db)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(claimed.user_id, user);
         assert_eq!(claimed.media_id, item);
         assert_eq!(claimed.series_id, Some(series));
-        assert!(claim_due_stream_refresh(&db).await.unwrap().is_none());
+        assert!(
+            claim_due_stream_refresh(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
-        finish_stream_refresh(&db, &claimed, false).await.unwrap();
-        assert!(claim_due_stream_refresh(&db).await.unwrap().is_none());
+        finish_stream_refresh(&db, &claimed, false)
+            .await
+            .unwrap();
+        assert!(
+            claim_due_stream_refresh(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
