@@ -1560,25 +1560,6 @@ pub struct Media {
     pub locked_fields: Vec<MetadataField>,
 }
 
-/// 0 = synthetic "[+VN dub]" row, 1 = debrid / direct HTTP / anything else,
-/// 2 = usenet (NzbDAV) verified, 3 = usenet the streamer flagged (⚠ unverified).
-pub(crate) fn source_transport_rank(s: &Media) -> u8 {
-    if s.title
-        .starts_with("[+VN dub")
-    {
-        return 0;
-    }
-    let usenet = s
-        .stream_info
-        .as_ref()
-        .and_then(|si| si.service_id.as_deref())
-        .is_some_and(|svc| svc.eq_ignore_ascii_case("nzbdav"));
-    if !usenet {
-        return 1;
-    }
-    if s.title.contains('⚠') { 3 } else { 2 }
-}
-
 impl Media {
     pub fn is_group_container(&self) -> bool {
         self.kind == MediaKind::Collection
@@ -6551,14 +6532,6 @@ impl Media {
                 a.idx
                     .cmp(&b.idx)
             });
-            // PATCH (uduchi2nd): stable re-rank by transport class — the
-            // addon's order within a class is kept. Usenet (NzbDAV) sources
-            // start slower and stutter more than cached debrid links (Speed
-            // and Love E01: a usenet 2160p listed first took ages and lagged,
-            // the TorBox 2160p next to it played at once), and a usenet result
-            // the streamer could not verify (⚠) is the least trustworthy. Dub
-            // rows stay first; the muxer's HQ choice follows this order too.
-            sources.sort_by_key(|s| source_transport_rank(s));
 
             // Exclude Sources that predate the last refresh — they belong to a
             // previous fetch and may have expired URLs. They stay in the DB so
@@ -11300,43 +11273,5 @@ mod dedup_tests {
 
         let found = Media::find_by_external_ids(&ctx.db, &MediaKind::Album, &ext).await;
         assert_eq!(found, Some(album.id));
-    }
-}
-
-#[cfg(test)]
-mod transport_rank_tests {
-    use super::*;
-
-    fn row(title: &str, service: Option<&str>) -> Media {
-        let mut m = Media::default();
-        m.title = title.into();
-        m.stream_info = Some(crate::stream::StreamInfo {
-            service_id: service.map(|s| s.to_string()),
-            ..Default::default()
-        });
-        m
-    }
-
-    #[test]
-    fn dub_rows_first_then_debrid_then_usenet_then_unverified() {
-        let mut v = vec![
-            row("[ND 🌐⚡] Whatbox UsenetUltimate 1080p ⚠", Some("nzbdav")),
-            row("[ND 🌐⚡] Whatbox UsenetUltimate 2160p", Some("nzbdav")),
-            row("[TB⚡] Library 2160p", Some("torbox")),
-            row("[+VN dub · kkphim] [TB⚡] Library 2160p", Some("torbox")),
-            row("Vnphim whatbox proxy 1080p", None),
-        ];
-        v.sort_by_key(source_transport_rank);
-        let titles: Vec<&str> = v.iter().map(|m| m.title.as_str()).collect();
-        assert_eq!(
-            titles,
-            [
-                "[+VN dub · kkphim] [TB⚡] Library 2160p",
-                "[TB⚡] Library 2160p",
-                "Vnphim whatbox proxy 1080p",
-                "[ND 🌐⚡] Whatbox UsenetUltimate 2160p",
-                "[ND 🌐⚡] Whatbox UsenetUltimate 1080p ⚠",
-            ]
-        );
     }
 }
