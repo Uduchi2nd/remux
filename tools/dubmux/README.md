@@ -298,3 +298,29 @@ new ids, the match record rewritten to point at the existing aligned track
 records that carry a `video_url` (new records always do; older unmuxed ones
 do not). Rough cost of warming: ~2–4 GB of seedbox download per episode for
 the alignment's raw copy (deleted 2 h later), ~100 MB kept per episode.
+
+## Findings from the CN/KR sampling round 1 (2026-09-27) and fixes (`520b7e96`, `de56e159`)
+Of 87 items with a VN dub: 41 accepted, 12 no HQ release, 34 no match. The
+34 broke down as 26 transient (muxer restarts during deploys → connection
+refused; NzbDAV restarting → usenet 443 refused), 6 pre-screen rejects and 2
+alignment rejects. Across all 823 stored records the rejects were: 65
+`reject:skew` (almost all stale, from before the aligner fixes, or a
+truncated decode), 64 `reject:coverage`, 46 low-confidence pre-screen, 14
+undecodable pre-screen (source unreachable), 4 correlation, 3 fragmented.
+Fixes:
+- Unreadable sources (every pre-screen window undecodable) and a huge skew
+  after a passed pre-screen are ERRORS now (retried later), never cached
+  rejections. Raw copies shorter than 97 % of the release are discarded.
+- Cached rejects expire when `ALIGN_VERSION` is bumped (now 6) and after
+  14 days; accepts are kept.
+- Aligner: windows with ratio 7–12 whose lag equals a run's lag count as
+  evidence for that run (`WEAK_RATIO`). Many kkphim dubs sit at 7–9 for
+  whole episodes (quieter music bed), and were rejected for "coverage"
+  with the runs clearly visible.
+- Pre-screen sends borderline pairs (≥2 confident windows, ≥3 weak windows
+  agreeing on one lag, or half undecodable) to the full aligner instead of
+  rejecting; it only rejects obvious mismatches now.
+- `/root/dubmux-eval/redo.py <results file> [--all-nomatch]` re-evaluates
+  transient (or all) no-match items in place.
+Inherent classes left: different edits (dub 20–30 min shorter/longer —
+movie cuts), wrong episode on the VN side, releases with no usable HQ.
