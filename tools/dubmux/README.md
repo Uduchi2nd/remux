@@ -324,3 +324,28 @@ Fixes:
   transient (or all) no-match items in place.
 Inherent classes left: different edits (dub 20–30 min shorter/longer —
 movie cuts), wrong episode on the VN side, releases with no usable HQ.
+
+## Debrid-link budget and circuit breaker (2026-09-27, `aff87f5a`)
+Incident: TorBox rate-limited the account (AIOStreams answers every playback
+URL with its 2-minute `/static/429.mp4`, from any IP) and remux's refresh
+queue kept it limited for hours by force-probing every version of every
+tracked episode every 12 minutes (~15 link requests/min).
+Rules now (live playback = the episode being played and the next one, never
+throttled by any of this):
+- **remux background refresh:** current/next episode re-listed every 30 min,
+  the rest every 3 h; probes only the first 2 non-dub versions, only if not
+  verified in 24 h, one probe per 30 s (`services/upstream_budget.rs`).
+  Three placeholder-length probe results within 5 min open a breaker:
+  background probing stops 30 min, doubling to 4 h; a real probe resets it.
+- **dubmux (remux side):** outside priority ≤9 only the first 2 pairs of an
+  episode may start a new preparation; later pairs are sent `cached_only`.
+- **muxer:** resolved links cached 3 h, background resolves ≥20 s apart, a
+  placeholder trips the resolver breaker (30 min doubling to 4 h, `/health`
+  `breaker_secs`); while open, background `/prepare` answers `skipped`.
+- **warmer:** once a day (03:40), 12 newest episodes, 2 pairs each, skips
+  while the breaker is open or `PAUSED` exists → ≤24 links/day.
+- **sampling (eval):** ≤30 new pairs per hour across processes, waits while
+  the breaker is open; AIOStreams stream lists paced ≥30 s (`aiopace.py`).
+Budget: background link requests drop from ~900/h to a few dozen, hard
+ceiling ~120/h for probes plus ~180/h for muxer resolves. TorBox's exact
+quota for link requests is not published in a readable form.
