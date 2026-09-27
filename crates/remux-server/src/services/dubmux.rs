@@ -628,6 +628,63 @@ async fn carry_over(
     rows
 }
 
+/// Priority for pairs requested because the viewer opened the item's detail
+/// page: ahead of the walk, behind an actual playback request.
+pub(crate) const PRIORITY_OPEN: u32 = 10;
+
+/// Opening an episode/movie is the earliest signal that it may be played:
+/// prepare its dub pairs and pre-mux the best one right away (cold path is
+/// 3–6 min end to end, far longer than a player waits at PlaybackInfo), so
+/// by the time the viewer presses play the row usually exists. Throttled to
+/// once per item per 10 min; runs in the background, never delays the page.
+pub(crate) fn prepare_on_open(ctx: &AppContext, media: &db::Media, user: Uuid) {
+    use std::sync::Mutex;
+    use std::time::{Duration as StdDuration, Instant};
+    static SEEN: Mutex<Option<std::collections::HashMap<Uuid, Instant>>> = Mutex::new(None);
+    if DubmuxConfig::from(&ctx.config).is_none()
+        || !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
+    {
+        return;
+    }
+    {
+        let mut guard = match SEEN.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let map = guard.get_or_insert_with(Default::default);
+        let now = Instant::now();
+        map.retain(|_, t| now.duration_since(*t) < StdDuration::from_secs(3600));
+        if map
+            .get(&media.id)
+            .is_some_and(|t| now.duration_since(*t) < StdDuration::from_secs(600))
+        {
+            return;
+        }
+        map.insert(media.id, now);
+    }
+    let ctx = ctx.clone();
+    let mut media = media.clone();
+    tokio::spawn(async move {
+        let Ok(streams) = media
+            .streams(&ctx.db)
+            .await
+        else {
+            return;
+        };
+        let rows = ensure_dub_rows(&ctx, &media, &streams, 0, PRIORITY_OPEN).await;
+        let Some(cfg) = DubmuxConfig::from(&ctx.config) else {
+            return;
+        };
+        if let Some(url) = rows
+            .first()
+            .and_then(http_url)
+        {
+            start_mux(&url.replacen(cfg.public, cfg.api, 1), media.id).await;
+        }
+        debug!(item = %media.id, user = %user, rows = rows.len(), "dub prepare on open");
+    });
+}
+
 /// Ask the muxer to start (or confirm) the mux behind a dub row's master URL
 /// without waiting for it. `url` must already point at the API host.
 pub(crate) async fn start_mux(url: &str, item: Uuid) {
