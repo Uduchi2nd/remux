@@ -276,3 +276,7 @@ Also observed: hosted AIOStreams sometimes answers remux without the vnphim stre
 ### Dub rows are never live-probed — 2026-09-27
 
 `9a981bc3`: the first play of a dub row without a stored probe (older build, or carried over before its release was probed) ffprobed the muxer's master playlist. That request starts the mux and only answers when it is done, so the first PlaybackInfo took a minute and listed no Vietnamese track (Pursuit of Jade E12, Queen of News E2; reopening showed it). `probe_stream` now short-circuits dub rows with their stored probe, rows always get one (rebuilt from the release's current probe on carry-over; a minimal video + Vietnamese-dub list when the release is unprobed), and no mux is ever started by a probe. Verified: explicit PlaybackInfo on the legacy E12 row answers in 7 s with the dub track and the muxer sees no master request. Live binary `a6d2e90fbf0360a1…`.
+
+### Source ordering stays in AIOStreams — 2026-09-27
+
+A remux-side transport re-rank (debrid before usenet, unverified usenet last; `089956f5`) was reverted the same day at the user's request: sorting and behaviour belong in the AIOStreams config so the setup stays portable, and the fork should carry the minimum (dub rows first is achieved by their negative `idx`, no code). The equivalent lives in AIOStreams: the "Boost Cached Usenet" preferred expression no longer includes usenet stream types, so cached debrid ranks above usenet.
