@@ -20,8 +20,15 @@ RATE = 8000
 UA = "Infuse-Direct/8.5.3"
 
 
+RUN_TIMEOUT_S = 900   # no single ffmpeg/ffprobe may hold a gate slot for hours
+
+
 def run(cmd, **kw):
-    r = subprocess.run(cmd, capture_output=True, **kw)
+    kw.setdefault("timeout", RUN_TIMEOUT_S)
+    try:
+        r = subprocess.run(cmd, capture_output=True, **kw)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{os.path.basename(cmd[0])} timed out after {kw['timeout']}s")
     if r.returncode != 0:
         tail = r.stderr.decode("utf8", "replace").strip()[-600:]
         raise RuntimeError(f"{os.path.basename(cmd[0])} exit {r.returncode}: {tail}")
@@ -29,7 +36,10 @@ def run(cmd, **kw):
 
 
 def ua_for(url):
-    return ["-user_agent", UA] if url.startswith(("http://", "https://")) else []
+    # -rw_timeout: give up on a remote read idle for 30 s (2026-09-27: three
+    # pre-screen decodes hung 8 h on a stalled TorBox CDN node and held every
+    # general match slot, freezing the whole queue)
+    return ["-user_agent", UA, "-rw_timeout", "30000000"] if url.startswith(("http://", "https://")) else []
 
 
 def resolve_url(url, timeout=20):
