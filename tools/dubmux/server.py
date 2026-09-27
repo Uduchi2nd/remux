@@ -496,14 +496,20 @@ def _verify_sync(d, max_abs_lag=0.35):
     ignored; the check fails only on a CONFIDENT disagreement."""
     try:
         idx = str(d / "index.m3u8")
-        dur = dubmux.ffprobe_duration(idx)
+        # Decode both tracks whole and slice in memory: `-ss` on an HLS input
+        # is not sample-accurate in the container's ffmpeg (per-track
+        # segment-boundary offsets of up to 1.6 s made a correct mux fail).
+        A = _decode_full_track(idx, 0)
+        B = _decode_full_track(idx, 1)
+        R = dubmux.RATE
+        dur = min(len(A), len(B)) / R
         pts = [120.0, dur / 2, max(120.0, dur - 200)]
         lags = []
         for t in pts:
-            a = _decode_track(idx, 0, t, 60)
-            b = _decode_track(idx, 1, t, 60)
+            i0, i1 = int(t * R), int((t + 60) * R)
+            a, b = A[i0:i1], B[i0:i1]
             m = min(len(a), len(b))
-            if m < 30 * dubmux.RATE:
+            if m < 30 * R:
                 continue
             lag, _peak, ratio = dubmux.xcorr_lag(a[:m], b[:m], 10.0)
             lags.append((round(t), round(float(lag), 3), round(float(ratio), 1)))
@@ -512,6 +518,13 @@ def _verify_sync(d, max_abs_lag=0.35):
         return (not bad, {"windows": lags, "bad": bad})
     except Exception as e:  # noqa: BLE001
         return (True, {"error": str(e)[-200:]})
+
+
+def _decode_full_track(path, track):
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-map", f"0:a:{track}", "-vn", "-sn",
+           "-ac", "1", "-ar", str(dubmux.RATE), "-f", "f32le", "-"]
+    import numpy as np
+    return np.frombuffer(dubmux.run(cmd).stdout, dtype=np.float32)
 
 
 def _decode_track(path, track, start, span):
