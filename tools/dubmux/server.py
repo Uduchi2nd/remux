@@ -868,7 +868,9 @@ def master(dub_id: str, video_id: str, request: Request):
         print(f"mux {k}: inconsistent finished session, rebuilding", file=sys.stderr, flush=True)
         shutil.rmtree(d, ignore_errors=True)
     if not (d / ".done").exists():
-        if _segtab(hq_id_of(k)) is not None:
+        if (d / ".jit").exists():
+            _resume_session(k)                       # orphaned by a restart? continue it
+        elif _segtab(hq_id_of(k)) is not None:
             _ensure_mux(k, dub_id, m, video_url)     # opens the session in ~1 s
         elif not (d / ".jit").exists():
             # no segment table yet (a match prepared before tables existed):
@@ -1069,9 +1071,47 @@ def sweep_now():
     return health()
 
 
+def _resume_session(k):
+    """Continue an unfinished JIT session (after a restart, or when a
+    finished-with-holes session is opened again): drop stale run dirs and
+    fill from the first hole. Returns True when a producer was started."""
+    d = _session_dir(k)
+    if not (d / ".jit").exists() or (d / ".done").exists() or (d / ".failed").exists():
+        return False
+    prod = _producers.get(k)
+    if prod and prod["proc"].poll() is None:
+        return False
+    for rd in d.glob("run*"):
+        shutil.rmtree(rd, ignore_errors=True)
+    m = _load_match(k) or {}
+    tab = _segtab(hq_id_of(k))
+    if not m.get("video_url") or tab is None:
+        return False
+    n = len(tab[0])
+    hole = next((i for i in range(n) if not (d / f"seg{i:05d}.ts").exists()), None)
+    if hole is None:
+        (d / ".done").write_text(str(int(time.time())))
+        return False
+    end = next((i for i in range(hole + 1, n) if (d / f"seg{i:05d}.ts").exists()), None)
+    _jit_start(k, dubmux.resolve_url(m["video_url"]), k.split("__", 1)[0], m.get("lag", 0.0), tab, hole, end)
+    return True
+
+
+def _startup():
+    _sweep()
+    # producers do not survive a restart: resume every unfinished session
+    for d in sorted(HLS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if d.is_dir() and not d.name.startswith("raw-"):
+            try:
+                if _resume_session(d.name):
+                    print(f"resumed JIT session {d.name}", file=sys.stderr, flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"resume {d.name} failed: {e}", file=sys.stderr, flush=True)
+
+
 # Retention on startup too: a prefetch sweep can complete many muxes while the
 # reaper-time sweep only ever runs on this process's own completions.
-threading.Thread(target=_sweep, daemon=True).start()
+threading.Thread(target=_startup, daemon=True).start()
 
 
 def _dir_bytes(d):
