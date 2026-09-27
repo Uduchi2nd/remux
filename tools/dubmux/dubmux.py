@@ -72,6 +72,33 @@ def decode(url, start, span, extra=()):
     return np.frombuffer(pcm, dtype=np.float32)
 
 
+def prescreen(video_url, dubfile, vdur, ddur, n=8, span=60.0, max_lag=75.0, min_ratio=10.0):
+    """Cheap decision before any full read of the release: correlate `n`
+    60 s windows spread over the file (byte-range seeks, ~30 MB each of
+    interleaved data) against the dub at the same nominal time. Returns
+    [(t, lag, ratio)] — the caller counts confident windows (ratio >=
+    min_ratio) and looks at lag agreement."""
+    from concurrent.futures import ThreadPoolExecutor
+    lim = min(vdur, ddur) - span - 5
+    if lim <= span:
+        return []
+    ts = [round(lim * (0.06 + 0.88 * i / (n - 1)), 1) for i in range(n)]
+
+    def one(t):
+        try:
+            a = decode(video_url, t, span)
+            b = decode(dubfile, t, span)
+            m = min(len(a), len(b))
+            if m < int(span * RATE * 0.8):
+                return (t, None, 0.0)
+            lag, _peak, ratio = xcorr_lag(a[:m], b[:m], max_lag)
+            return (t, round(float(lag), 3), round(float(ratio), 1))
+        except Exception:  # noqa: BLE001
+            return (t, None, 0.0)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return list(pool.map(one, ts))
+
+
 def xcorr_lag(a, b, max_lag_s):
     """Lag (seconds) such that a(t) ≈ b(t + lag): with a = video and b = dub,
     video(t) lines up with dub(t + lag). Negative lag = the video has extra
