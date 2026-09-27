@@ -273,7 +273,7 @@ in remux (`/start`) makes that copy ahead of the first play.
 
 ## Ahead-of-time warming of trending Chinese/Korean titles (2026-09-27)
 `tools/dubmux/warm.py` (lives at `/root/dubmux-warm/warm.py` on nimo, root cron
-`10 */2 * * *`, log `warm.log`, state `state.json`): reads remux's promoted
+`40 3 * * *` = once a day since 2026-09-27, 12 newest-aired episodes per run, `PAUSED` file skips runs; log `warm.log`, state `state.json`): reads remux's promoted
 libraries Hot Chinese Shows, Hot Korean Shows, Netflix South Korea Top 10,
 Trending Shows/Movies, Hot Korean Movies (titles filtered to
 `ProductionLocations` China/Hong Kong/Taiwan/South Korea, ≤100 titles), takes
