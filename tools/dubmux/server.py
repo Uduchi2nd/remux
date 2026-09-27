@@ -437,7 +437,7 @@ def _prepare_worker(dub, video, k):
                     _start_mux(k, dubmux.resolve_url(video["url"]), dub["id"], result["lag"])
                 return
         orig_url = video["url"]   # kept in the record: the release identity (file name)
-        video["url"] = dubmux.resolve_url(video["url"])
+        video["url"] = dubmux.resolve_url(video["url"], background=job["priority"] > 9)
         job["video_url"] = video["url"]
         _raw_ref(hq_id, k)
         if job["priority"] <= 99 and not (_raw_dir(hq_id) / ".done").exists():
@@ -1065,6 +1065,7 @@ def master(dub_id: str, video_id: str, request: Request):
         print(f"mux {k}: inconsistent finished session, rebuilding", file=sys.stderr, flush=True)
         shutil.rmtree(d, ignore_errors=True)
     if not (d / ".done").exists():
+      try:
         if (d / ".jit").exists():
             _resume_session(k)                       # orphaned by a restart? continue it
         elif _segtab(hq_id_of(k)) is not None:
@@ -1075,6 +1076,10 @@ def master(dub_id: str, video_id: str, request: Request):
             # release by _raw_copy's lock) and wait for the session to open
             threading.Thread(target=_ensure_mux, args=(k, dub_id, m, video_url), daemon=True).start()
             _wait_for(d / ".jit", MASTER_WAIT_S)
+      except dubmux.SourceUnavailable as e:
+        # the release's resolver is rate-limiting: tell the player to retry
+        # rather than building a session on a placeholder video
+        raise HTTPException(503, f"source temporarily unavailable: {e}", headers={"Retry-After": "60"})
     (d / ".touched").write_text(str(int(time.time())))
     body = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=20000000\nindex.m3u8\n"
     return Response(body, media_type="application/vnd.apple.mpegurl",
@@ -1177,7 +1182,11 @@ def segment(dub_id: str, video_id: str, seg: str, request: Request):
             running = bool(prod and prod["proc"].poll() is None)
             if tab and (not running or n < prod["start"] or n > prod["cursor"] + JIT_AHEAD):
                 # far seek (or producer gone): restart at this segment
-                _jit_start(k, m.get("video_url", ""), dub_id, m.get("lag", 0.0), tab, n)
+                try:
+                    src = dubmux.resolve_url(m.get("video_url", ""))   # cached: no resolver hit per seek
+                except dubmux.SourceUnavailable as e:
+                    raise HTTPException(503, f"source temporarily unavailable: {e}", headers={"Retry-After": "30"})
+                _jit_start(k, src, dub_id, m.get("lag", 0.0), tab, n)
         elif (d / ".done").exists() or (d / ".failed").exists():
             raise HTTPException(404)
         end = time.time() + SEG_WAIT_S

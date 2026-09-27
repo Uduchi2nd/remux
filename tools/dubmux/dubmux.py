@@ -10,7 +10,7 @@ Cache layout: $DUBMUX_CACHE/<name>.m4a + <name>.json (meta). Matching decodes
 short mono 8 kHz windows from both sides and cross-correlates them (FFT) at
 several points along the runtime; the lag must agree across windows.
 """
-import argparse, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.request
+import argparse, json, os, re, shutil, subprocess, sys, tempfile, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 import numpy as np
@@ -42,22 +42,58 @@ def ua_for(url):
     return ["-user_agent", UA, "-rw_timeout", "30000000"] if url.startswith(("http://", "https://")) else []
 
 
-def resolve_url(url, timeout=20):
+class SourceUnavailable(RuntimeError):
+    """The resolver answered with a placeholder instead of the release
+    (AIOStreams' rate-limit / error videos): retry later, never mux it."""
+
+
+# AIOStreams answers a rate-limited or failed playback request with a 307 to a
+# short placeholder video (`/static/429.mp4`, `/static/500.mp4`, ...). Muxing
+# that produced a dub row that "loads but never plays" (2026-09-27).
+_PLACEHOLDER = re.compile(r"/static/\d{3}[^/]*\.mp4$|/static/[a-z_-]*error[^/]*\.mp4$", re.I)
+_resolved: dict = {}          # url -> (final url, time)
+_resolve_lock = threading.Lock()
+_last_bg_resolve = [0.0]
+RESOLVE_TTL_S = 3 * 3600      # debrid CDN links stay valid for hours
+BG_RESOLVE_GAP_S = float(os.environ.get("DUBMUX_BG_RESOLVE_GAP_S", "20"))
+
+
+def resolve_url(url, timeout=20, background=False):
     """Follow addon/debrid redirectors (AIOStreams playback URLs, Torrentio
     resolvers, TorBox API) to the final CDN URL. ffmpeg can follow redirects
     but cannot seek through them, and the muxer must not hammer a resolver
-    once per segment window anyway."""
+    once per segment window anyway. Results are cached (a seek or a producer
+    restart never asks the resolver again); background callers are paced so
+    they cannot trip the resolver's rate limit; placeholders raise."""
     if not url.startswith(("http://", "https://")):
         return url
+    now = time.time()
+    hit = _resolved.get(url)
+    if hit and now - hit[1] < RESOLVE_TTL_S:
+        return hit[0]
+    if background:
+        with _resolve_lock:
+            gap = _last_bg_resolve[0] + BG_RESOLVE_GAP_S - time.time()
+            if gap > 0:
+                time.sleep(gap)
+            _last_bg_resolve[0] = time.time()
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": "bytes=0-0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.geturl()
+            final = r.geturl()
     except urllib.error.HTTPError as e:
         # 416 etc. still carries the final URL after redirects.
-        return e.geturl() or url
+        final = e.geturl() or url
     except Exception:  # noqa: BLE001
         return url
+    if _PLACEHOLDER.search(final.split("?")[0]):
+        raise SourceUnavailable(f"resolver returned a placeholder ({final.rsplit('/', 1)[-1]})")
+    if final != url:
+        _resolved[url] = (final, now)
+        if len(_resolved) > 5000:
+            for k in sorted(_resolved, key=lambda k: _resolved[k][1])[:1000]:
+                _resolved.pop(k, None)
+    return final
 
 
 def ffprobe_duration(url):
