@@ -139,6 +139,16 @@ so every episode's FIRST dub version in the walk is prepared before anyone's
 second variant, and the series being watched never waits behind another
 series' upkeep. Jobs submitted by older remux builds get 500.
 
+### Priority order and slots (2026-09-27)
+remux → muxer priorities: current episode (playback) 0, NEXT episode 2, item
+opened in the app 10, the rest of the on-play walk 100+n (upcoming first,
+previous last), background refresh 300, evaluation 400; a pair that is not
+the best of its episode adds 50+rank, so every episode's first dub version
+lands before any variant. Gates (`PriorityGate`): match 3 shared slots + 1
+reserved for ≤99 + 1 express for ≤9 (playback/next only); extract 2+1+1; raw
+copy (the full-release fetch) 2+1+1 → at most 4 releases downloading at
+once. Running jobs are never preempted; priority only orders the waiting.
+
 ## Acceptance by time coverage (2026-09-26)
 
 `align.py` accepts a piecewise match on either of two criteria: (a) ≥ 85 %

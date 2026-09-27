@@ -262,6 +262,10 @@ pub(crate) fn hq_url_of(stream: &db::Media) -> Option<String> {
 /// anyone's second variant.
 pub(crate) const PRIORITY_PLAYBACK: u32 = 0;
 pub(crate) const PRIORITY_WALK: u32 = 100;
+/// The episode after the one being played: below the current episode, above
+/// everything else (item-open pairs of browsed titles, the rest of the walk,
+/// background, cache warming). Gets the muxer's express slot too (≤ 9).
+pub(crate) const PRIORITY_NEXT: u32 = 2;
 pub(crate) const PRIORITY_BACKGROUND: u32 = 300;
 /// Variants (second dub provider / second-best release) of an episode rank
 /// behind the first pairs of the whole walk (up to 12 episodes).
@@ -1018,13 +1022,18 @@ async fn prefetch_upcoming(
             warn!(episode = %id, "dub prefetch: stream refresh failed: {e:#}");
             continue;
         }
-        // Re-submit this episode's pairs at walk priority (next episodes
-        // first, previous ones last): the muxer bumps queued jobs in place.
+        // Re-submit this episode's pairs: the NEXT episode right behind the
+        // current one, the rest at walk priority (upcoming first, previous
+        // ones last); the muxer bumps queued jobs in place.
         if let Ok(streams) = ep
             .streams(&ctx.db)
             .await
         {
-            let prio = PRIORITY_WALK + offset as u32;
+            let prio = if offset == 0 {
+                PRIORITY_NEXT
+            } else {
+                PRIORITY_WALK + offset as u32
+            };
             let _ = ensure_dub_rows(ctx, &ep, &streams, 0, prio).await;
         }
         if offset == 0
