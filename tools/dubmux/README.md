@@ -205,3 +205,52 @@ Every finished mux runs `_verify_sync`: the dub track is cross-correlated
 against the release's first audio track at three points; a confident
 disagreement > 0.35 s marks the session `.failed` (`.verify` holds the
 numbers). It caught a +1.6 s double clock shift in the first build.
+
+## Cache redesign: durable audio + JIT playback (2026-09-27)
+What is kept, and for how long (`Containerfile` env, LRU within budget):
+- **Durable** (`audio/`, `match/`; 200 GB / 365 d, LRU by mtime, bumped on
+  every use by `_touch_pair`): extracted dub tracks, match records, ALIGNED
+  tracks (`<dub>__<hq>.aligned.m4a` + a `.json` sidecar listing every release
+  the track is known to fit — one aligned track serves several releases via
+  the pre-screen), and the release's **segment table**
+  `segtab-<hq>.json` (`{"v":3,"starts":[true PTS of every raw segment],
+  "last":dur,"origin":start_time}`).
+- **Play cache** (`hls/<dub>__<hq>/`; 100 GB / 30 d, LRU by `.touched`):
+  finished muxes, ONE version per pair. `hls/raw-<hq>/` local copies are
+  staging (deleted 2 h after last use).
+Playback is built **just in time** against the release (raw copy while it
+exists, else the live debrid/usenet URL): `master.m3u8` answers in ~1 s with
+a full **VOD** playlist derived from the segment table, and a producer
+(`ffmpeg -copyts … -f segment -segment_times`) makes the segments from
+wherever the player is. A far seek restarts the producer at that segment
+(~0.5 s), and a **mover thread** moves each finished segment from the run's
+own dir into the session, so served files are always whole and a killed
+producer never truncates anything. When a run ends with holes (the viewer
+seeked around) bounded fill runs complete the session, then the sync
+self-check runs and the session becomes cache.
+Hard-won ffmpeg facts (all measured, see `_jit_cmd`):
+- `-segment_times` are RELATIVE to the run's first packet and indexed per
+  run (`segment.c`: `end_pts = times[count] + reference_stream_first_pts`),
+  not absolute, not by `segment_start_number`. Pass `starts[i] - T`.
+- The table must be the real first PTS of each raw segment (parsed from the
+  TS files, 64 KB reads): cumulative EXTINF sums drift (1.6 s over one
+  file) and the cuts then miss keyframes.
+- `-copyts` keeps original timestamps after an input `-ss`; `-start_at_zero`
+  shifted a seeked run's clock by 1.6 s — never use it here. The alignment
+  lag lives on the re-based clock, so the dub is offset by
+  `origin - dub_start_time - lag` (`origin` = the release's container
+  start_time) and always input-seeked so no packet lands before 0
+  (avoid_negative_ts would otherwise shift a whole run).
+- The self-check decodes both audio tracks with
+  `aresample=first_pts=0` so they share the absolute clock; passes at
+  -0.022 s (AAC priming).
+- The hls muxer's own `hls_time` splitting is not reproducible across a
+  restart; a finished session whose playlist does not list every segment
+  with `#EXT-X-ENDLIST` (a legacy producer killed mid-playlist — the "0
+  length" Love in the Clouds E1 row) is rebuilt on the next master GET
+  (`_session_consistent`).
+Matches prepared before tables existed (255 of 279 releases on 2026-09-27,
+mostly evaluation runs) need a raw copy on first play: master starts it in
+the background (deduplicated per release) and waits up to
+`DUBMUX_MASTER_WAIT_S` (50) for the session to open; opening the episode
+in remux (`/start`) makes that copy ahead of the first play.
