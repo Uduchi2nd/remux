@@ -254,3 +254,25 @@ mostly evaluation runs) need a raw copy on first play: master starts it in
 the background (deduplicated per release) and waits up to
 `DUBMUX_MASTER_WAIT_S` (50) for the session to open; opening the episode
 in remux (`/start`) makes that copy ahead of the first play.
+
+## Ahead-of-time warming of trending Chinese/Korean titles (2026-09-27)
+`tools/dubmux/warm.py` (lives at `/root/dubmux-warm/warm.py` on nimo, root cron
+`10 */2 * * *`, log `warm.log`, state `state.json`): reads remux's promoted
+libraries Hot Chinese Shows, Hot Korean Shows, Netflix South Korea Top 10,
+Trending Shows/Movies, Hot Korean Movies (titles filtered to
+`ProductionLocations` China/Hong Kong/Taiwan/South Korea, ≤100 titles), takes
+the latest 10 AIRED episodes of each series (and the movies), and inserts them
+into remux's persistent `background_stream_refresh_jobs` queue at priority 10
+(below every viewer-driven job: 40/80/100/200). The queue worker refreshes
+the episode's streams → "[+VN dub]" rows → muxer `/prepare` at muxer priority
+300 (behind playback and the on-play walk) → dub audio aligned + segment
+table in the durable cache; nothing is pre-muxed, so the play cache is not
+touched. Pacing: ≤40 episodes per run, skipped while the muxer has >80
+waiting pairs at priority ≤300 or remux still holds >20 warm jobs; an episode
+is not re-queued within 7 days. DB writes go through a throwaway
+`python:3.12-slim` container in LXC 111 (short WAL transactions beside the
+running server; `ON CONFLICT DO NOTHING` so a viewer's job never loses its
+priority). Env knobs: `WARM_MAX_TITLES`, `WARM_EPISODES`, `WARM_BATCH`,
+`WARM_REPEAT_DAYS`, `WARM_MUXER_MAX_WAITING`, `WARM_REMUX_MAX_PENDING`.
+Rough cost: ~2–4 GB of seedbox download per episode for the alignment's raw
+copy (deleted 2 h later), ~100 MB kept per episode in the audio cache.
