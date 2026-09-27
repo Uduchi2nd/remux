@@ -78,20 +78,34 @@ class PriorityGate:
     A waiter's priority can be raised later (`bump`) — remux re-submits a
     pair with a better priority when the viewer gets closer to it."""
 
-    def __init__(self, slots):
+    def __init__(self, slots, reserved=0, reserved_max_priority=99):
+        # `reserved` extra slots may only be taken by jobs whose priority is
+        # <= reserved_max_priority: an interactive request (playback 0, the
+        # on-play walk 100+… no) never waits behind a queue of background /
+        # evaluation extractions that already hold the shared slots.
         self.slots = slots
+        self.reserved = reserved
+        self.reserved_max = reserved_max_priority
         self.cv = threading.Condition()
         self.waiting: dict[str, list] = {}   # key -> [priority, seq]
         self.seq = 0
         self.active = 0
+
+    def _capacity(self, priority):
+        return self.slots + (self.reserved if priority <= self.reserved_max else 0)
 
     def acquire(self, key, priority):
         with self.cv:
             self.seq += 1
             self.waiting[key] = [priority, self.seq]
             while True:
-                if self.active < self.slots:
-                    best = min(self.waiting.items(), key=lambda kv: (kv[1][0], kv[1][1]))[0]
+                prio = self.waiting[key][0]
+                if self.active < self._capacity(prio):
+                    # lowest-priority-number waiter that fits in the capacity
+                    # its own priority allows
+                    eligible = [(v[0], v[1], k) for k, v in self.waiting.items()
+                                if self.active < self._capacity(v[0])]
+                    best = min(eligible)[2]
                     if best == key:
                         del self.waiting[key]
                         self.active += 1
@@ -112,7 +126,7 @@ class PriorityGate:
 
     def snapshot(self):
         with self.cv:
-            return {"active": self.active, "slots": self.slots,
+            return {"active": self.active, "slots": self.slots, "reserved": self.reserved,
                     "waiting": sorted((p, k[:8]) for k, (p, _s) in self.waiting.items())}
 
 
@@ -121,8 +135,8 @@ class PriorityGate:
 # the event loop keeps answering /prepare and /mux promptly. Extraction is
 # bounded to what the VN extractor runs in parallel, so ITS queue never
 # holds work this gate would have ordered differently.
-MATCH_GATE = PriorityGate(int(os.environ.get("DUBMUX_MATCH_SLOTS", "3")))
-EXTRACT_GATE = PriorityGate(int(os.environ.get("DUBMUX_EXTRACT_SLOTS", "2")))
+MATCH_GATE = PriorityGate(int(os.environ.get("DUBMUX_MATCH_SLOTS", "3")), reserved=1)
+EXTRACT_GATE = PriorityGate(int(os.environ.get("DUBMUX_EXTRACT_SLOTS", "2")), reserved=1)
 DEFAULT_PRIORITY = 500
 # Decoded HQ windows are shared across the dubs paired with the same release
 # (up to three dubs per episode) for a few minutes.
