@@ -78,21 +78,24 @@ class PriorityGate:
     A waiter's priority can be raised later (`bump`) — remux re-submits a
     pair with a better priority when the viewer gets closer to it."""
 
-    def __init__(self, slots, reserved=0, reserved_max_priority=99):
+    def __init__(self, slots, reserved=0, reserved_max_priority=99, express=1, express_max_priority=9):
         # `reserved` extra slots may only be taken by jobs whose priority is
-        # <= reserved_max_priority: an interactive request (playback 0, the
-        # on-play walk 100+… no) never waits behind a queue of background /
-        # evaluation extractions that already hold the shared slots.
+        # <= reserved_max_priority (interactive: playback 0, item-open 10+…),
+        # so they never wait behind a queue of background / evaluation jobs
+        # that already hold the shared slots; `express` extra slots are for
+        # priority <= express_max_priority only (a PLAYBACK pair), so a
+        # viewer who pressed play never waits behind the on-open / walk
+        # pairs of everything else they browsed (2026-09-27: a playback pair
+        # sat 6 min behind 56 open-time pairs on the single reserved slot).
         self.slots = slots
-        self.reserved = reserved
-        self.reserved_max = reserved_max_priority
+        self.tiers = [(reserved, reserved_max_priority), (express, express_max_priority)]
         self.cv = threading.Condition()
         self.waiting: dict[str, list] = {}   # key -> [priority, seq]
         self.seq = 0
         self.active = 0
 
     def _capacity(self, priority):
-        return self.slots + (self.reserved if priority <= self.reserved_max else 0)
+        return self.slots + sum(extra for extra, cap in self.tiers if priority <= cap)
 
     def acquire(self, key, priority):
         with self.cv:
@@ -126,7 +129,7 @@ class PriorityGate:
 
     def snapshot(self):
         with self.cv:
-            return {"active": self.active, "slots": self.slots, "reserved": self.reserved,
+            return {"active": self.active, "slots": self.slots, "tiers": self.tiers,
                     "waiting": sorted((p, k[:8]) for k, (p, _s) in self.waiting.items())}
 
 
