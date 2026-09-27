@@ -67,7 +67,7 @@ def _match_path(k):
 # older version are re-run on the next prepare (accepts are kept). 65 stale
 # "reject:skew" records from before the 2026-09-27 aligner fixes were
 # blocking re-alignment of pairs that now pass.
-ALIGN_VERSION = 5
+ALIGN_VERSION = 6
 REJECT_TTL_DAYS = 14   # a rejected pair is re-tried after this (sources change)
 
 
@@ -481,8 +481,16 @@ def _prepare_worker(dub, video, k):
             # container): not a verdict about the pair — fail so it is
             # retried later instead of caching a rejection
             raise RuntimeError("release unreadable: no pre-screen window decoded")
-        if len(conf) < 3 and undecodable >= len(pre) // 2:
+        # Weak-but-consistent evidence: >= 3 windows at ratio >= 7 sharing one
+        # lag (+-1 s) is a real match with a quiet music bed (kkphim dubs sat
+        # at 7-9 for whole episodes); >= 2 confident windows likewise. The
+        # pre-screen only exists to skip downloads for OBVIOUS mismatches —
+        # the full aligner is the judge for everything else.
+        weak = [(t, lag, r) for t, lag, r in pre if lag is not None and r >= 7.0]
+        clustered = max((sum(1 for _t, l2, _r in weak if abs(l2 - l1) <= 1.0) for _t, l1, _r in weak), default=0)
+        if len(conf) < 3 and (undecodable >= len(pre) // 2 or len(conf) >= 2 or clustered >= 3):
             # too little evidence either way: decide on the full local copy
+            result["prescreen"]["inconclusive"] = {"confident": len(conf), "clustered_weak": clustered}
             conf = []
             pre_inconclusive = True
         else:

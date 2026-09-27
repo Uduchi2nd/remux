@@ -23,6 +23,10 @@ COARSE_SPAN = 60.0      # 30 s windows produced spurious single-window runs
 FINE_SPAN = 10.0
 FINE_STEP = 2.0
 MIN_RATIO = 12.0        # coarse window confidence floor (peak / rms)
+WEAK_RATIO = 7.0        # a weaker window COUNTS when its lag equals a run's lag
+                        # (random peaks land there with negligible probability;
+                        # dubs with a quieter music bed sit at 7-9 for long
+                        # stretches and were rejected for "coverage" 2026-09-27)
 STRONG_RATIO = 30.0     # a lone window needs this to stand as its own run
 RUN_TOL = 0.25          # lags within this are the same run
 MAX_RUNS = 8
@@ -151,6 +155,22 @@ def analyse(video_pcm, dub_pcm):
     if not runs:
         return {"verdict": "reject:correlation",
                 "coarse": [(s, r and round(r[0], 3), r and round(r[1], 1)) for s, r in coarse]}
+    # Lag-consistent weak windows: a window below MIN_RATIO whose best lag
+    # is a run's lag (+- RUN_TOL) is evidence for that run — absorb it
+    # (between the neighbouring runs' confident spans only), so coverage and
+    # gap checks see the whole stretch the offset really holds.
+    bounds = [(r["first"], r["last"]) for r in runs]
+    for i, r in enumerate(runs):
+        lo = bounds[i - 1][1] if i > 0 else -1e9
+        hi = bounds[i + 1][0] if i + 1 < len(runs) else 1e9
+        for s, res in coarse:
+            if res and lo < s < hi and s not in r["starts"] and WEAK_RATIO <= res[1] < MIN_RATIO \
+                    and abs(res[0] - r["lag_med"]) <= RUN_TOL:
+                r["starts"].append(s)
+                r["lags"].append(res[0])
+                r["ratios"].append(res[1])
+                r["weak"] = r.get("weak", 0) + 1
+        r["first"], r["last"] = min(r["starts"]), max(r["starts"])
     if len(runs) > MAX_RUNS:
         return {"verdict": "reject:fragmented", "runs": len(runs),
                 "coarse": [(s, r and round(r[0], 3), r and round(r[1], 1)) for s, r in coarse]}
@@ -183,7 +203,8 @@ def analyse(video_pcm, dub_pcm):
     out = []
     for r in runs:
         rr = {"dub_start": round(max(0.0, r["dub_start"]), 3), "dub_end": round(r["dub_end"], 3),
-              "lag": r["lag"], "min_ratio": round(min(r["ratios"]), 1), "windows": len(r["lags"])}
+              "lag": r["lag"], "min_ratio": round(min(r["ratios"]), 1), "windows": len(r["lags"]),
+              "weak_windows": r.get("weak", 0)}
         # A positive lag means the dub starts BEFORE the video (a longer
         # streamer ident on the VN side): video(t) <-> dub(t + lag), so dub
         # time [0, lag) has no video — clip the run there instead of
