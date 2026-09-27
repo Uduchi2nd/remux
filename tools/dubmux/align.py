@@ -106,7 +106,8 @@ def analyse(video_pcm, dub_pcm):
     vdur, ddur = len(video_pcm) / R, len(dub_pcm) / R
     skew = abs(vdur - ddur)
     if skew > MAX_SKEW:
-        return {"verdict": "reject:skew", "skew": round(skew, 1)}
+        return {"verdict": "reject:skew", "skew": round(skew, 1),
+                "video_pcm_s": round(vdur, 1), "dub_pcm_s": round(ddur, 1)}
     # The search range must cover a mid-roll ad the VN source injects
     # (kkphim: ~30 s around 15 min, so the lag jumps by that much) even when
     # the total durations happen to agree: skew + 15 s was too tight and

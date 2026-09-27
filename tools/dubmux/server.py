@@ -63,11 +63,27 @@ def _match_path(k):
     return MATCH / f"{k}.json"
 
 
+# Bump when the pre-screen / aligner logic changes: cached REJECTS from an
+# older version are re-run on the next prepare (accepts are kept). 65 stale
+# "reject:skew" records from before the 2026-09-27 aligner fixes were
+# blocking re-alignment of pairs that now pass.
+ALIGN_VERSION = 5
+REJECT_TTL_DAYS = 14   # a rejected pair is re-tried after this (sources change)
+
+
 def _load_match(k):
     p = _match_path(k)
-    if p.exists():
-        return json.load(open(p))
-    return None
+    if not p.exists():
+        return None
+    try:
+        m = json.load(open(p))
+    except Exception:  # noqa: BLE001
+        return None
+    if m.get("verdict") != "accept":
+        if m.get("align_version", 0) < ALIGN_VERSION or \
+                time.time() - m.get("created", 0) > REJECT_TTL_DAYS * 86400:
+            return None
+    return m
 
 
 _extract_locks: dict[str, threading.Lock] = {}
@@ -233,6 +249,18 @@ def _raw_copy(hq_id, video_url, k, priority):
                                 "-vn", "-sn", "-map", "0:a:0", "-c:a", "copy", "-f", "matroska",
                                 str(d / "audio.mka")], capture_output=True)
             if a.returncode != 0:
+                shutil.rmtree(d, ignore_errors=True)
+                return None
+            # A stream that ended early (CDN cut, 5xx mid-file) exits 0 with a
+            # short copy; a short copy must never be aligned or served.
+            try:
+                expect = dubmux.ffprobe_duration(video_url)
+                got = dubmux.ffprobe_duration(str(d / "index.m3u8"))
+            except Exception:  # noqa: BLE001
+                expect = got = None
+            if expect and got and got < 0.97 * expect:
+                print(f"raw copy {hq_id}: truncated ({got:.0f}s of {expect:.0f}s), discarded",
+                      file=sys.stderr, flush=True)
                 shutil.rmtree(d, ignore_errors=True)
                 return None
             (d / ".done").write_text(str(int(time.time())))
@@ -440,19 +468,31 @@ def _prepare_worker(dub, video, k):
         dubfile = str(AUDIO / f"{dub['id']}.m4a")
         result = {"dub": dub["id"], "video": video["id"], "video_duration": vdur,
                   "dub_duration": ddur, "duration_delta": round(vdur - ddur, 3),
-                  "created": int(time.time()), "video_url": orig_url}
+                  "created": int(time.time()), "video_url": orig_url, "align_version": ALIGN_VERSION}
         # Pre-screen: 8 windows by byte range (~1 % of the file). Fewer than
         # 3 confident windows = a different edit or the wrong episode; stop
         # before reading the whole release.
         pre = dubmux.prescreen(video["url"], dubfile, vdur, ddur, max_lag=max(75.0, abs(vdur - ddur) + 15.0))
         conf = [(t, lag, r) for t, lag, r in pre if lag is not None and r >= 10.0]
-        result["prescreen"] = {"windows": pre, "confident": len(conf)}
-        if len(conf) < 3:
+        undecodable = sum(1 for _t, lag, _r in pre if lag is None)
+        result["prescreen"] = {"windows": pre, "confident": len(conf), "undecodable": undecodable}
+        if pre and undecodable == len(pre):
+            # nothing could be read (source down, dead link, unseekable
+            # container): not a verdict about the pair — fail so it is
+            # retried later instead of caching a rejection
+            raise RuntimeError("release unreadable: no pre-screen window decoded")
+        if len(conf) < 3 and undecodable >= len(pre) // 2:
+            # too little evidence either way: decide on the full local copy
+            conf = []
+            pre_inconclusive = True
+        else:
+            pre_inconclusive = False
+        if len(conf) < 3 and not pre_inconclusive:
             result["verdict"] = "reject:prescreen"
         else:
             lags = sorted(l for _t, l, _r in conf)
-            spread = lags[-1] - lags[0]
-            same_cut = abs(vdur - ddur) <= 1.5 and len(conf) >= 5 and spread <= 0.15
+            spread = (lags[-1] - lags[0]) if lags else None
+            same_cut = bool(lags) and abs(vdur - ddur) <= 1.5 and len(conf) >= 5 and spread <= 0.15
             if same_cut:
                 # Same cut: one constant offset, no piecewise, no full audio needed.
                 result["lag"] = round(lags[len(lags) // 2], 3)
@@ -491,6 +531,11 @@ def _prepare_worker(dub, video, k):
                     rep = align.align(video["url"], dubfile, str(MATCH), k,
                                       hq_audio=str(rd / "audio.mka") if rd else None)
                     result["piecewise"] = {kk: vv for kk, vv in rep.items() if kk != "aligned"}
+                    if rep.get("verdict") == "reject:skew" and abs(vdur - ddur) <= align.MAX_SKEW:
+                        # the pre-screen (or the probes) saw two same-length
+                        # streams; a huge skew here means a decode came back
+                        # short (truncated raw copy / dub) — retry later
+                        raise RuntimeError(f"decoded audio length mismatch: {rep}")
                     if rep.get("verdict") == "accept":
                         result["lag"] = 0.0
                         result["verdict"] = "accept"
