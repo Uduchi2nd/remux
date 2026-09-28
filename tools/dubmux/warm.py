@@ -22,7 +22,7 @@ ran while anything had been watched in the last 24 h (2026-09-27).
 Pacing: one pair at a time, at most WARM_BATCH episodes per run, skipped
 while the muxer's general pool has a deep backlog; an episode is not
 re-warmed within WARM_REPEAT_DAYS. AIOStreams calls are spaced (it 403s
-bursts). Root cron on nimo once a day (03:40 local); `PAUSED` file in this dir skips runs.
+bursts). Root cron on nimo once a day (06:00 local); `PAUSED` file in this dir skips runs.
 """
 import hashlib, json, os, sys, time, urllib.parse, urllib.request
 from datetime import datetime, timezone
@@ -40,7 +40,7 @@ LIBRARIES = [  # remux view names, in priority order
 COUNTRIES = {"China", "Hong Kong", "Taiwan", "South Korea", "Korea"}
 MAX_TITLES = int(os.environ.get("WARM_MAX_TITLES", "100"))
 EPISODES = int(os.environ.get("WARM_EPISODES", "10"))      # latest aired per series
-BATCH = int(os.environ.get("WARM_BATCH", "12"))             # episodes per run
+BATCH = int(os.environ.get("WARM_BATCH", "40"))             # episodes per run
 REPEAT_DAYS = int(os.environ.get("WARM_REPEAT_DAYS", "7"))
 MUXER_MAX_WAITING = int(os.environ.get("WARM_MUXER_MAX_WAITING", "30"))
 PRIORITY = 300
