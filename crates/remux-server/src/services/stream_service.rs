@@ -243,8 +243,15 @@ impl StreamService {
         let media = crate::services::MediaResolveService::resolve_item(lookup_id, ctx)
             .await?
             .ok_or_else(|| anyhow::anyhow!("stream not found: {}", lookup_id))?;
-        let mut row =
-            Self::dispatch_lookup(ctx, item_id, requested_id, device_key, user_id, media).await?;
+        let mut row = Self::dispatch_lookup(
+            ctx,
+            item_id,
+            requested_id,
+            device_key,
+            user_id,
+            media,
+        )
+        .await?;
         // PATCH (uduchi2nd): every consumer (PlaybackInfo, subtitle routes)
         // must see the same track list for a legacy dub row.
         if crate::services::dubmux::fill_row_probe(&mut row)
