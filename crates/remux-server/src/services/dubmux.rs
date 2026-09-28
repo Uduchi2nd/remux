@@ -173,6 +173,15 @@ impl PrepareReply {
             == Some(true)
     }
 
+    /// Exact byte size of the pair's seekable file (players and downloads
+    /// see this as the source's Size).
+    fn file_size(&self) -> Option<i64> {
+        self.result
+            .as_ref()
+            .and_then(|r| r.get("file_size"))
+            .and_then(|v| v.as_i64())
+    }
+
     fn video_checked(&self) -> bool {
         self.result
             .as_ref()
@@ -653,6 +662,15 @@ pub(crate) async fn ensure_dub_rows(
                     ("master.m3u8", "m3u8")
                 };
                 si.filename = Some(format!("{stem}.VNDub-{provider}.{ext}"));
+                // the file's real size, not the release's (Infuse shows it and
+                // may size a download by it)
+                si.size = if reply.file_ready() {
+                    reply
+                        .file_size()
+                        .or(si.size)
+                } else {
+                    si.size
+                };
                 si.descriptor = StreamDescriptor::Http {
                     url: format!(
                         "{}/mux/{dub_id}/{hq_id}/{leaf}?video={}",
