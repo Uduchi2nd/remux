@@ -349,3 +349,32 @@ throttled by any of this):
 Budget: background link requests drop from ~900/h to a few dozen, hard
 ceiling ~120/h for probes plus ~180/h for muxer resolves. TorBox's exact
 quota for link requests is not published in a readable form.
+
+## Asian titles only; video decode checks; corrupt HEVC copies (2026-09-28, `5625e2fa`)
+User report: Reacher S02E01 dub rows loaded a few MB and never played
+(VidHub, Fladder on Windows); Infuse crashed on S01E01. All Reacher sessions
+decoded as green/black frames (29–97 HEVC errors per segment).
+Root cause: those Amazon HDR10+/Dolby Vision HEVC MKVs carry DIFFERENT
+parameter sets (VPS/SPS/PPS) in the container header than in-band. MPEG-TS
+needs Annex-B, and the muxer's automatic `hevc_mp4toannexb` inserts the
+header set before every keyframe, so the decoder uses the wrong PPS. The MKV
+itself decodes cleanly, as do fMP4/MKV copies. Fix: raw copies and remote JIT
+sessions pass `-bsf:v hevc_metadata` (`h264_metadata` for H.264), which
+rewrites the parameter sets from the stream — Reacher S01E01: 0 errors,
+real picture. (`dubmux.ts_video_bsf`, codec from one ffprobe, cached.)
+Safety nets so a broken pair can never be a player's default again:
+- every raw copy decodes 4 segments across the file; most failing →
+  `reject:corrupt-source` (expires like other rejects, 14 d / ALIGN_VERSION);
+- a session of a pair not yet checked decodes its first 2 segments; both
+  failing → pair rejected, session `.failed`; passing → `video_check: ok`;
+- `/prepare` and `/status` report `video_check`; remux lists a dub row
+  FIRST only when it is "ok", otherwise after every release (idx ≥ 100000);
+- a pair the muxer rejects has its row deleted by remux immediately.
+All checks decode local files: no debrid link requests.
+Backfill 2026-09-28 (local data only): 23 pairs checked, 19 ok, 4 corrupt
+(all Reacher S01, HDR10+); 834 accepted pairs had no local data and stay
+unchecked until their first session.
+**Scope (user decision):** dub rows only for Asian-originated titles — the
+series' (or movie's) original language (zh/ko/ja/th/… ; not vi), else its
+country (all listed countries Asian); unknown origin → none. Existing rows
+on other titles are deleted on the next stream load.
