@@ -2315,10 +2315,20 @@ async fn item_for_user(
                         .cloned()
                         .collect();
                     if !ext.is_empty() {
+                        // A dub row presents the release's embedded text
+                        // tracks as external under the SAME index: drop the
+                        // embedded originals too, or the item lists every
+                        // such track twice with one index (VidHub, 2026-09-28).
+                        let ext_idx: std::collections::HashSet<i64> =
+                            ext.iter().map(|s| s.index).collect();
                         let list = base_item
                             .media_streams
                             .get_or_insert_with(Vec::new);
-                        list.retain(|s| !is_ext_sub(s));
+                        list.retain(|s| {
+                            !is_ext_sub(s)
+                                && !(matches!(s.type_, Some(api::MediaStreamType::Subtitle))
+                                    && ext_idx.contains(&s.index))
+                        });
                         list.extend(ext);
                         base_item.has_subtitles = Some(true);
                     }

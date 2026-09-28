@@ -1034,13 +1034,12 @@ pub(crate) async fn probe_stream(
     // one (video + Vietnamese dub) — the next refresh rebuilds it from the HQ.
     if crate::services::dubmux::is_dubmux_row(stream) {
         let mut row = stream.clone();
-        if row
-            .probe_data
-            .is_none()
+        if crate::services::dubmux::fill_row_probe(&mut row)
+            && let Some(probe) = row
+                .probe_data
+                .as_ref()
         {
-            row.probe_data = Some(crate::services::dubmux::minimal_probe(
-                &crate::services::dubmux::row_provider_pub(&row),
-            ));
+            let _ = db::Media::save_probe_data(db, &row.id, probe).await;
         }
         record_probe_verification(&row, true);
         let mut info = api::MediaSourceInfo::from(row.clone());

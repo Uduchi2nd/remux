@@ -761,6 +761,24 @@ pub(crate) fn row_provider_pub(row: &db::Media) -> String {
 /// as a guess plus the dub as the default `vie` track. Rows must never be
 /// live-probed (the master would start a mux and the result races the
 /// muxer), so every row carries SOME probe from the moment it exists.
+/// Give a legacy dub row (created before rows carried a track list) the
+/// minimal one it is presented with. PlaybackInfo used to build it on the fly
+/// without saving it, so the subtitle route saw no tracks and numbered the
+/// external subtitles from 0 while PlaybackInfo advertised them from 2 →
+/// "subtitle stream not found" and blank subtitles in VidHub (2026-09-28).
+/// Returns true when the row was filled (the caller persists it).
+pub(crate) fn fill_row_probe(row: &mut db::Media) -> bool {
+    if is_dubmux_row(row)
+        && row
+            .probe_data
+            .is_none()
+    {
+        row.probe_data = Some(minimal_probe(&row_provider_pub(row)));
+        return true;
+    }
+    false
+}
+
 pub(crate) fn minimal_probe(provider: &str) -> api::MediaSourceInfo {
     let mut base = api::MediaSourceInfo::default();
     base.media_streams = vec![MediaStream {
