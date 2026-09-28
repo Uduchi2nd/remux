@@ -164,6 +164,15 @@ struct PrepareReply {
 impl PrepareReply {
     /// The muxer decode-checked this pair's video (its copy of the release,
     /// or the first segments of a session built from it).
+    /// The muxer can serve this pair as one seekable file (`file.ts`).
+    fn file_ready(&self) -> bool {
+        self.result
+            .as_ref()
+            .and_then(|r| r.get("file_ready"))
+            .and_then(|v| v.as_bool())
+            == Some(true)
+    }
+
     fn video_checked(&self) -> bool {
         self.result
             .as_ref()
@@ -406,7 +415,22 @@ pub(crate) const SUBTITLE_INDEX_OFFSET: i64 = 100;
 
 /// Is this a muxer master-playlist path (a "[+VN dub]" row's source path)?
 pub(crate) fn is_mux_path(path: Option<&str>) -> bool {
-    path.is_some_and(|p| p.contains("/mux/") && p.contains("master.m3u8"))
+    path.is_some_and(|p| {
+        p.contains("/mux/") && (p.contains("master.m3u8") || p.contains("/file.ts"))
+    })
+}
+
+/// A muxer control URL (`/start`, `/touch`) for a dub row's media URL, which
+/// is either the HLS master or the seekable `file.ts`.
+fn mux_action_url(url: &str, action: &str) -> String {
+    let base = url
+        .split('?')
+        .next()
+        .unwrap_or(url);
+    match base.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{action}"),
+        None => base.to_string(),
+    }
 }
 
 /// The HQ release a "[+VN dub]" row was built from: the muxer URL carries it
@@ -618,10 +642,20 @@ pub(crate) async fn ensure_dub_rows(
                             .map(|(s, _)| s)
                     })
                     .unwrap_or("stream");
-                si.filename = Some(format!("{stem}.VNDub-{provider}.m3u8"));
+                // PATCH (uduchi2nd, 2026-09-28): a pair the muxer can serve as
+                // one seekable file (`file.ts`: fixed-size segment slots, a
+                // known size, byte ranges produced on demand) is handed out as
+                // that file — Infuse and VidHub then stream, seek AND download
+                // it like any other file. Otherwise the HLS playlist.
+                let (leaf, ext) = if reply.file_ready() {
+                    ("file.ts", "ts")
+                } else {
+                    ("master.m3u8", "m3u8")
+                };
+                si.filename = Some(format!("{stem}.VNDub-{provider}.{ext}"));
                 si.descriptor = StreamDescriptor::Http {
                     url: format!(
-                        "{}/mux/{dub_id}/{hq_id}/master.m3u8?video={}",
+                        "{}/mux/{dub_id}/{hq_id}/{leaf}?video={}",
                         cfg.public,
                         urlencoding::encode(hq_url)
                     ),
@@ -645,7 +679,13 @@ pub(crate) async fn ensure_dub_rows(
                     r.probe_data
                         .clone()
                 });
-            row.probe_data = Some(richer_probe(rebuilt, stored_probe));
+            let mut probe = richer_probe(rebuilt, stored_probe);
+            probe.container = Some(if reply.file_ready() {
+                VideoContainer::Ts
+            } else {
+                VideoContainer::Other("hls".into())
+            });
+            row.probe_data = Some(probe);
             rows.push(row);
             // HQ releases are walked in quality order, so the cap keeps the
             // best video and its dub variants (backups against a bad dub)
@@ -974,7 +1014,11 @@ pub(crate) fn prepare_on_open(ctx: &AppContext, media: &db::Media, user: Uuid) {
 /// Ask the muxer to start (or confirm) the mux behind a dub row's master URL
 /// without waiting for it. `url` must already point at the API host.
 pub(crate) async fn start_mux(url: &str, item: Uuid) {
-    let start = url.replacen("/master.m3u8", "/start", 1);
+    let start = mux_action_url(url, "start")
+        + url
+            .find('?')
+            .map(|i| &url[i..])
+            .unwrap_or("");
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(20))
@@ -1017,6 +1061,21 @@ mod tests {
         assert!(!is_asian_origin(None, Some("CN, US")));
         assert!(!is_asian_origin(None, None));
         assert!(!is_asian_origin(Some(""), Some("")));
+    }
+
+    #[test]
+    fn mux_action_urls_from_either_media_url() {
+        assert_eq!(
+            mux_action_url("https://m.example/mux/d/h/master.m3u8?video=x", "touch"),
+            "https://m.example/mux/d/h/touch"
+        );
+        assert_eq!(
+            mux_action_url("https://m.example/mux/d/h/file.ts?video=x", "start"),
+            "https://m.example/mux/d/h/start"
+        );
+        assert!(is_mux_path(Some("https://m.example/mux/d/h/file.ts?video=x")));
+        assert!(is_mux_path(Some("https://m.example/mux/d/h/master.m3u8")));
+        assert!(!is_mux_path(Some("https://cdn.example/a.ts")));
     }
 
     #[test]
@@ -1480,14 +1539,7 @@ async fn touch_muxes(ctx: &AppContext, item: Uuid, streams: &[db::Media]) {
         .filter(|s| is_dubmux_row(s))
         .filter_map(http_url)
     {
-        let touch = url
-            .replacen(cfg.public, cfg.api, 1)
-            .replacen("/master.m3u8", "/touch", 1);
-        let touch = touch
-            .split('?')
-            .next()
-            .unwrap_or(&touch)
-            .to_string();
+        let touch = mux_action_url(&url.replacen(cfg.public, cfg.api, 1), "touch");
         if let Err(e) = client
             .post(&touch)
             .send()
