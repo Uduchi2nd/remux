@@ -378,3 +378,32 @@ unchecked until their first session.
 series' (or movie's) original language (zh/ko/ja/th/… ; not vi), else its
 country (all listed countries Asian); unknown origin → none. Existing rows
 on other titles are deleted on the next stream load.
+
+## Seekable virtual file per pair (`file.ts`, 2026-09-28, `a42c79f5`)
+Why: Infuse downloads a dub row by fetching its media URL and saved the
+73-byte HLS master; its direct reader also never followed a master's
+variant. A file with a known size and byte ranges is what Infuse, VidHub and
+mpv (Fladder) all handle natively — stream, seek and download.
+How: `GET/HEAD /mux/{dub}/{hq}/file.ts?video=…` is ONE virtual MPEG-TS file.
+Every segment of the release's segment table owns a FIXED-SIZE slot, so the
+total size is known before anything is produced and a byte offset maps to a
+segment arithmetically. A range request produces its segments just in time
+(`_ensure_segment`, the same producer/seek machinery as HLS) and fills the
+rest of each slot with MPEG-TS null packets (PID 0x1FFF — skipped by every
+demuxer; 188-byte aligned because slots and segments are whole packets).
+Slot sizes: the release's own segment size (recorded in the segment table
+from the raw copy, `sizes`) + 3x the dub audio bytes for that duration +
+32 KB — measured over ~2,900 segments the dub adds 1.4–2.3x its audio bytes
+(TS wraps each small AAC frame in its own PES); or, when a finished session
+exists, its exact segment size + 16 KB (padding < 1 %). The layout is saved
+(`match/file-<pair>.json`) the first time and never changes, so a player
+never sees the size move. A segment that would overflow its slot is logged
+("overflows its slot") and truncated at the slot end.
+remux: `/prepare` and `/status` report `file_ready`; rows of such pairs get
+the `file.ts` URL and container `ts`, others keep `master.m3u8` (pairs made
+before segment sizes were recorded, until their first session finishes).
+Browser/AVPlayer clients cannot play a raw TS file — not supported by design
+(user decision: only Infuse/VidHub matter).
+Verified: Early Spring E01 (session layout) 808 MB, ffprobe 2615 s with vie +
+chi tracks, 1 MB range 0.9 s, seek to 20:00 decodes; Kung Fu Hustle (raw
+layout) 8.1 GB, 5976 s, no overflow.
