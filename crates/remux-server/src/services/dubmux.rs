@@ -641,7 +641,10 @@ pub(crate) async fn ensure_dub_rows(
             let stored_probe = stored
                 .iter()
                 .find(|r| r.id == row.id)
-                .and_then(|r| r.probe_data.clone());
+                .and_then(|r| {
+                    r.probe_data
+                        .clone()
+                });
             row.probe_data = Some(richer_probe(rebuilt, stored_probe));
             rows.push(row);
             // HQ releases are walked in quality order, so the cap keeps the
@@ -870,7 +873,11 @@ fn carried_rows(
             .as_ref()
             .map(|p| mux_probe(p, &provider))
             .unwrap_or_else(|| minimal_probe(&provider));
-        row.probe_data = Some(richer_probe(rebuilt, row.probe_data.take()));
+        row.probe_data = Some(richer_probe(
+            rebuilt,
+            row.probe_data
+                .take(),
+        ));
         if let Some(si) = row
             .stream_info
             .as_mut()
@@ -1017,20 +1024,35 @@ mod tests {
         let guess = minimal_probe("hotphim");
         let mut full = minimal_probe("hotphim");
         for i in 0..5 {
-            full.media_streams.push(MediaStream {
-                type_: Some(MediaStreamType::Subtitle),
-                index: 102 + i,
-                ..Default::default()
-            });
+            full.media_streams
+                .push(MediaStream {
+                    type_: Some(MediaStreamType::Subtitle),
+                    index: 102 + i,
+                    ..Default::default()
+                });
         }
         let n = full
             .media_streams
             .len();
-        assert_eq!(richer_probe(guess.clone(), Some(full.clone())).media_streams.len(), n);
-        assert_eq!(richer_probe(full.clone(), Some(guess.clone())).media_streams.len(), n);
         assert_eq!(
-            richer_probe(guess.clone(), None).media_streams.len(),
-            guess.media_streams.len()
+            richer_probe(guess.clone(), Some(full.clone()))
+                .media_streams
+                .len(),
+            n
+        );
+        assert_eq!(
+            richer_probe(full.clone(), Some(guess.clone()))
+                .media_streams
+                .len(),
+            n
+        );
+        assert_eq!(
+            richer_probe(guess.clone(), None)
+                .media_streams
+                .len(),
+            guess
+                .media_streams
+                .len()
         );
     }
 
