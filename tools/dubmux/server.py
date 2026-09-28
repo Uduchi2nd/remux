@@ -216,6 +216,29 @@ def _raw_ref(hq_id, k, add=True):
         return len(refs)
 
 
+class CorruptSource(RuntimeError):
+    """The release's video does not decode (damaged download or file)."""
+
+
+def _corrupt_video(d, samples=4, max_errors=4):
+    """Decode a few whole segments spread over a finished raw copy; return a
+    description when most of them produce decoder errors, else ''. A clean
+    HEVC/H.264 segment decodes with 0 errors (open-GOP leading pictures at a
+    segment start are dropped by the decoder, not reported)."""
+    segs = sorted(d.glob("seg*.ts"))
+    if len(segs) < 3:
+        return ""
+    picks = [segs[int(len(segs) * f)] for f in (0.1, 0.35, 0.6, 0.85)][:samples]
+    bad = 0
+    for seg in picks:
+        r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(seg), "-map", "0:v:0",
+                            "-f", "null", "-"], capture_output=True, timeout=300)
+        n = len([l for l in r.stderr.decode("utf8", "replace").splitlines() if l.strip()])
+        if r.returncode != 0 or n > max_errors:
+            bad += 1
+    return f"{bad}/{len(picks)} sampled segments fail to decode" if bad * 2 > len(picks) else ""
+
+
 def _raw_copy(hq_id, video_url, k, priority):
     """Pass 1 of the two-pass mux: stream-copy the release ONCE into a local
     HLS (video + every original audio track, no dub). Shared by every dub
@@ -263,6 +286,15 @@ def _raw_copy(hq_id, video_url, k, priority):
                       file=sys.stderr, flush=True)
                 shutil.rmtree(d, ignore_errors=True)
                 return None
+            bad = _corrupt_video(d)
+            if bad:
+                # 2026-09-28: Reacher S02E01 from Premiumize copied with a
+                # broken HEVC bitstream (green frames; players loaded a few
+                # MB and never started) while the same file from TorBox was
+                # clean. Never align or serve such a copy.
+                print(f"raw copy {hq_id}: corrupt video ({bad}), discarded", file=sys.stderr, flush=True)
+                shutil.rmtree(d, ignore_errors=True)
+                raise CorruptSource(bad)
             (d / ".done").write_text(str(int(time.time())))
             _record_segtab(hq_id, d)
             return d
@@ -442,7 +474,10 @@ def _prepare_worker(dub, video, k):
         _raw_ref(hq_id, k)
         if job["priority"] <= 99 and not (_raw_dir(hq_id) / ".done").exists():
             def _dl():
-                raw_box["dir"] = _raw_copy(hq_id, video["url"], k, job["priority"])
+                try:
+                    raw_box["dir"] = _raw_copy(hq_id, video["url"], k, job["priority"])
+                except CorruptSource as e:
+                    raw_box["corrupt"] = e
             raw_thread = threading.Thread(target=_dl, daemon=True)
             raw_thread.start()
         meta = AUDIO / f"{dub['id']}.json"
@@ -534,6 +569,8 @@ def _prepare_worker(dub, video, k):
                     else:
                         raw_thread.join()
                         raw_thread = None
+                        if raw_box.get("corrupt"):
+                            raise raw_box["corrupt"]
                     rd = raw_box.get("dir")
                     job["stage"] = "match:piecewise"
                     rep = align.align(video["url"], dubfile, str(MATCH), k,
@@ -569,7 +606,15 @@ def _prepare_worker(dub, video, k):
             if raw_thread is not None:
                 raw_thread.join()
                 raw_thread = None
+                if raw_box.get("corrupt"):
+                    raise raw_box["corrupt"]
             _start_mux(k, video["url"], dub["id"], result["lag"])
+    except CorruptSource as e:
+        result = {"dub": dub["id"], "video": video["id"], "verdict": "reject:corrupt-source",
+                  "detail": str(e), "created": int(time.time()), "align_version": ALIGN_VERSION,
+                  "video_url": video.get("url", "")}
+        json.dump(result, open(_match_path(k), "w"), indent=1)
+        job.update(status="rejected", stage="done", result=result)
     except Exception as e:  # noqa: BLE001
         print(f"prepare {k} failed at stage {job.get('stage')}: {str(e)[-600:]}",
               file=sys.stderr, flush=True)
@@ -579,6 +624,13 @@ def _prepare_worker(dub, video, k):
             MATCH_GATE.release(k)
         if raw_thread is not None:
             raw_thread.join()
+        if raw_box.get("corrupt") and job.get("status") == "ready":
+            result = {"dub": dub["id"], "video": video["id"], "verdict": "reject:corrupt-source",
+                      "detail": str(raw_box["corrupt"]), "created": int(time.time()),
+                      "align_version": ALIGN_VERSION, "video_url": video.get("url", "")}
+            json.dump(result, open(_match_path(k), "w"), indent=1)
+            job.update(status="rejected", result=result)
+            rejected = True
         _raw_release(hq_id, k, rejected)
         job["finished"] = time.time()
 
