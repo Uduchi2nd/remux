@@ -157,6 +157,86 @@ struct PrepareReply {
     status: String,
     #[serde(default)]
     stage: Option<String>,
+    #[serde(default)]
+    result: Option<serde_json::Value>,
+}
+
+impl PrepareReply {
+    /// The muxer decode-checked this pair's video (its copy of the release,
+    /// or the first segments of a session built from it).
+    fn video_checked(&self) -> bool {
+        self.result
+            .as_ref()
+            .and_then(|r| r.get("video_check"))
+            .and_then(|v| v.as_str())
+            == Some("ok")
+    }
+}
+
+/// PATCH (uduchi2nd, user decision 2026-09-28): the Vietnamese-dub mux is only
+/// for Asian-originated titles. Judged on the title's (for an episode: its
+/// series') original language, falling back to its country; unknown origin
+/// means no dub rows. Vietnamese originals are excluded (their audio already
+/// is Vietnamese).
+pub(crate) fn is_asian_origin(original_language: Option<&str>, country: Option<&str>) -> bool {
+    const LANGS: &[&str] = &[
+        "zh", "cn", "yue", "ko", "ja", "th", "id", "ms", "tl", "fil", "hi", "ta", "te", "ml",
+        "kn", "bn", "mr", "ur", "pa", "my", "km", "lo", "mn", "ne", "si",
+    ];
+    const COUNTRIES: &[&str] = &[
+        "CN", "HK", "TW", "MO", "KR", "KP", "JP", "TH", "ID", "MY", "SG", "PH", "IN", "PK", "BD",
+        "LK", "NP", "MM", "KH", "LA", "MN", "BT", "BN", "CHINA", "HONG KONG", "TAIWAN", "MACAU",
+        "SOUTH KOREA", "KOREA", "NORTH KOREA", "JAPAN", "THAILAND", "INDONESIA", "MALAYSIA",
+        "SINGAPORE", "PHILIPPINES", "INDIA", "PAKISTAN", "BANGLADESH", "SRI LANKA", "NEPAL",
+        "MYANMAR", "CAMBODIA", "LAOS", "MONGOLIA",
+    ];
+    if let Some(lang) = original_language
+        .map(|l| l.trim().to_ascii_lowercase())
+        .filter(|l| !l.is_empty())
+    {
+        let base = lang
+            .split(['-', '_'])
+            .next()
+            .unwrap_or("");
+        return LANGS.contains(&base);
+    }
+    // No language: the country field (codes or full names, comma-separated);
+    // every listed country must be Asian (a US/UK co-production does not
+    // qualify).
+    let Some(countries) = country
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    else {
+        return false;
+    };
+    let mut any = false;
+    for c in countries.split(',') {
+        let c = c
+            .trim()
+            .to_ascii_uppercase();
+        if c.is_empty() {
+            continue;
+        }
+        if !COUNTRIES.contains(&c.as_str()) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// The title whose origin decides: an episode's series, else the item itself.
+async fn origin_title(ctx: &AppContext, media: &db::Media) -> Option<db::Media> {
+    match media.kind {
+        db::MediaKind::Episode => match media.grandparent_id {
+            Some(id) => db::Media::get_by_id(&ctx.db, &id)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        },
+        _ => Some(media.clone()),
+    }
 }
 
 async fn prepare(
@@ -187,6 +267,29 @@ async fn prepare(
         .json::<PrepareReply>()
         .await?;
     Ok(reply)
+}
+
+/// Sources sort by idx ascending. Rows whose video the muxer has decode-
+/// checked go first (the first-built = best HQ release gets the most negative
+/// idx); unchecked rows go after every release, so a broken row is never a
+/// player's default. They move up once a check passes.
+const UNCHECKED_IDX_BASE: i64 = 100_000;
+
+fn order_rows(rows: &mut [db::Media], checked: &[Uuid]) {
+    let n_checked = rows
+        .iter()
+        .filter(|r| checked.contains(&r.id))
+        .count() as i64;
+    let (mut c, mut u) = (0_i64, 0_i64);
+    for row in rows.iter_mut() {
+        if checked.contains(&row.id) {
+            row.idx = Some(c - n_checked);
+            c += 1;
+        } else {
+            row.idx = Some(UNCHECKED_IDX_BASE + u);
+            u += 1;
+        }
+    }
 }
 
 /// Rebuild the HQ probe as the mux's track layout: video, then the dub as the
@@ -311,6 +414,23 @@ pub(crate) async fn ensure_dub_rows(
     if !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
         return vec![];
     }
+    let origin = origin_title(ctx, media).await;
+    if !origin
+        .as_ref()
+        .is_some_and(|t| is_asian_origin(t.original_language.as_deref(), t.country.as_deref()))
+    {
+        debug!(item = %media.id, "dubmux skipped: not an Asian-originated title");
+        // rows made before this rule (e.g. Reacher) go now
+        for row in existing_dub_rows(ctx, media).await {
+            if db::Media::delete(&ctx.db, &row.id)
+                .await
+                .is_ok()
+            {
+                info!(item = %media.id, row = %row.id, "dubmux row removed: title not Asian-originated");
+            }
+        }
+        return vec![];
+    }
     // Existing dub rows come from the DB, not from `streams`: on a refresh
     // the caller passes the freshly fetched addon list, which never
     // contains our synthetic rows (that is exactly when carry-over matters).
@@ -359,6 +479,7 @@ pub(crate) async fn ensure_dub_rows(
         .build()
         .unwrap_or_default();
     let mut rows = Vec::new();
+    let mut checked: Vec<Uuid> = Vec::new();
     let mut rejected: Vec<Uuid> = Vec::new();
     let mut wait = wait_secs;
     let mut failures = 0u32;
@@ -426,6 +547,9 @@ pub(crate) async fn ensure_dub_rows(
             }
             let mut row = hq.clone();
             row.id = row_id(media, dub_id, &hq.id);
+            if reply.video_checked() {
+                checked.push(row.id);
+            }
             row.parent_id = Some(media.id);
             row.idx = Some(-(rows.len() as i64) - 1);
             row.created_at = now;
@@ -499,18 +623,24 @@ pub(crate) async fn ensure_dub_rows(
             rows.push(row);
         }
     }
+    // A pair the muxer now rejects (e.g. its video turned out not to decode)
+    // loses its row immediately rather than at the next stream refresh — a
+    // broken row sorted first is every player's default choice.
+    for id in stored
+        .iter()
+        .map(|r| r.id)
+        .filter(|id| rejected.contains(id))
+    {
+        if let Err(e) = db::Media::delete(&ctx.db, &id).await {
+            warn!(item = %media.id, row = %id, "dubmux rejected row delete failed: {e:#}");
+        } else {
+            info!(item = %media.id, row = %id, "dubmux row removed: pair rejected");
+        }
+    }
     if rows.is_empty() {
         return rows;
     }
-    // Sources sort by idx ascending, so the first-built row (best HQ
-    // release) gets the most negative idx.
-    let n = rows.len() as i64;
-    for (i, row) in rows
-        .iter_mut()
-        .enumerate()
-    {
-        row.idx = Some(i as i64 - n);
-    }
+    order_rows(&mut rows, &checked);
     if let Err(e) = db::Media::upsert(&ctx.db, &rows).await {
         warn!(item = %media.id, "dubmux row upsert failed: {e:#}");
         return vec![];
@@ -762,6 +892,39 @@ pub(crate) async fn start_mux(url: &str, item: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asian_origin_by_language_then_country() {
+        assert!(is_asian_origin(Some("zh"), Some("CN")));
+        assert!(is_asian_origin(Some("ko"), None));
+        assert!(is_asian_origin(Some("ja"), Some("US")));
+        assert!(!is_asian_origin(Some("en"), Some("US")));
+        assert!(!is_asian_origin(Some("en"), Some("CN")));
+        assert!(!is_asian_origin(Some("vi"), Some("VN")));
+        assert!(is_asian_origin(None, Some("SOUTH KOREA")));
+        assert!(is_asian_origin(None, Some("CN, HK")));
+        assert!(!is_asian_origin(None, Some("UNITED KINGDOM, UNITED STATES OF AMERICA")));
+        assert!(!is_asian_origin(None, Some("CN, US")));
+        assert!(!is_asian_origin(None, None));
+        assert!(!is_asian_origin(Some(""), Some("")));
+    }
+
+    #[test]
+    fn unchecked_rows_sort_after_releases() {
+        let mk = |n: u128| {
+            let mut m = db::Media::default();
+            m.id = Uuid::from_u128(n);
+            m
+        };
+        let mut rows = vec![mk(1), mk(2), mk(3)];
+        order_rows(&mut rows, &[Uuid::from_u128(2)]);
+        assert_eq!(rows[1].idx, Some(-1));
+        assert_eq!(rows[0].idx, Some(UNCHECKED_IDX_BASE));
+        assert_eq!(rows[2].idx, Some(UNCHECKED_IDX_BASE + 1));
+        let mut rows = vec![mk(1), mk(2)];
+        order_rows(&mut rows, &[Uuid::from_u128(1), Uuid::from_u128(2)]);
+        assert_eq!((rows[0].idx, rows[1].idx), (Some(-2), Some(-1)));
+    }
 
     #[test]
     fn hq_candidate_accepts_extensionless_usenet_names_and_rejects_vn_sources() {
