@@ -35,6 +35,7 @@ RETENTION_DAYS = int(os.environ.get("DUBMUX_RETENTION_DAYS", "30"))
 HLS_BUDGET_GB = float(os.environ.get("DUBMUX_HLS_BUDGET_GB", "100"))
 WORKERS = int(os.environ.get("DUBMUX_FETCH_WORKERS", "128"))
 SEG_WAIT_S = 25
+PUBLIC_BASE = os.environ.get("DUBMUX_PUBLIC_BASE", "https://dubmux.geniallark.box.ca").rstrip("/")
 # A player GET on the master/index waits this long for the mux to finish so
 # it gets a VOD playlist (duration + seeking); an EVENT playlist is served
 # only when the mux is still running after that.
@@ -1198,6 +1199,10 @@ def master(dub_id: str, video_id: str, request: Request):
     # remux liveness checks (and item-doc probes) HEAD the master while a
     # viewer merely browses; only a GET — a player, or the deliberate
     # pre-mux — may start producing.
+    ua = request.headers.get("user-agent", "")
+    print(f"master {k[:8]}/{hq_id_of(k)[:8]} {request.method} ua={ua[:120]!r} "
+          f"range={request.headers.get('range', '')!r} accept={request.headers.get('accept', '')[:60]!r}",
+          file=sys.stderr, flush=True)
     if request.method == "HEAD":
         return Response(status_code=200, media_type="application/vnd.apple.mpegurl",
                         headers={"Cache-Control": "no-store"})
@@ -1224,7 +1229,13 @@ def master(dub_id: str, video_id: str, request: Request):
         # rather than building a session on a placeholder video
         raise HTTPException(503, f"source temporarily unavailable: {e}", headers={"Retry-After": "60"})
     (d / ".touched").write_text(str(int(time.time())))
-    body = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=20000000\nindex.m3u8\n"
+    # ABSOLUTE variant URL: remux serves this master INLINE from its own
+    # /videos/{id}/stream route (Infuse plays only that way), and a relative
+    # "index.m3u8" then resolved against remux → 404 → Infuse "Server didn't
+    # report the size of the file" (2026-09-28). Segments stay relative to
+    # the index, which is always fetched from here.
+    body = ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=20000000\n"
+            f"{PUBLIC_BASE}/mux/{dub_id}/{video_id}/index.m3u8\n")
     return Response(body, media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-store"})
 
