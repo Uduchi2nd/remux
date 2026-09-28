@@ -19,7 +19,7 @@ import asyncio, hashlib, json, os, re, shutil, subprocess, sys, threading, time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dubmux  # noqa: E402
@@ -648,6 +648,8 @@ def _prepare_worker(dub, video, k):
             _index_put(origin, hq_name, k, result["verdict"])
         if result["verdict"] == "accept":
             result["video_check"] = _video_check(k) or ("ok" if (_raw_dir(hq_id) / ".video_ok").exists() else None)
+            json.dump(result, open(_match_path(k), "w"), indent=1)
+            result["file_ready"] = _file_layout(k, dub["id"]) is not None
         job.update(status="ready" if result["verdict"] == "accept" else "rejected",
                    stage="done", result=result)
         # Playing / next episode + accepted: the raw copy is (being)
@@ -701,6 +703,7 @@ async def prepare(req: Request):
     if cached:
         if cached["verdict"] == "accept":
             cached["video_check"] = _video_check(k)
+            cached["file_ready"] = _file_layout(k, k.split("__", 1)[0]) is not None
         return {"status": "ready" if cached["verdict"] == "accept" else "rejected",
                 "stage": "done", "result": cached, "cached": True}
     # Lower = sooner. remux sends 0 for the episode being played, ~100+ for
@@ -749,6 +752,7 @@ def status(dub_id: str, video_id: str):
     if cached:
         if cached["verdict"] == "accept":
             cached["video_check"] = _video_check(k)
+            cached["file_ready"] = _file_layout(k, k.split("__", 1)[0]) is not None
         return {"status": "ready" if cached["verdict"] == "accept" else "rejected",
                 "stage": "done", "result": cached, "cached": True}
     return {"status": "unknown"}
@@ -844,7 +848,8 @@ def _record_segtab(hq_id, raw_dir):
     origin = _start_time(str(src))
     if origin is None:
         return
-    json.dump({"v": 3, "starts": starts, "last": durs[-1], "origin": origin,
+    sizes = [(raw_dir / n).stat().st_size for n in names]
+    json.dump({"v": 3, "starts": starts, "last": durs[-1], "origin": origin, "sizes": sizes,
                **({"video_check": "ok"} if (raw_dir / ".video_ok").exists() else {})},
               open(_segtab_path(hq_id), "w"))
 
@@ -911,7 +916,7 @@ def _touch_pair(k, dub_id):
     now = None
     m = _load_match(k) or {}
     extra = [MATCH / m["aligned"], MATCH / (m["aligned"][:-4] + ".json")] if m.get("aligned") else []
-    for f in (AUDIO / f"{dub_id}.m4a", AUDIO / f"{dub_id}.json", _match_path(k),
+    for f in (AUDIO / f"{dub_id}.m4a", AUDIO / f"{dub_id}.json", _match_path(k), _file_layout_path(k),
               MATCH / f"{k}.aligned.m4a", _segtab_path(hq_id_of(k)), *extra):
         if f.exists():
             os.utime(f, now)
@@ -1206,6 +1211,30 @@ def master(dub_id: str, video_id: str, request: Request):
     if request.method == "HEAD":
         return Response(status_code=200, media_type="application/vnd.apple.mpegurl",
                         headers={"Cache-Control": "no-store"})
+    d = _open_session(k, dub_id, m, video_url)
+    (d / ".touched").write_text(str(int(time.time())))
+    # Serve the MEDIA playlist itself (absolute segment URLs), not a master
+    # pointing at index.m3u8: Infuse fetches this URL with its direct reader
+    # (Range: bytes=0-, no User-Agent) — or inline through remux's
+    # /videos/{id}/stream — and never followed the master's variant
+    # (2026-09-28: "An error occurred loading this content"); vnphim's
+    # media playlists play there. VidHub and other HLS players accept a media
+    # playlist at this URL just as well.
+    idx = d / "index.m3u8"
+    if not _wait_for(idx, SEG_WAIT_S):
+        raise HTTPException(503, "mux not started", headers={"Retry-After": "5"})
+    text = idx.read_text()
+    if (d / ".done").exists():
+        text = text.replace("#EXT-X-PLAYLIST-TYPE:EVENT", "#EXT-X-PLAYLIST-TYPE:VOD", 1)
+    base = f"{PUBLIC_BASE}/mux/{dub_id}/{video_id}/"
+    body = "\n".join(base + l if l.startswith("seg") else l for l in text.splitlines()) + "\n"
+    return Response(body, media_type="application/vnd.apple.mpegurl",
+                    headers={"Cache-Control": "no-store"})
+
+
+def _open_session(k, dub_id, m, video_url):
+    """Make sure the pair's play session exists (JIT or finished); returns its
+    directory. Shared by the playlist and the seekable-file endpoints."""
     d = _session_dir(k)
     if (d / ".done").exists() and not _session_consistent(d):
         # a finished session whose playlist does not describe its segments
@@ -1228,24 +1257,7 @@ def master(dub_id: str, video_id: str, request: Request):
         # the release's resolver is rate-limiting: tell the player to retry
         # rather than building a session on a placeholder video
         raise HTTPException(503, f"source temporarily unavailable: {e}", headers={"Retry-After": "60"})
-    (d / ".touched").write_text(str(int(time.time())))
-    # Serve the MEDIA playlist itself (absolute segment URLs), not a master
-    # pointing at index.m3u8: Infuse fetches this URL with its direct reader
-    # (Range: bytes=0-, no User-Agent) — or inline through remux's
-    # /videos/{id}/stream — and never followed the master's variant
-    # (2026-09-28: "An error occurred loading this content"); vnphim's
-    # media playlists play there. VidHub and other HLS players accept a media
-    # playlist at this URL just as well.
-    idx = d / "index.m3u8"
-    if not _wait_for(idx, SEG_WAIT_S):
-        raise HTTPException(503, "mux not started", headers={"Retry-After": "5"})
-    text = idx.read_text()
-    if (d / ".done").exists():
-        text = text.replace("#EXT-X-PLAYLIST-TYPE:EVENT", "#EXT-X-PLAYLIST-TYPE:VOD", 1)
-    base = f"{PUBLIC_BASE}/mux/{dub_id}/{video_id}/"
-    body = "\n".join(base + l if l.startswith("seg") else l for l in text.splitlines()) + "\n"
-    return Response(body, media_type="application/vnd.apple.mpegurl",
-                    headers={"Cache-Control": "no-store"})
+    return d
 
 
 def _session_consistent(d):
@@ -1325,18 +1337,13 @@ def index(dub_id: str, video_id: str, request: Request):
                     headers={"Cache-Control": "no-store"})
 
 
-@app.api_route("/mux/{dub_id}/{video_id}/{seg}", methods=["GET", "HEAD"])
-def segment(dub_id: str, video_id: str, seg: str, request: Request):
-    k = _key(_check_id(dub_id), _check_id(video_id))
-    if not re.match(r"^seg\d{5}\.ts$", seg):
-        raise HTTPException(404)
+def _ensure_segment(k, dub_id, n):
+    """Path of segment n of the pair's session, producing it just in time
+    (restarting the producer on a far seek). Raises HTTPException."""
     d = _session_dir(k)
-    p = d / seg
-    if request.method == "HEAD":
-        return Response(status_code=200 if p.exists() else 404, media_type="video/mp2t")
+    seg = f"seg{n:05d}.ts"
     if not _seg_ready(d, seg, k):
         if (d / ".jit").exists() and not (d / ".done").exists():
-            n = int(seg[3:8])
             meta = json.loads((d / ".jit").read_text())
             m = _load_match(k) or {}
             tab = _segtab(meta["hq"])
@@ -1357,6 +1364,171 @@ def segment(dub_id: str, video_id: str, seg: str, request: Request):
                 raise HTTPException(503, "segment not produced yet")
             time.sleep(0.2)
     (d / ".touched").write_text(str(int(time.time())))
+    return d / seg
+
+
+# ---------------------------------------------------------- seekable file ---
+# One virtual MPEG-TS file per pair (2026-09-28): every segment gets a
+# FIXED-SIZE slot, so the file has an exact size before anything is produced
+# and a byte offset maps to a segment arithmetically. A requested range is
+# served by producing its segments just in time and filling the rest of each
+# slot with MPEG-TS null packets (PID 0x1FFF — every demuxer skips them).
+# Infuse and VidHub then stream, seek AND download a dub row like any file.
+# Slot = the release's own segment + 3x the dub audio's bytes + 32 KB
+# (measured: +1.4..2.3x over ~2,900 segments — TS wraps each small AAC frame
+# in its own PES), or a finished session's exact segment + 16 KB. The layout
+# is computed once and SAVED: a file's size never changes under a player.
+TS_NULL = b"\x47\x1f\xff\x10" + b"\xff" * 184
+FILE_DUB_FACTOR = 3.0
+FILE_SLOT_MARGIN = 32768
+
+
+def _file_layout_path(k):
+    return MATCH / f"file-{k}.json"
+
+
+def _file_layout(k, dub_id, create=True):
+    """(offsets, slots, total) of the pair's virtual file, or None when its
+    segment sizes are not known yet (then the playlist is used)."""
+    p = _file_layout_path(k)
+    try:
+        lay = json.load(open(p))
+        slots = lay["slots"]
+    except Exception:  # noqa: BLE001
+        if not create:
+            return None
+        hq = hq_id_of(k)
+        tab = _segtab(hq)
+        if tab is None:
+            return None
+        starts, durs, _origin = tab
+        n = len(durs)
+        d = _session_dir(k)
+        sizes = None
+        src = None
+        segs = [d / f"seg{i:05d}.ts" for i in range(n)]
+        if (d / ".done").exists() and all(x.exists() for x in segs):
+            sizes = [x.stat().st_size + 16384 for x in segs]
+            src = "session"
+        else:
+            try:
+                raw_sizes = json.load(open(_segtab_path(hq))).get("sizes")
+            except Exception:  # noqa: BLE001
+                raw_sizes = None
+            if raw_sizes and len(raw_sizes) == n:
+                dubfile, _lag = _dub_input(k, dub_id, 0.0)
+                try:
+                    rate = os.path.getsize(dubfile) / max(1.0, starts[-1] - starts[0] + durs[-1])
+                except OSError:
+                    return None
+                sizes = [r + int(FILE_DUB_FACTOR * rate * du) + FILE_SLOT_MARGIN
+                         for r, du in zip(raw_sizes, durs)]
+                src = "raw"
+        if sizes is None:
+            return None
+        slots = [(x + 187) // 188 * 188 for x in sizes]
+        json.dump({"slots": slots, "from": src, "created": int(time.time())}, open(p, "w"))
+    offs, t = [], 0
+    for sl in slots:
+        offs.append(t)
+        t += sl
+    return offs, slots, t
+
+
+def _parse_range(h, total):
+    if not h or not h.startswith("bytes="):
+        return None
+    spec = h[6:].split(",")[0].strip()
+    a, _, b = spec.partition("-")
+    if a == "":
+        n = int(b)
+        return max(0, total - n), total - 1
+    a = int(a)
+    b = int(b) if b else total - 1
+    return a, min(b, total - 1)
+
+
+@app.api_route("/mux/{dub_id}/{video_id}/file.ts", methods=["GET", "HEAD"])
+def seekable_file(dub_id: str, video_id: str, request: Request):
+    k = _key(_check_id(dub_id), _check_id(video_id))
+    m = _load_match(k)
+    if not m or m.get("verdict") != "accept":
+        raise HTTPException(409, "dub not prepared or rejected for this source")
+    lay = _file_layout(k, dub_id)
+    if lay is None:
+        raise HTTPException(404, "not available as a file yet (use master.m3u8)")
+    offs, slots, total = lay
+    rng = _parse_range(request.headers.get("range", ""), total)
+    if rng and (rng[0] >= total or rng[0] > rng[1]):
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+    a, b = rng if rng else (0, total - 1)
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(b - a + 1),
+               "Cache-Control": "private, max-age=3600"}
+    if rng:
+        headers["Content-Range"] = f"bytes {a}-{b}/{total}"
+    status = 206 if rng else 200
+    if request.method == "HEAD":
+        return Response(status_code=status, headers=headers, media_type="video/mp2t")
+    video_url = request.query_params.get("video") or m.get("video_url")
+    if not video_url:
+        raise HTTPException(400, "video url required (query ?video=)")
+    _open_session(k, dub_id, m, video_url)
+    # first segment of the range is produced BEFORE the response starts, so
+    # a producer failure is a proper HTTP error rather than a cut body
+    import bisect
+    first = bisect.bisect_right(offs, a) - 1
+    first_path = _ensure_segment(k, dub_id, first)
+
+    def body():
+        pos = a
+        i = first
+        path = first_path
+        while pos <= b and i < len(slots):
+            if path is None:
+                try:
+                    path = _ensure_segment(k, dub_id, i)
+                except HTTPException:
+                    return          # client retries the remaining range
+            size = path.stat().st_size
+            if size > slots[i]:
+                print(f"file {k}: segment {i} ({size} B) overflows its slot ({slots[i]} B)",
+                      file=sys.stderr, flush=True)
+            lo = pos - offs[i]
+            hi = min(b - offs[i], slots[i] - 1)
+            if lo < size:
+                with open(path, "rb") as f:
+                    f.seek(lo)
+                    left = min(hi, size - 1) - lo + 1
+                    while left > 0:
+                        chunk = f.read(min(1 << 20, left))
+                        if not chunk:
+                            break
+                        left -= len(chunk)
+                        yield chunk
+                lo = min(hi, size - 1) + 1 if size - 1 >= lo else lo
+            if lo <= hi:
+                # null packets from the slot's padding; the slot and the
+                # segment are both multiples of 188, so this stays aligned
+                pad = hi - max(lo, size) + 1
+                start_in_pkt = (max(lo, size)) % 188
+                buf = (TS_NULL * ((pad + start_in_pkt) // 188 + 2))[start_in_pkt:start_in_pkt + pad]
+                yield buf
+            pos = offs[i] + hi + 1
+            i += 1
+            path = None
+    return StreamingResponse(body(), status_code=status, headers=headers, media_type="video/mp2t")
+
+
+@app.api_route("/mux/{dub_id}/{video_id}/{seg}", methods=["GET", "HEAD"])
+def segment(dub_id: str, video_id: str, seg: str, request: Request):
+    k = _key(_check_id(dub_id), _check_id(video_id))
+    if not re.match(r"^seg\d{5}\.ts$", seg):
+        raise HTTPException(404)
+    d = _session_dir(k)
+    p = d / seg
+    if request.method == "HEAD":
+        return Response(status_code=200 if p.exists() else 404, media_type="video/mp2t")
+    p = _ensure_segment(k, dub_id, int(seg[3:8]))
     return FileResponse(str(p), media_type="video/mp2t",
                         headers={"Cache-Control": "private, max-age=3600"})
 
