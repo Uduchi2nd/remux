@@ -1229,13 +1229,21 @@ def master(dub_id: str, video_id: str, request: Request):
         # rather than building a session on a placeholder video
         raise HTTPException(503, f"source temporarily unavailable: {e}", headers={"Retry-After": "60"})
     (d / ".touched").write_text(str(int(time.time())))
-    # ABSOLUTE variant URL: remux serves this master INLINE from its own
-    # /videos/{id}/stream route (Infuse plays only that way), and a relative
-    # "index.m3u8" then resolved against remux → 404 → Infuse "Server didn't
-    # report the size of the file" (2026-09-28). Segments stay relative to
-    # the index, which is always fetched from here.
-    body = ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=20000000\n"
-            f"{PUBLIC_BASE}/mux/{dub_id}/{video_id}/index.m3u8\n")
+    # Serve the MEDIA playlist itself (absolute segment URLs), not a master
+    # pointing at index.m3u8: Infuse fetches this URL with its direct reader
+    # (Range: bytes=0-, no User-Agent) — or inline through remux's
+    # /videos/{id}/stream — and never followed the master's variant
+    # (2026-09-28: "An error occurred loading this content"); vnphim's
+    # media playlists play there. VidHub and other HLS players accept a media
+    # playlist at this URL just as well.
+    idx = d / "index.m3u8"
+    if not _wait_for(idx, SEG_WAIT_S):
+        raise HTTPException(503, "mux not started", headers={"Retry-After": "5"})
+    text = idx.read_text()
+    if (d / ".done").exists():
+        text = text.replace("#EXT-X-PLAYLIST-TYPE:EVENT", "#EXT-X-PLAYLIST-TYPE:VOD", 1)
+    base = f"{PUBLIC_BASE}/mux/{dub_id}/{video_id}/"
+    body = "\n".join(base + l if l.startswith("seg") else l for l in text.splitlines()) + "\n"
     return Response(body, media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-store"})
 
