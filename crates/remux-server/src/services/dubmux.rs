@@ -178,20 +178,66 @@ impl PrepareReply {
 /// series') original language, falling back to its country; unknown origin
 /// means no dub rows. Vietnamese originals are excluded (their audio already
 /// is Vietnamese).
-pub(crate) fn is_asian_origin(original_language: Option<&str>, country: Option<&str>) -> bool {
+pub(crate) fn is_asian_origin(
+    original_language: Option<&str>,
+    country: Option<&str>,
+) -> bool {
     const LANGS: &[&str] = &[
-        "zh", "cn", "yue", "ko", "ja", "th", "id", "ms", "tl", "fil", "hi", "ta", "te", "ml",
-        "kn", "bn", "mr", "ur", "pa", "my", "km", "lo", "mn", "ne", "si",
+        "zh", "cn", "yue", "ko", "ja", "th", "id", "ms", "tl", "fil", "hi", "ta", "te",
+        "ml", "kn", "bn", "mr", "ur", "pa", "my", "km", "lo", "mn", "ne", "si",
     ];
     const COUNTRIES: &[&str] = &[
-        "CN", "HK", "TW", "MO", "KR", "KP", "JP", "TH", "ID", "MY", "SG", "PH", "IN", "PK", "BD",
-        "LK", "NP", "MM", "KH", "LA", "MN", "BT", "BN", "CHINA", "HONG KONG", "TAIWAN", "MACAU",
-        "SOUTH KOREA", "KOREA", "NORTH KOREA", "JAPAN", "THAILAND", "INDONESIA", "MALAYSIA",
-        "SINGAPORE", "PHILIPPINES", "INDIA", "PAKISTAN", "BANGLADESH", "SRI LANKA", "NEPAL",
-        "MYANMAR", "CAMBODIA", "LAOS", "MONGOLIA",
+        "CN",
+        "HK",
+        "TW",
+        "MO",
+        "KR",
+        "KP",
+        "JP",
+        "TH",
+        "ID",
+        "MY",
+        "SG",
+        "PH",
+        "IN",
+        "PK",
+        "BD",
+        "LK",
+        "NP",
+        "MM",
+        "KH",
+        "LA",
+        "MN",
+        "BT",
+        "BN",
+        "CHINA",
+        "HONG KONG",
+        "TAIWAN",
+        "MACAU",
+        "SOUTH KOREA",
+        "KOREA",
+        "NORTH KOREA",
+        "JAPAN",
+        "THAILAND",
+        "INDONESIA",
+        "MALAYSIA",
+        "SINGAPORE",
+        "PHILIPPINES",
+        "INDIA",
+        "PAKISTAN",
+        "BANGLADESH",
+        "SRI LANKA",
+        "NEPAL",
+        "MYANMAR",
+        "CAMBODIA",
+        "LAOS",
+        "MONGOLIA",
     ];
     if let Some(lang) = original_language
-        .map(|l| l.trim().to_ascii_lowercase())
+        .map(|l| {
+            l.trim()
+                .to_ascii_lowercase()
+        })
         .filter(|l| !l.is_empty())
     {
         let base = lang
@@ -417,7 +463,14 @@ pub(crate) async fn ensure_dub_rows(
     let origin = origin_title(ctx, media).await;
     if !origin
         .as_ref()
-        .is_some_and(|t| is_asian_origin(t.original_language.as_deref(), t.country.as_deref()))
+        .is_some_and(|t| {
+            is_asian_origin(
+                t.original_language
+                    .as_deref(),
+                t.country
+                    .as_deref(),
+            )
+        })
     {
         debug!(item = %media.id, "dubmux skipped: not an Asian-originated title");
         // rows made before this rule (e.g. Reacher) go now
@@ -903,7 +956,10 @@ mod tests {
         assert!(!is_asian_origin(Some("vi"), Some("VN")));
         assert!(is_asian_origin(None, Some("SOUTH KOREA")));
         assert!(is_asian_origin(None, Some("CN, HK")));
-        assert!(!is_asian_origin(None, Some("UNITED KINGDOM, UNITED STATES OF AMERICA")));
+        assert!(!is_asian_origin(
+            None,
+            Some("UNITED KINGDOM, UNITED STATES OF AMERICA")
+        ));
         assert!(!is_asian_origin(None, Some("CN, US")));
         assert!(!is_asian_origin(None, None));
         assert!(!is_asian_origin(Some(""), Some("")));
