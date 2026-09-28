@@ -120,6 +120,36 @@ def resolve_url(url, timeout=20, background=False):
     return final
 
 
+_codecs: dict = {}
+
+
+def video_codec(url):
+    """Codec name of the first video stream (cached per URL), or None."""
+    if url in _codecs:
+        return _codecs[url]
+    try:
+        out = run(["ffprobe", "-v", "error", *ua_for(url), "-select_streams", "v:0", "-show_entries",
+                   "stream=codec_name", "-of", "csv=p=0", url], timeout=120).stdout.decode().strip()
+    except Exception:  # noqa: BLE001
+        return None
+    _codecs[url] = out.split(",")[0].strip() or None
+    return _codecs[url]
+
+
+# Rewrite the video's parameter sets from the stream itself before packaging
+# into MPEG-TS. Some releases (Amazon HDR10+/Dolby Vision HEVC, e.g. Reacher)
+# carry DIFFERENT parameter sets in the container header than in-band; the
+# MPEG-TS muxer's automatic mp4->Annex-B conversion then inserts the header
+# set before every keyframe and the decoder produces green/black corruption
+# (97 errors in 30 s; 0 with this rewrite; fMP4/MKV were unaffected).
+_REWRITE = {"hevc": "hevc_metadata", "h264": "h264_metadata"}
+
+
+def ts_video_bsf(url):
+    bsf = _REWRITE.get(video_codec(url) or "")
+    return ["-bsf:v", bsf] if bsf else []
+
+
 def ffprobe_duration(url):
     out = run(["ffprobe", "-v", "error", *ua_for(url), "-show_entries",
                "format=duration", "-of", "csv=p=0", url]).stdout.decode().strip()

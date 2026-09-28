@@ -216,6 +216,54 @@ def _raw_ref(hq_id, k, add=True):
         return len(refs)
 
 
+def _video_check(k):
+    """"ok" when this pair's video is known to decode (its raw copy passed the
+    decode check, or a session's first segments did), else None. remux lists
+    a dub row first only when "ok" (an unchecked row goes after the
+    releases, so a broken one is never a player's default)."""
+    m = _load_match(k) or {}
+    if m.get("video_check"):
+        return m["video_check"]
+    try:
+        return json.load(open(_segtab_path(hq_id_of(k)))).get("video_check")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _set_video_check(k, value):
+    p = _match_path(k)
+    try:
+        m = json.load(open(p))
+    except Exception:  # noqa: BLE001
+        return
+    m["video_check"] = value
+    json.dump(m, open(p, "w"), indent=1)
+
+
+def _reject_corrupt(k, detail):
+    """Turn an accepted pair into a (cached, expiring) corrupt-source reject."""
+    p = _match_path(k)
+    try:
+        m = json.load(open(p))
+    except Exception:  # noqa: BLE001
+        m = {}
+    m.update(verdict="reject:corrupt-source", detail=detail, created=int(time.time()),
+             align_version=ALIGN_VERSION)
+    m.pop("video_check", None)
+    json.dump(m, open(p, "w"), indent=1)
+    job = _jobs.get(k)
+    if job:
+        job.update(status="rejected", result=m)
+    print(f"pair {k}: corrupt source ({detail}), rejected", file=sys.stderr, flush=True)
+
+
+def _segment_decodes(path, max_errors=4):
+    r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", "0:v:0",
+                        "-f", "null", "-"], capture_output=True, timeout=300)
+    n = len([l for l in r.stderr.decode("utf8", "replace").splitlines() if l.strip()])
+    return r.returncode == 0 and n <= max_errors
+
+
 class CorruptSource(RuntimeError):
     """The release's video does not decode (damaged download or file)."""
 
@@ -259,6 +307,7 @@ def _raw_copy(hq_id, video_url, k, priority):
             (d / ".touched").write_text(str(int(time.time())))
             cmd = ["ffmpeg", "-nostdin", "-y", "-v", "error", *dubmux.ua_for(video_url),
                    "-i", video_url, "-map", "0:v:0", "-map", "0:a?", "-sn", "-c", "copy",
+                   *dubmux.ts_video_bsf(video_url),
                    "-f", "hls", "-hls_time", "6", "-hls_playlist_type", "vod",
                    "-hls_flags", "temp_file+independent_segments",
                    "-hls_segment_filename", str(d / "seg%05d.ts"), str(d / "index.m3u8")]
@@ -295,6 +344,7 @@ def _raw_copy(hq_id, video_url, k, priority):
                 print(f"raw copy {hq_id}: corrupt video ({bad}), discarded", file=sys.stderr, flush=True)
                 shutil.rmtree(d, ignore_errors=True)
                 raise CorruptSource(bad)
+            (d / ".video_ok").write_text(str(int(time.time())))
             (d / ".done").write_text(str(int(time.time())))
             _record_segtab(hq_id, d)
             return d
@@ -595,6 +645,8 @@ def _prepare_worker(dub, video, k):
         json.dump(result, open(_match_path(k), "w"), indent=1)
         if origin and hq_name:
             _index_put(origin, hq_name, k, result["verdict"])
+        if result["verdict"] == "accept":
+            result["video_check"] = _video_check(k) or ("ok" if (_raw_dir(hq_id) / ".video_ok").exists() else None)
         job.update(status="ready" if result["verdict"] == "accept" else "rejected",
                    stage="done", result=result)
         # Playing / next episode + accepted: the raw copy is (being)
@@ -646,6 +698,8 @@ async def prepare(req: Request):
     k = _key(dub["id"], video["id"])
     cached = _load_match(k)
     if cached:
+        if cached["verdict"] == "accept":
+            cached["video_check"] = _video_check(k)
         return {"status": "ready" if cached["verdict"] == "accept" else "rejected",
                 "stage": "done", "result": cached, "cached": True}
     # Lower = sooner. remux sends 0 for the episode being played, ~100+ for
@@ -692,6 +746,8 @@ def status(dub_id: str, video_id: str):
     if k in _jobs:
         return _jobs[k]
     if cached:
+        if cached["verdict"] == "accept":
+            cached["video_check"] = _video_check(k)
         return {"status": "ready" if cached["verdict"] == "accept" else "rejected",
                 "stage": "done", "result": cached, "cached": True}
     return {"status": "unknown"}
@@ -787,7 +843,8 @@ def _record_segtab(hq_id, raw_dir):
     origin = _start_time(str(src))
     if origin is None:
         return
-    json.dump({"v": 3, "starts": starts, "last": durs[-1], "origin": origin},
+    json.dump({"v": 3, "starts": starts, "last": durs[-1], "origin": origin,
+               **({"video_check": "ok"} if (raw_dir / ".video_ok").exists() else {})},
               open(_segtab_path(hq_id), "w"))
 
 
@@ -928,6 +985,7 @@ def _jit_cmd(k, src, remote, dubfile, lag, tab, start_seg, d):
             "-copyts", *seek_v, "-i", src,
             "-copyts", *seek_d, "-itsoffset", f"{shift:.6f}", "-i", dubfile,
             "-map", "0:v:0", "-map", "1:a:0", "-map", "0:a?", "-sn", "-c", "copy",
+            *(dubmux.ts_video_bsf(src) if remote else ()),
             "-metadata:s:a:0", "language=vie", "-metadata:s:a:0", "title=Tiếng Việt (Thuyết Minh)",
             "-disposition:a:0", "default", "-muxdelay", "0", "-muxpreload", "0",
             "-f", "segment", "-segment_format", "mpegts", "-segment_times", times,
@@ -991,6 +1049,22 @@ def _jit_start(k, video_url, dub_id, lag, tab, start_seg=0, end_seg=None):
         _producers[k] = prod
         _touch_pair(k, dub_id)
 
+    checking = {"moved": [], "started": _video_check(k) is not None}
+
+    def session_check(paths):
+        # A session whose pair was never decode-checked (built from the remote
+        # file, or from a raw copy made before the check existed): decode its
+        # first segments; if they are corrupt, stop the session and reject the
+        # pair so remux drops the row. Local work only — no debrid request.
+        bad = sum(1 for p in paths if not _segment_decodes(p))
+        if bad == len(paths):
+            _reject_corrupt(k, f"session segments {', '.join(p.name for p in paths)} do not decode")
+            (d / ".failed").write_text("corrupt-source")
+            if proc.poll() is None:
+                proc.kill()
+        else:
+            _set_video_check(k, "ok")
+
     def move_ready(final):
         names = _listed(rd)
         if final and proc.returncode == 0:
@@ -1001,6 +1075,12 @@ def _jit_start(k, video_url, dub_id, lag, tab, start_seg=0, end_seg=None):
             if f.exists():
                 os.replace(f, d / name)
                 prod["cursor"] = max(prod["cursor"], int(name[3:8]))
+                if not checking["started"]:
+                    checking["moved"].append(d / name)
+                    if len(checking["moved"]) >= 2:
+                        checking["started"] = True
+                        threading.Thread(target=session_check, args=(list(checking["moved"]),),
+                                         daemon=True).start()
 
     def runner():
         while proc.poll() is None:
