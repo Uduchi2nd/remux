@@ -649,7 +649,9 @@ def _prepare_worker(dub, video, k):
         if result["verdict"] == "accept":
             result["video_check"] = _video_check(k) or ("ok" if (_raw_dir(hq_id) / ".video_ok").exists() else None)
             json.dump(result, open(_match_path(k), "w"), indent=1)
-            result["file_ready"] = _file_layout(k, dub["id"]) is not None
+            lay = _file_layout(k, dub["id"])
+            result["file_ready"] = lay is not None
+            result["file_size"] = lay[2] if lay else None
         job.update(status="ready" if result["verdict"] == "accept" else "rejected",
                    stage="done", result=result)
         # Playing / next episode + accepted: the raw copy is (being)
@@ -703,7 +705,9 @@ async def prepare(req: Request):
     if cached:
         if cached["verdict"] == "accept":
             cached["video_check"] = _video_check(k)
-            cached["file_ready"] = _file_layout(k, k.split("__", 1)[0]) is not None
+            lay = _file_layout(k, k.split("__", 1)[0])
+            cached["file_ready"] = lay is not None
+            cached["file_size"] = lay[2] if lay else None
         return {"status": "ready" if cached["verdict"] == "accept" else "rejected",
                 "stage": "done", "result": cached, "cached": True}
     # Lower = sooner. remux sends 0 for the episode being played, ~100+ for
@@ -752,7 +756,9 @@ def status(dub_id: str, video_id: str):
     if cached:
         if cached["verdict"] == "accept":
             cached["video_check"] = _video_check(k)
-            cached["file_ready"] = _file_layout(k, k.split("__", 1)[0]) is not None
+            lay = _file_layout(k, k.split("__", 1)[0])
+            cached["file_ready"] = lay is not None
+            cached["file_size"] = lay[2] if lay else None
         return {"status": "ready" if cached["verdict"] == "accept" else "rejected",
                 "stage": "done", "result": cached, "cached": True}
     return {"status": "unknown"}
