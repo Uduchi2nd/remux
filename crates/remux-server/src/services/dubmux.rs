@@ -633,12 +633,16 @@ pub(crate) async fn ensure_dub_rows(
             // list (dub first, default) from the moment it exists; the next
             // refresh rebuilds it from the HQ's real probe. Without it a
             // just-created row showed no Vietnamese track until then.
-            row.probe_data = Some(
-                hq.probe_data
-                    .as_ref()
-                    .map(|p| mux_probe(p, provider))
-                    .unwrap_or_else(|| minimal_probe(provider)),
-            );
+            let rebuilt = hq
+                .probe_data
+                .as_ref()
+                .map(|p| mux_probe(p, provider))
+                .unwrap_or_else(|| minimal_probe(provider));
+            let stored_probe = stored
+                .iter()
+                .find(|r| r.id == row.id)
+                .and_then(|r| r.probe_data.clone());
+            row.probe_data = Some(richer_probe(rebuilt, stored_probe));
             rows.push(row);
             // HQ releases are walked in quality order, so the cap keeps the
             // best video and its dub variants (backups against a bad dub)
@@ -767,6 +771,31 @@ pub(crate) fn row_provider_pub(row: &db::Media) -> String {
 /// external subtitles from 0 while PlaybackInfo advertised them from 2 →
 /// "subtitle stream not found" and blank subtitles in VidHub (2026-09-28).
 /// Returns true when the row was filled (the caller persists it).
+/// A dub row's track list must never shrink: rebuilding it from a release
+/// that is not (yet) ffprobed — only a filename guess, or no probe at all —
+/// dropped the release's subtitle tracks, renumbering the addon subtitles
+/// (102+ → 2), and the next rebuild from the probed release switched back.
+/// Players remember one numbering and fetch tracks under it after the flip →
+/// "subtitle stream not found" (The Early Spring E01/E19, 2026-09-28).
+fn richer_probe(
+    rebuilt: api::MediaSourceInfo,
+    stored: Option<api::MediaSourceInfo>,
+) -> api::MediaSourceInfo {
+    match stored {
+        Some(old)
+            if old
+                .media_streams
+                .len()
+                > rebuilt
+                    .media_streams
+                    .len() =>
+        {
+            old
+        }
+        _ => rebuilt,
+    }
+}
+
 pub(crate) fn fill_row_probe(row: &mut db::Media) -> bool {
     if is_dubmux_row(row)
         && row
@@ -836,12 +865,12 @@ fn carried_rows(
         // play — the mux master answers only once the mux is done and the
         // first PlaybackInfo listed no Vietnamese track (Pursuit of Jade E12).
         let provider = row_provider(&row);
-        row.probe_data = Some(
-            hq.probe_data
-                .as_ref()
-                .map(|p| mux_probe(p, &provider))
-                .unwrap_or_else(|| minimal_probe(&provider)),
-        );
+        let rebuilt = hq
+            .probe_data
+            .as_ref()
+            .map(|p| mux_probe(p, &provider))
+            .unwrap_or_else(|| minimal_probe(&provider));
+        row.probe_data = Some(richer_probe(rebuilt, row.probe_data.take()));
         if let Some(si) = row
             .stream_info
             .as_mut()
@@ -981,6 +1010,28 @@ mod tests {
         assert!(!is_asian_origin(None, Some("CN, US")));
         assert!(!is_asian_origin(None, None));
         assert!(!is_asian_origin(Some(""), Some("")));
+    }
+
+    #[test]
+    fn row_track_list_never_shrinks() {
+        let guess = minimal_probe("hotphim");
+        let mut full = minimal_probe("hotphim");
+        for i in 0..5 {
+            full.media_streams.push(MediaStream {
+                type_: Some(MediaStreamType::Subtitle),
+                index: 102 + i,
+                ..Default::default()
+            });
+        }
+        let n = full
+            .media_streams
+            .len();
+        assert_eq!(richer_probe(guess.clone(), Some(full.clone())).media_streams.len(), n);
+        assert_eq!(richer_probe(full.clone(), Some(guess.clone())).media_streams.len(), n);
+        assert_eq!(
+            richer_probe(guess.clone(), None).media_streams.len(),
+            guess.media_streams.len()
+        );
     }
 
     #[test]
