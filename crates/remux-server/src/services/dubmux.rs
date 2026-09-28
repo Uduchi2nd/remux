@@ -703,6 +703,13 @@ pub(crate) async fn ensure_dub_rows(
             } else {
                 VideoContainer::Other("hls".into())
             });
+            if reply.file_ready()
+                && let Some(size) = reply.file_size()
+            {
+                // the probe's Size wins over stream_info.size in the source
+                // document; it must be the file's, not the release's
+                probe.size = Some(size);
+            }
             row.probe_data = Some(probe);
             rows.push(row);
             // HQ releases are walked in quality order, so the cap keeps the
