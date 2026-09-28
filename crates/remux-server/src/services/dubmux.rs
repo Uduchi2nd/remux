@@ -1073,7 +1073,9 @@ mod tests {
             mux_action_url("https://m.example/mux/d/h/file.ts?video=x", "start"),
             "https://m.example/mux/d/h/start"
         );
-        assert!(is_mux_path(Some("https://m.example/mux/d/h/file.ts?video=x")));
+        assert!(is_mux_path(Some(
+            "https://m.example/mux/d/h/file.ts?video=x"
+        )));
         assert!(is_mux_path(Some("https://m.example/mux/d/h/master.m3u8")));
         assert!(!is_mux_path(Some("https://cdn.example/a.ts")));
     }
