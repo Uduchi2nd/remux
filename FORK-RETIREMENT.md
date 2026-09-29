@@ -303,4 +303,4 @@ Rows of pairs the muxer reports `file_ready` point at `{public}/mux/{dub}/{hq}/f
 
 ### Start-time patches (2026-09-29)
 - `d4383ad4` PlaybackInfo: addon subtitles prefetched in parallel; per-version redirect HEADs started in parallel with the first probe (were sequential, ~1 s each); dub-pair checks in parallel. Cold open 45 s → 11 s together with the vnphim/AIOStreams changes.
-- `5f9cedd9` (build tree hash) open prefetch (`services/open_prefetch.rs`): an item document fetched without MediaSources, or a show page, refreshes the (next) episode's stream list in the background (one at a time, 1 s gap, each item once per 10 min). Retire when upstream prefetches on item open.
+- `49f6afaf` open prefetch (`services/open_prefetch.rs`): an item document fetched without MediaSources, or a show page, refreshes the (next) episode's stream list in the background (one at a time, 1 s gap, each item once per 10 min). Retire when upstream prefetches on item open.
