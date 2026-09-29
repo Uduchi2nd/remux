@@ -567,7 +567,19 @@ pub(crate) async fn ensure_dub_rows(
     let mut rows = Vec::new();
     let mut checked: Vec<Uuid> = Vec::new();
     let mut rejected: Vec<Uuid> = Vec::new();
-    let mut wait = wait_secs;
+    // PATCH (uduchi2nd, 2026-09-29): the wait stops at the first AVAILABLE
+    // version. Pass 1 asks every pair without waiting (a cached pair answers
+    // at once); only when none is ready yet does pass 2 spend the caller's
+    // wait on the first pair. Versions still preparing join the list on a
+    // later refresh — the muxer keeps preparing them either way.
+    for attempt in 0..2u8 {
+    if attempt == 1 && (!rows.is_empty() || wait_secs == 0) {
+        break;
+    }
+    rows.clear();
+    checked.clear();
+    rejected.clear();
+    let mut wait = if attempt == 0 { 0 } else { wait_secs };
     let mut failures = 0u32;
     let mut pairs_seen: u32 = 0;
     'pairs: for hq in hqs
@@ -723,6 +735,10 @@ pub(crate) async fn ensure_dub_rows(
                 break 'pairs;
             }
         }
+    }
+    if failures >= 2 {
+        break;
+    }
     }
     // Rows this walk could not rebuild (muxer busy, a pair not answered in
     // time) but which were fine before stay, unless the muxer now rejects
