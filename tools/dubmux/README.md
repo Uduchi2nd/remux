@@ -407,3 +407,29 @@ Browser/AVPlayer clients cannot play a raw TS file — not supported by design
 Verified: Early Spring E01 (session layout) 808 MB, ffprobe 2615 s with vie +
 chi tracks, 1 MB range 0.9 s, seek to 20:00 decodes; Kung Fu Hustle (raw
 layout) 8.1 GB, 5976 s, no overflow.
+
+## vnphim playlists as seekable files (`/vn/<id>/file.ts`, 2026-09-28)
+User request: expose vnphim's HLS streams the same way as the dub file —
+downloadable, seekable, buffered by our servers instead of the player. US
+viewers only for now (the VN box has no direct public exposure). vnphim adds
+ONE extra stream per episode for viewers outside VN: the first Thuyết Minh
+(else dub) stream as `https://dubmux.geniallark.box.ca/vn/<id>/file.ts`,
+title "… · File (US)", filename `…Vietnamese.ThuyetMinh-File.<provider>.ts`
+(Vietnamese audio for AIOStreams; not a remux dub source; not an HQ release).
+`vnfile.py` (muxer): the id resolves via vnphim `/_internal/file-source`
+(keyed) to vnphim's ad-stripped playlist with origin segment URLs and
+whether segments must come from VN. Sizes: BYTERANGE (hotphim), HEAD from
+the seedbox (yanhh3d), or the VN extractor's new `POST /sizes` (kkphim/
+ophim, geo-blocked abroad). Layout saved in `match/vn-<id>.json`. Segments
+fetched on demand (VN extractor `GET /seg` relay, ~370 KB/s per segment)
+and prefetched 12 ahead in parallel; cached in `hls/vn-<id>/` for 3 days.
+Playlists with #EXT-X-DISCONTINUITY (ad-stripped kkphim) are REBASED: each
+segment re-muxed with ONE timestamp shift per run between cuts (anchor =
+the run's first segment), slots +5 % +64 KB; others are passed through with
+exact-size slots (no padding). vnphim warms the table with a HEAD when it
+lists the link, the muxer prefetches the first and last segments.
+Verified 2026-09-28: Early Spring E01 kkphim TM (648 segs, 646 MB, 2
+discontinuities, gaps 0 over the first 6 min, 5 MB/s sequential, seek
+decodes); PNTT E189 yanhh3d TM (549 MB, first open 0.4 s, 13 MB/s);
+hotphim TM (262 byte-range segs, 336 MB, no rebase). Through remux: 307 to
+the file, ffprobe duration 2589 s, Size 646 MB, vie audio + vnphim subs.

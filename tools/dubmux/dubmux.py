@@ -354,6 +354,34 @@ def vn_extract(name, url, out, log=sys.stderr, timeout=1500):
             "workers": "vn-extractor", "transfer_seconds": round(time.time() - t0, 1)}
 
 
+def vn_opener():
+    """urllib opener for the VN extractor (seedbox tailscaled is userspace:
+    tailnet hosts only through its local CONNECT proxy)."""
+    proxy = os.environ.get("DUBMUX_VN_PROXY", "http://127.0.0.1:1055")
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {}))
+
+
+def vn_sizes(urls, timeout=300):
+    """Origin byte sizes of segment URLs (MediaFlow wraps or plain origins),
+    measured in VN (kkphim/ophim origins are geo-blocked abroad)."""
+    out = []
+    for i in range(0, len(urls), 1000):
+        req = urllib.request.Request(VN_EXTRACTOR + "/sizes", data=json.dumps({"urls": urls[i:i + 1000]}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with vn_opener().open(req, timeout=timeout) as r:
+            out += json.loads(r.read())["sizes"]
+    return out
+
+
+def vn_segment(url, timeout=120):
+    """One origin segment, fetched in VN and relayed over the tailnet."""
+    from urllib.parse import quote
+    req = urllib.request.Request(VN_EXTRACTOR + "/seg?u=" + quote(url, safe=""))
+    with vn_opener().open(req, timeout=timeout) as r:
+        return r.read()
+
+
 VNPHIM_URL = os.environ.get("DUBMUX_VNPHIM_URL", "").rstrip("/")
 VNPHIM_KEY = os.environ.get("DUBMUX_VNPHIM_KEY", "")
 MF_PASSWORD = os.environ.get("DUBMUX_MF_PASSWORD", "")

@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dubmux  # noqa: E402
+import vnfile  # noqa: E402
 import align  # noqa: E402
 
 DATA = Path(os.environ.get("DUBMUX_DATA", "/data"))
@@ -1454,6 +1455,90 @@ def _parse_range(h, total):
     return a, min(b, total - 1)
 
 
+def _serve_slots(request, offs, slots, total, get_path, label):
+    """Serve a virtual file made of fixed-size slots (segment bytes, then
+    MPEG-TS null packets) with HTTP range support. get_path(i) produces or
+    returns segment i (raises HTTPException/any on failure)."""
+    import bisect
+    rng = _parse_range(request.headers.get("range", ""), total)
+    if rng and (rng[0] >= total or rng[0] > rng[1]):
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+    a, b = rng if rng else (0, total - 1)
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(b - a + 1),
+               "Cache-Control": "private, max-age=3600"}
+    if rng:
+        headers["Content-Range"] = f"bytes {a}-{b}/{total}"
+    status = 206 if rng else 200
+    if request.method == "HEAD":
+        return Response(status_code=status, headers=headers, media_type="video/mp2t")
+    first = bisect.bisect_right(offs, a) - 1
+    try:
+        first_path = get_path(first)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(503, f"segment unavailable: {str(e)[:120]}", headers={"Retry-After": "5"})
+
+    def body():
+        pos, i, path = a, first, first_path
+        while pos <= b and i < len(slots):
+            if path is None:
+                try:
+                    path = get_path(i)
+                except Exception as e:  # noqa: BLE001
+                    print(f"{label}: segment {i} failed mid-response: {str(e)[:160]}",
+                          file=sys.stderr, flush=True)
+                    return
+            size = path.stat().st_size
+            if size > slots[i]:
+                print(f"{label}: segment {i} ({size} B) overflows its slot ({slots[i]} B)",
+                      file=sys.stderr, flush=True)
+            lo = pos - offs[i]
+            hi = min(b - offs[i], slots[i] - 1)
+            if lo < size:
+                end = min(hi, size - 1)
+                with open(path, "rb") as f:
+                    f.seek(lo)
+                    left = end - lo + 1
+                    while left > 0:
+                        chunk = f.read(min(1 << 20, left))
+                        if not chunk:
+                            break
+                        left -= len(chunk)
+                        yield chunk
+                lo = end + 1
+            if lo <= hi:
+                start = max(lo, size)
+                pad = hi - start + 1
+                k0 = start % 188
+                yield (TS_NULL * ((pad + k0) // 188 + 2))[k0:k0 + pad]
+            pos = offs[i] + hi + 1
+            i += 1
+            path = None
+    return StreamingResponse(body(), status_code=status, headers=headers, media_type="video/mp2t")
+
+
+@app.api_route("/vn/{fid}/file.ts", methods=["GET", "HEAD"])
+def vn_file(fid: str, request: Request):
+    """A vnphim playlist as one seekable file (see vnfile.py)."""
+    if not re.fullmatch(r"[0-9a-f]{16,40}", fid):
+        raise HTTPException(404)
+    try:
+        table = vnfile.build_table(HLS, MATCH, fid)
+    except Exception as e:  # noqa: BLE001
+        print(f"vnfile {fid}: table failed: {str(e)[-200:]}", file=sys.stderr, flush=True)
+        raise HTTPException(502, f"playlist not usable as a file: {str(e)[:120]}")
+    if table is None:
+        raise HTTPException(404, "unknown file id")
+    slots = table["slots"]
+    offs, t = [], 0
+    for sl in slots:
+        offs.append(t)
+        t += sl
+    return _serve_slots(request, offs, slots, t,
+                        lambda i: vnfile.ensure(HLS, MATCH, fid, i), f"vnfile {fid}")
+
+
 @app.api_route("/mux/{dub_id}/{video_id}/file.ts", methods=["GET", "HEAD"])
 def seekable_file(dub_id: str, video_id: str, request: Request):
     k = _key(_check_id(dub_id), _check_id(video_id))
@@ -1543,6 +1628,10 @@ def segment(dub_id: str, video_id: str, seg: str, request: Request):
 
 def _sweep():
     now = time.time()
+    try:
+        vnfile.sweep(HLS)
+    except Exception as e:  # noqa: BLE001
+        print(f"vnfile sweep failed: {e}", file=sys.stderr, flush=True)
     # Durable cache (audio, matches, aligned tracks, segment tables): LRU by
     # mtime (bumped on every use), 365 d / 200 GB.
     cutoff = now - AUDIO_RETENTION_DAYS * 86400
