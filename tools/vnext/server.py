@@ -160,6 +160,73 @@ def audio(job_id: str):
     return FileResponse(str(out), media_type="audio/mp4")
 
 
+# ---------------------------------------------------------------- relay ---
+# For the seedbox's virtual-file view of vnphim playlists (2026-09-28): the
+# segment SIZES (fetched here, in VN, because kkphim/ophim origins are
+# geo-blocked abroad) and a byte relay for single segments. Tailnet-only.
+_size_pool = ThreadPoolExecutor(max_workers=int(os.environ.get("VNEXT_SIZE_WORKERS", "32")))
+
+
+def _origin_size(url):
+    import urllib.request
+    origin, hdr = unwrap(url)
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(origin, headers={**hdr, "Range": "bytes=0-0"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                cr = r.headers.get("Content-Range", "")
+                if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
+                    return int(cr.rsplit("/", 1)[1])
+                cl = r.headers.get("Content-Length")
+                if r.status == 200 and cl and cl.isdigit():
+                    return int(cl)
+        except Exception:  # noqa: BLE001
+            time.sleep(0.5 * (attempt + 1))
+    return None
+
+
+@app.post("/sizes")
+async def sizes(req: Request):
+    """{"urls": [...]} -> {"sizes": [bytes|null, ...]} (origin sizes, in VN)."""
+    body = await req.json()
+    urls = [u for u in (body.get("urls") or []) if isinstance(u, str) and u.startswith("http")]
+    if len(urls) > 5000:
+        raise HTTPException(400, "too many urls")
+    import asyncio
+    loop = asyncio.get_running_loop()
+    res = await asyncio.gather(*[loop.run_in_executor(_size_pool, _origin_size, u) for u in urls])
+    return {"sizes": res}
+
+
+@app.get("/seg")
+def seg(u: str, request: Request):
+    """One origin segment fetched in VN, streamed to the caller (the seedbox)."""
+    import urllib.request
+    from fastapi.responses import StreamingResponse
+    if not u.startswith("http"):
+        raise HTTPException(400, "url required")
+    origin, hdr = unwrap(u)
+    if request.headers.get("range"):
+        hdr["Range"] = request.headers["range"]
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(origin, headers=hdr), timeout=30)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"origin fetch failed: {str(e)[:120]}")
+
+    def body():
+        try:
+            while True:
+                chunk = r.read(1 << 18)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            r.close()
+    headers = {k: v for k, v in r.headers.items() if k.lower() in ("content-length", "content-range")}
+    return StreamingResponse(body(), status_code=r.status, headers=headers,
+                             media_type=r.headers.get("Content-Type", "video/mp2t"))
+
+
 def _sweep():
     cutoff = time.time() - TTL_HOURS * 3600
     for f in DATA.glob("*.m4a*"):
