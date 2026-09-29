@@ -433,3 +433,24 @@ discontinuities, gaps 0 over the first 6 min, 5 MB/s sequential, seek
 decodes); PNTT E189 yanhh3d TM (549 MB, first open 0.4 s, 13 MB/s);
 hotphim TM (262 byte-range segs, 336 MB, no rebase). Through remux: 307 to
 the file, ffprobe duration 2589 s, Size 646 MB, vie audio + vnphim subs.
+
+## One aligned-track rule + sync check before serving (2026-09-29)
+Trigger: Queen of News E02 dub 21 s late from 3:00 — an alias of an old
+piecewise pair lost its aligned track (old records located it only by name)
+and the mux silently fell back to the raw dub at lag 0; the finished-session
+sync self-check never ran because the session was streamed JIT.
+- **One rule** (`_dub_input`): a pair matched piecewise (or whose record
+  names `aligned`) MUST name its aligned track and the file must exist;
+  otherwise the pair is rejected (`reject:missing-aligned`, remux drops the
+  row) — no name-based fallback. 421 records were backfilled with the field.
+- **Sync check before serving** (`_sync_check`): dub input (with its lag) vs
+  the release's own first audio track, two 45 s stretches past 3:00, lag
+  searched ±30 s; the majority of confident windows (ratio ≥ 8) off by more
+  than 0.35 s rejects the pair (`reject:sync`). Runs right after accept when
+  the raw copy is local, else in the background when a session first opens
+  (resolved release URL is cached — no debrid request); a failure also stops
+  the session. Result stored in the record (`sync_check`).
+  Validated on E02: repaired pair 0.04 s / 0.00 s (ok); the old raw-dub
+  mistake −21.08 s / −21.12 s at confidence 30–40 (would reject).
+- One-time audit of every accepted pair with local data (raw copy or
+  finished session): see below.
