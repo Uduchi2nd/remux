@@ -1,6 +1,7 @@
 pub(crate) mod four_k_capability;
 pub mod background_prepare;
 pub(crate) mod dubmux;
+pub(crate) mod open_prefetch;
 pub mod image;
 pub mod media_tracker;
 pub(crate) mod resolve;
