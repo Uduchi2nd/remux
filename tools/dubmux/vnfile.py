@@ -258,6 +258,7 @@ def _download(table, i):
 def _fetch(hls, match, fid, i):
     table = _tables[fid]
     d, _ = _dirs(hls, match, fid)
+    d.mkdir(parents=True, exist_ok=True)
     out = d / f"s{i:05d}.ts"
     if out.exists():
         return out
@@ -299,6 +300,9 @@ def ensure(hls, match, fid, i, timeout=90):
     """Path of segment i, fetching it (urgent) and prefetching AHEAD more."""
     table = _tables[fid]
     d, _ = _dirs(hls, match, fid)
+    # the segment cache may have been swept (play-cache budget) while the
+    # saved layout stayed: recreate it
+    d.mkdir(parents=True, exist_ok=True)
     (d / ".touched").write_text(str(int(time.time())))
     out = d / f"s{i:05d}.ts"
     n = len(table["segs"])
