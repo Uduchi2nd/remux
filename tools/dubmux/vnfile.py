@@ -127,6 +127,16 @@ def build_table(hls, match, fid):
             return t
         except Exception:  # noqa: BLE001
             pass
+    with _BUILD_SLOTS:          # warm-ups for many episodes must not pile up
+        if fid in _tables:
+            return _tables[fid]
+        return _build(hls, match, fid, d, tp)
+
+
+_BUILD_SLOTS = threading.BoundedSemaphore(int(os.environ.get("VNFILE_BUILDS", "2")))
+
+
+def _build(hls, match, fid, d, tp):
     src = resolve(fid)
     if not src or not src.get("playlist"):
         return None
