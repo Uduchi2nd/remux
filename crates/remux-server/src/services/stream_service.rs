@@ -557,6 +557,55 @@ impl StreamService {
             sel.candidates
                 .len(),
         );
+        // PATCH (uduchi2nd, 2026-09-29): every remote redirect-enabled
+        // source gets its redirect chain resolved below (VidHub needs the
+        // final CDN URL) — one 1–2 s HEAD each, one after the other (~11 s
+        // for 14 versions). Start them all now, in parallel with the first
+        // source's probe; the loop then reads the 30 s HEAD cache.
+        {
+            let heads: Vec<(Uuid, crate::stream::StreamInfo)> = sel
+                .candidates
+                .iter()
+                .filter(|s| !crate::services::dubmux::is_dubmux_row(s))
+                .filter_map(|s| {
+                    let si = s
+                        .stream_info
+                        .as_ref()?;
+                    let addon_id = si.addon_id?;
+                    let crate::stream::StreamDescriptor::Http { url, .. } = &si.descriptor
+                    else {
+                        return None;
+                    };
+                    let external = url::Url::parse(url)
+                        .ok()
+                        .and_then(|u| {
+                            u.host_str()
+                                .map(|h| !crate::stream::is_internal_host(h))
+                        })
+                        .unwrap_or(false);
+                    let redirects = self
+                        .ctx
+                        .addons
+                        .get(addon_id)
+                        .map(|a| {
+                            a.row
+                                .http_redirect_stream
+                        })
+                        .unwrap_or(false);
+                    (external && redirects).then(|| (s.id, si.clone()))
+                })
+                .collect();
+            if !heads.is_empty() {
+                tokio::spawn(async move {
+                    futures::future::join_all(
+                        heads
+                            .iter()
+                            .map(|(id, si)| crate::stream::redirected_client_url(*id, si)),
+                    )
+                    .await;
+                });
+            }
+        }
         for (idx, stream) in sel
             .candidates
             .into_iter()

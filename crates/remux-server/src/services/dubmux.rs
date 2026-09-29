@@ -582,6 +582,51 @@ pub(crate) async fn ensure_dub_rows(
     let mut wait = if attempt == 0 { 0 } else { wait_secs };
     let mut failures = 0u32;
     let mut pairs_seen: u32 = 0;
+    // Pass 1 asks about every pair at once (each answer is one round trip to
+    // the seedbox, ~0.5 s; one after the other that was 3–5 s per list).
+    // Same order, priorities and cached_only rule as the walk below.
+    let mut pre: std::collections::VecDeque<anyhow::Result<PrepareReply>> = Default::default();
+    if attempt == 0 {
+        let mut specs = Vec::new();
+        let mut n: u32 = 0;
+        for hq in hqs
+            .iter()
+            .copied()
+        {
+            let hq_url = http_url(hq).unwrap();
+            let hq_id = hq
+                .id
+                .simple()
+                .to_string();
+            for (dub, _provider, dub_id) in &dubs {
+                let pair_priority = if n == 0 {
+                    priority
+                } else {
+                    priority + VARIANT_PENALTY + n.min(40)
+                };
+                let cached_only = priority > PRIORITY_LIVE_MAX && n >= BACKGROUND_NEW_PAIRS;
+                n += 1;
+                specs.push((
+                    dub_id.clone(),
+                    http_url(dub)
+                        .unwrap()
+                        .to_string(),
+                    hq_id.clone(),
+                    hq_url.to_string(),
+                    pair_priority,
+                    cached_only,
+                ));
+            }
+        }
+        pre = futures::future::join_all(specs.iter().map(
+            |(dub_id, dub_url, hq_id, hq_url, pr, co)| {
+                prepare(&client, &cfg, dub_id, dub_url, hq_id, hq_url, 0, *pr, *co)
+            },
+        ))
+        .await
+        .into_iter()
+        .collect();
+    }
     'pairs: for hq in hqs
         .iter()
         .copied()
@@ -605,19 +650,24 @@ pub(crate) async fn ensure_dub_rows(
             let cached_only =
                 priority > PRIORITY_LIVE_MAX && pairs_seen >= BACKGROUND_NEW_PAIRS;
             pairs_seen += 1;
-            let reply = match prepare(
-                &client,
-                &cfg,
-                dub_id,
-                dub_url,
-                &hq_id,
-                hq_url,
-                wait,
-                pair_priority,
-                cached_only,
-            )
-            .await
-            {
+            let answer = match pre.pop_front() {
+                Some(r) => r,
+                None => {
+                    prepare(
+                        &client,
+                        &cfg,
+                        dub_id,
+                        dub_url,
+                        &hq_id,
+                        hq_url,
+                        wait,
+                        pair_priority,
+                        cached_only,
+                    )
+                    .await
+                }
+            };
+            let reply = match answer {
                 Ok(r) => r,
                 Err(e) => {
                     // A busy muxer answers late, not wrong: the job it was

@@ -181,6 +181,23 @@ async fn items_playbackinfo_inner(
             .context_forbidden("media playback is disabled"));
     }
 
+    // PATCH (uduchi2nd, 2026-09-29): fetch the addon subtitles (cached 24 h)
+    // while the stream list is loaded and the first source probed, instead of
+    // after them — 5–7 s off a cold PlaybackInfo. Awaited before injection.
+    let subtitle_prefetch = {
+        let st = state.clone();
+        let uid = session
+            .user
+            .id;
+        tokio::spawn(async move {
+            if let Ok(Some(mut m)) = db::Media::get_by_id(&st.ctx.db, &id).await {
+                st.ctx
+                    .addons
+                    .fetch_subtitles(&mut m, &st.ctx.db, false, Some(uid))
+                    .await;
+            }
+        })
+    };
     let media =
         MediaResolveService::resolve_item(media_source_id.unwrap_or(id), &state.ctx)
             .await?
@@ -580,6 +597,7 @@ async fn items_playbackinfo_inner(
     }
 
     // Inject external subtitles from AIO (cache-backed)
+    let _ = subtitle_prefetch.await;
     if let Some(ref mut sub_media) = subtitle_media {
         let sub_langs = probe_cfg
             .subtitle_languages
