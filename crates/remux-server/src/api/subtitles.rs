@@ -1207,6 +1207,57 @@ fn resolve_subtitle_source(
         .unwrap_or(alias)
 }
 
+fn external_base_key(item_id: Uuid, source_id: Uuid) -> String {
+    format!("subtitle-ext-bases:{item_id}:{source_id}")
+}
+
+/// Remember the first add-on subtitle index advertised for a source (the
+/// numbering changes once the source is probed; clients keep the old one).
+pub(crate) fn remember_external_base(
+    ctx: &crate::AppContext,
+    item_id: Uuid,
+    source_id: Uuid,
+    base: i64,
+) {
+    let key = external_base_key(item_id, source_id);
+    let mut bases: Vec<i64> = ctx
+        .store
+        .get::<Vec<i64>>(&key)
+        .map(|v| (*v).clone())
+        .unwrap_or_default();
+    bases.retain(|b| *b != base);
+    bases.push(base);
+    if bases.len() > 8 {
+        bases.remove(0);
+    }
+    ctx.store
+        .save(key, bases, std::time::Duration::from_secs(6 * 60 * 60));
+}
+
+/// Most recently advertised base (other than the current one) under which
+/// `stream_index` is an add-on subtitle.
+fn advertised_external_base(
+    ctx: &crate::AppContext,
+    item_id: Uuid,
+    source_ids: &[Uuid],
+    stream_index: i64,
+    current: i64,
+) -> Option<i64> {
+    source_ids
+        .iter()
+        .filter_map(|id| {
+            ctx.store
+                .get::<Vec<i64>>(&external_base_key(item_id, *id))
+        })
+        .flat_map(|v| {
+            v.iter()
+                .rev()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .find(|b| *b != current && *b <= stream_index)
+}
+
 fn sidecar_subtitle_routes_key(
     device_id: &str,
     item_id: Uuid,
@@ -1538,9 +1589,42 @@ async fn subtitles_stream_inner(
                     .flatten()
                     .map(|entry| entry.index),
             );
-            let i = stream_index - next_idx;
+            let mut i = stream_index - next_idx;
+            let mut external = i >= 0 && !embedded_indices.contains(&stream_index);
+            // PATCH (uduchi2nd, 2026-09-29): the client may hold a layout
+            // advertised BEFORE the source was probed (no embedded streams →
+            // the add-on track was index 0); after the probe that index is
+            // the video and the request 404ed (VidHub, No Pain No Gain E20).
+            // An index that now points at a video/audio stream (or below the
+            // external range) is read with the numbering we advertised.
+            if !external {
+                let is_embedded_subtitle = source
+                    .probe_data
+                    .as_ref()
+                    .is_some_and(|p| {
+                        p.media_streams
+                            .iter()
+                            .any(|s| {
+                                s.index == stream_index
+                                    && matches!(s.type_, Some(api::MediaStreamType::Subtitle))
+                            })
+                    });
+                if !is_embedded_subtitle
+                    && let Some(base) = advertised_external_base(
+                        &state.ctx,
+                        item_id,
+                        &[advertised_source_id, media_source_id],
+                        stream_index,
+                        next_idx,
+                    )
+                {
+                    i = stream_index - base;
+                    external = true;
+                    debug!(item_id = %item_id, stream_index, base, "subtitle index read with the advertised numbering");
+                }
+            }
             // Only attempt external resolution if the index is not an embedded stream.
-            if i >= 0 && !embedded_indices.contains(&stream_index) {
+            if external {
                 let subs = match subs.take() {
                     Some(subs) => subs,
                     None => {
@@ -2143,25 +2227,37 @@ pub(crate) async fn restore_persisted_subtitle_sync_label(
 }
 
 fn mark_subtitle_auto_synced(stream: &mut api::MediaStream) {
-    const MARKER: &str = "[Auto-synced]";
-    let title = stream.display_title.get_or_insert_with(|| {
-        stream
-            .language
-            .clone()
-            .unwrap_or_else(|| "Subtitle".into())
-    });
-    if !title.contains(MARKER) {
-        title.push_str(" [Auto-synced]");
+    // (2026-09-29) was "[Auto-synced]"; the user asked for a plain "Synced"
+    // suffix. Older labels are still recognised so nothing is marked twice.
+    const MARKER: &str = "[Synced]";
+    const OLD_MARKER: &str = "[Auto-synced]";
+    let title = stream
+        .display_title
+        .get_or_insert_with(|| {
+            stream
+                .language
+                .clone()
+                .unwrap_or_else(|| "Subtitle".into())
+        });
+    if !title.contains(MARKER) && !title.contains(OLD_MARKER) {
+        title.push_str(" [Synced]");
     }
-    let path = stream.path.get_or_insert_with(|| {
-        format!(
-            "{}.vtt",
-            stream.language.as_deref().unwrap_or("und")
-        )
-    });
-    if !path.contains(MARKER) {
-        let (stem, extension) = path.rsplit_once('.').unwrap_or((path.as_str(), "vtt"));
-        *path = format!("{stem} [Auto-synced].{extension}");
+    let path = stream
+        .path
+        .get_or_insert_with(|| {
+            format!(
+                "{}.vtt",
+                stream
+                    .language
+                    .as_deref()
+                    .unwrap_or("und")
+            )
+        });
+    if !path.contains(MARKER) && !path.contains(OLD_MARKER) {
+        let (stem, extension) = path
+            .rsplit_once('.')
+            .unwrap_or((path.as_str(), "vtt"));
+        *path = format!("{stem} [Synced].{extension}");
     }
 }
 
@@ -2305,6 +2401,9 @@ fn append_external_subtitles_inner(
             .map(|s| s.index)
             .max()
             .map_or(0, |m| m + 1);
+        if let Some(ctx) = ctx {
+            remember_external_base(ctx, item_id, source.id, next_idx);
+        }
         let scored = filter_external_subtitles_for_source(
             source,
             provider_filename(source),
@@ -2312,6 +2411,11 @@ fn append_external_subtitles_inner(
             sub_langs,
             device_profile,
             dedup,
+        );
+        let labels = external_subtitle_labels(
+            scored
+                .iter()
+                .map(|s| s.lang.as_deref()),
         );
         let wants_default = !sub_langs.is_empty()
             && source.default_subtitle_stream_index.is_none();
@@ -2325,10 +2429,9 @@ fn append_external_subtitles_inner(
             ));
             // Vidhub requires Path to discover external subtitles and uses its
             // basename as the label. Keep credentials in DeliveryUrl only.
-            stream.path = Some(format!(
-                "{}.vtt",
-                stream.language.as_deref().unwrap_or("und")
-            ));
+            let label = labels[i].clone();
+            stream.path = Some(format!("{label}.vtt"));
+            stream.display_title = Some(label);
             if let (Some(ctx), Some(descriptor)) = (ctx, sub.url.as_ref()) {
                 apply_subtitle_sync_label(ctx, item_id, source, descriptor, &sub.id, &mut stream);
             }
@@ -2512,7 +2615,8 @@ pub(super) async fn validate_external_subtitles_for_advertising(
 /// `is_external = false` so alignment still treats them as an embedded
 /// reference, but VidHub/Infuse only list tracks that look external AND have
 /// a `Path`, so present them that way in every client-facing document.
-/// Labels for addon-provided subtitle tracks, in list order: `<lang> (vnphim N)`
+/// Labels for addon-provided subtitle tracks, in list order: `<lang> (N)`
+/// (was `<lang> (vnphim N)` — misleading, most come from other add-ons)
 /// with N counting tracks of the same language (1-based), so two Vietnamese
 /// files — and the release's own "(release)" track — can be told apart.
 fn external_subtitle_labels<'a>(
@@ -2528,7 +2632,7 @@ fn external_subtitle_labels<'a>(
                 .entry(lang.clone())
                 .or_insert(0);
             *n += 1;
-            format!("{lang} (vnphim {n})")
+            format!("{lang} ({n})")
         })
         .collect()
 }
@@ -2642,6 +2746,7 @@ pub(crate) async fn inject_external_subtitles(
             .map(|s| s.index)
             .max()
             .map_or(0, |m| m + 1);
+        remember_external_base(&state.ctx, item_id, source.id, next_idx);
         let scored = filter_external_subtitles_for_source(
             source,
             provider_filename(source),
@@ -2863,10 +2968,10 @@ mod label_tests {
         assert_eq!(
             l,
             [
-                "vie (vnphim 1)",
-                "vie (vnphim 2)",
-                "eng (vnphim 1)",
-                "und (vnphim 1)"
+                "vie (1)",
+                "vie (2)",
+                "eng (1)",
+                "und (1)"
             ]
         );
     }
@@ -3024,13 +3129,13 @@ mod tests {
             stream
                 .display_title
                 .as_deref(),
-            Some("Vietnamese - External [Auto-synced]")
+            Some("Vietnamese - External [Synced]")
         );
         assert_eq!(
             stream
                 .path
                 .as_deref(),
-            Some("vie [Auto-synced].vtt")
+            Some("vie [Synced].vtt")
         );
         assert_eq!(
             stream
