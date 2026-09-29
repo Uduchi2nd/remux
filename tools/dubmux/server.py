@@ -244,19 +244,7 @@ def _set_video_check(k, value):
 
 def _reject_corrupt(k, detail):
     """Turn an accepted pair into a (cached, expiring) corrupt-source reject."""
-    p = _match_path(k)
-    try:
-        m = json.load(open(p))
-    except Exception:  # noqa: BLE001
-        m = {}
-    m.update(verdict="reject:corrupt-source", detail=detail, created=int(time.time()),
-             align_version=ALIGN_VERSION)
-    m.pop("video_check", None)
-    json.dump(m, open(p, "w"), indent=1)
-    job = _jobs.get(k)
-    if job:
-        job.update(status="rejected", result=m)
-    print(f"pair {k}: corrupt source ({detail}), rejected", file=sys.stderr, flush=True)
+    _reject_pair(k, "reject:corrupt-source", detail)
 
 
 def _segment_decodes(path, max_errors=4):
@@ -657,6 +645,14 @@ def _prepare_worker(dub, video, k):
         if result["verdict"] == "accept":
             result["video_check"] = _video_check(k) or ("ok" if (_raw_dir(hq_id) / ".video_ok").exists() else None)
             json.dump(result, open(_match_path(k), "w"), indent=1)
+            # sync check BEFORE the pair is ever served, when the release's
+            # audio is local (raw copy); otherwise it runs when a session starts
+            if (_raw_dir(hq_id) / "audio.mka").exists():
+                job["stage"] = "sync-check"
+                sc = _sync_check(k, dub["id"])
+                if sc is not None and not sc["ok"]:
+                    result = _load_match(k) or result
+                    rejected = True
             lay = _file_layout(k, dub["id"])
             result["file_ready"] = lay is not None
             result["file_size"] = lay[2] if lay else None
@@ -950,18 +946,48 @@ def _aligned_note(path, hq_id, video_url):
     json.dump(data, open(note, "w"), indent=1)
 
 
+class MissingAligned(RuntimeError):
+    """A pair that needs a piecewise-aligned track has none."""
+
+
+def _needs_aligned(m):
+    return bool(m.get("aligned")) or (m.get("piecewise") or {}).get("verdict") == "accept"
+
+
 def _dub_input(k, dub_id, lag):
-    """(file, lag) the mux uses: a piecewise-aligned track sits on the
-    video's clock already (lag 0); the match record names which one."""
+    """(file, lag) the mux uses. ONE rule (2026-09-29): a pair whose match was
+    piecewise must name its aligned track in the record ("aligned") and the
+    file must exist — it sits on the video's clock (lag 0). Otherwise the raw
+    dub with the record's constant lag. There is no name-based fallback any
+    more: a missing aligned track rejects the pair (the row disappears)
+    instead of silently playing the raw dub at lag 0, which is what an alias
+    that lost the track did (Queen of News E02, 21 s off from 3:00)."""
     m = _load_match(k) or {}
-    if m.get("aligned"):
-        aligned = MATCH / m["aligned"]
-        if aligned.exists():
-            return str(aligned), 0.0
-    aligned = MATCH / f"{k}.aligned.m4a"
-    if aligned.exists():
+    if _needs_aligned(m):
+        aligned = MATCH / m["aligned"] if m.get("aligned") else None
+        if aligned is None or not aligned.exists():
+            _reject_pair(k, "reject:missing-aligned",
+                         f"aligned track {m.get('aligned') or '(unnamed)'} missing")
+            raise MissingAligned(k)
         return str(aligned), 0.0
     return str(AUDIO / f"{dub_id}.m4a"), lag
+
+
+def _reject_pair(k, verdict, detail):
+    """Turn an accepted pair into a (cached, expiring) rejection; remux drops
+    the row on its next prepare of the pair."""
+    p = _match_path(k)
+    try:
+        m = json.load(open(p))
+    except Exception:  # noqa: BLE001
+        m = {}
+    m.update(verdict=verdict, detail=detail, created=int(time.time()), align_version=ALIGN_VERSION)
+    json.dump(m, open(p, "w"), indent=1)
+    job = _jobs.get(k)
+    if job:
+        job.update(status="rejected", result=m)
+    _file_layout_path(k).unlink(missing_ok=True)
+    print(f"pair {k}: {verdict} ({detail})", file=sys.stderr, flush=True)
 
 
 def _mux_source(k, video_url):
@@ -1156,6 +1182,106 @@ def _start_mux(k, video_url, dub_id, lag):
     _jit_start(k, video_url, dub_id, lag, tab, 0)
 
 
+SYNC_MAX_S = 0.35
+SYNC_SPAN_S = 45.0
+SYNC_SEARCH_S = 30.0   # must exceed any plausible misalignment (E02 was 21 s)
+
+
+def _audio_window(src, start, span, remote):
+    """Mono PCM of the first audio track, [start, start+span) on the file's
+    RE-BASED clock (the aligner's clock: t = 0 at the container start)."""
+    import numpy as np
+    base = _start_time(src) or 0.0
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", *(dubmux.ua_for(src) if remote else ()),
+           "-ss", f"{base + start:.3f}", "-t", f"{span:.3f}", "-i", src, "-map", "0:a:0",
+           "-vn", "-sn", "-ac", "1", "-ar", str(dubmux.RATE), "-f", "f32le", "-"]
+    return np.frombuffer(dubmux.run(cmd, timeout=240).stdout, dtype=np.float32)
+
+
+def _sync_check(k, dub_id):
+    """Does the dub the mux will use line up with the release's own audio?
+    Two 45 s stretches past the 3-minute mark (lag searched +-30 s) (where a wrong or missing
+    alignment shows); the release audio is the raw copy's (local) or the
+    release itself (its resolved URL is cached — no debrid request).
+    Confident windows (ratio >= 8) that disagree by more than 0.35 s in the
+    majority reject the pair (reject:sync). Stored as match["sync_check"].
+    Returns the result, or None when it could not run."""
+    m = _load_match(k) or {}
+    if m.get("verdict") != "accept":
+        return None
+    try:
+        dubfile, lag = _dub_input(k, dub_id, m.get("lag", 0.0))
+    except MissingAligned:
+        return {"ok": False, "reason": "missing-aligned"}
+    raw = _raw_dir(hq_id_of(k)) / "audio.mka"
+    if raw.exists():
+        src, remote = str(raw), False
+    else:
+        try:
+            src, remote = dubmux.resolve_url(m.get("video_url", "")), True
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        dur = float(m.get("video_duration") or 0) or dubmux.ffprobe_duration(src)
+    except Exception:  # noqa: BLE001
+        return None
+    windows = []
+    for t in (max(240.0, dur * 0.35), max(360.0, dur * 0.7)):
+        if t + SYNC_SPAN_S > dur - 5 or t + lag < 0:
+            continue
+        try:
+            a = _audio_window(src, t, SYNC_SPAN_S, remote)
+            b = _audio_window(dubfile, t + lag, SYNC_SPAN_S, False)
+        except Exception:  # noqa: BLE001
+            continue
+        n = min(len(a), len(b))
+        if n < SYNC_SPAN_S * dubmux.RATE * 0.8:
+            continue
+        off, _peak, ratio = dubmux.xcorr_lag(a[:n], b[:n], SYNC_SEARCH_S)
+        windows.append([round(t), round(float(off), 3), round(float(ratio), 1)])
+    conf = [w for w in windows if w[2] >= 8.0]
+    bad = [w for w in conf if abs(w[1]) > SYNC_MAX_S]
+    ok = not bad or len(bad) * 2 < len(conf)
+    res = {"ok": ok, "windows": windows, "at": int(time.time()),
+           "source": "raw" if not remote else "release"}
+    m = _load_match(k) or {}
+    if m.get("verdict") == "accept":
+        m["sync_check"] = res
+        json.dump(m, open(_match_path(k), "w"), indent=1)
+        if not ok:
+            _reject_pair(k, "reject:sync", f"dub out of sync: {bad}")
+    return res
+
+
+def _sync_check_bg(k, dub_id):
+    """Session-start variant: run once per pair in the background; a failure
+    also stops the session so the player errors out instead of playing the
+    wrong audio (remux drops the row on its next prepare)."""
+    with _lock:
+        if k in _sync_running:
+            return
+        _sync_running.add(k)
+
+    def run():
+        try:
+            res = _sync_check(k, dub_id)
+            if res is not None and not res["ok"]:
+                d = _session_dir(k)
+                (d / ".failed").write_text("sync")
+                prod = _producers.get(k)
+                if prod and prod["proc"].poll() is None:
+                    prod["proc"].kill()
+        except Exception as e:  # noqa: BLE001
+            print(f"sync check {k} failed to run: {e}", file=sys.stderr, flush=True)
+        finally:
+            with _lock:
+                _sync_running.discard(k)
+    threading.Thread(target=run, daemon=True).start()
+
+
+_sync_running: set = set()
+
+
 def _verify_sync(d, max_abs_lag=0.35):
     """Self-check of a finished mux: the dub track must line up with the
     release's own first audio track (they carry the same music/effects bed)
@@ -1250,6 +1376,8 @@ def _open_session(k, dub_id, m, video_url):
     """Make sure the pair's play session exists (JIT or finished); returns its
     directory. Shared by the playlist and the seekable-file endpoints."""
     d = _session_dir(k)
+    if not m.get("sync_check"):
+        _sync_check_bg(k, dub_id)
     if (d / ".done").exists() and not _session_consistent(d):
         # a finished session whose playlist does not describe its segments
         # (a legacy producer killed mid-playlist): rebuild rather than serve
@@ -1271,6 +1399,8 @@ def _open_session(k, dub_id, m, video_url):
         # the release's resolver is rate-limiting: tell the player to retry
         # rather than building a session on a placeholder video
         raise HTTPException(503, f"source temporarily unavailable: {e}", headers={"Retry-After": "60"})
+      except MissingAligned:
+        raise HTTPException(409, "pair rejected: aligned track missing")
     return d
 
 
@@ -1369,7 +1499,10 @@ def _ensure_segment(k, dub_id, n):
                     src = dubmux.resolve_url(m.get("video_url", ""))   # cached: no resolver hit per seek
                 except dubmux.SourceUnavailable as e:
                     raise HTTPException(503, f"source temporarily unavailable: {e}", headers={"Retry-After": "30"})
-                _jit_start(k, src, dub_id, m.get("lag", 0.0), tab, n)
+                try:
+                    _jit_start(k, src, dub_id, m.get("lag", 0.0), tab, n)
+                except MissingAligned:
+                    raise HTTPException(409, "pair rejected: aligned track missing")
         elif (d / ".done").exists() or (d / ".failed").exists():
             raise HTTPException(404)
         end = time.time() + SEG_WAIT_S
@@ -1430,7 +1563,10 @@ def _file_layout(k, dub_id, create=True):
             except Exception:  # noqa: BLE001
                 raw_sizes = None
             if raw_sizes and len(raw_sizes) == n:
-                dubfile, _lag = _dub_input(k, dub_id, 0.0)
+                try:
+                    dubfile, _lag = _dub_input(k, dub_id, 0.0)
+                except MissingAligned:
+                    return None
                 try:
                     rate = os.path.getsize(dubfile) / max(1.0, starts[-1] - starts[0] + durs[-1])
                 except OSError:
