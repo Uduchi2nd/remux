@@ -1022,23 +1022,70 @@ def _jit_cmd(k, src, remote, dubfile, lag, tab, start_seg, d):
     # T - origin + dub_st + lag.
     dub_st = _start_time(dubfile) or 0.0
     shift = origin - dub_st - lag
+    # The table clock is the RAW COPY's (MPEG-TS; starts at `origin`, ~1.5 s).
+    # Produced from the remote release (raw copy gone), the video clock is the
+    # MKV's own (starts ~0): seek there by T - delta and move every output
+    # timestamp back by +delta, so segments are identical whichever source
+    # made them and the dub (whose shift is on the table clock) lines up.
+    # Without it every remote-built session put the dub ~1.56 s early
+    # (2026-09-29 audit: 22 sessions at -1.556 s).
+    delta = 0.0
+    lead = 0
+    if remote:
+        delta = origin - (_start_time(src) or 0.0)
+        if start_seg > 0:
+            # an MKV input seek lands on the previous INDEXED keyframe (cues
+            # every few seconds: 898.04 for a 903.0 target). Find where, and
+            # make the stretch before the segment start a throw-away lead-in
+            # segment (numbered start_seg-1, discarded by the mover), so the
+            # kept segments start exactly on the table and keep its clock.
+            land = _seek_landing(src, T - delta)
+            if land is not None and land + delta < T - 0.02:
+                lead = 1
+                times = ",".join(f"{b - (land + delta):.6f}" for b in starts[start_seg:])
     # the dub is always input-seeked so no packet lands before 0 (ffmpeg's
     # avoid_negative_ts would otherwise shift the whole run's clock)
     S = max(0.0, T - shift)
-    seek_v = ["-ss", f"{T:.6f}"] if start_seg > 0 else []
+    seek_v = ["-ss", f"{max(0.0, T - delta):.6f}"] if start_seg > 0 else []
     seek_d = ["-ss", f"{S:.6f}"] if S > 0 else []
     return ["ffmpeg", "-nostdin", "-y", "-v", "warning", *(dubmux.ua_for(src) if remote else ()),
             "-copyts", *seek_v, "-i", src,
-            "-copyts", *seek_d, "-itsoffset", f"{shift:.6f}", "-i", dubfile,
+            "-copyts", *seek_d, "-itsoffset", f"{shift - delta:.6f}", "-i", dubfile,
             "-map", "0:v:0", "-map", "1:a:0", "-map", "0:a?", "-sn", "-c", "copy",
             *(dubmux.ts_video_bsf(src) if remote else ()),
             "-metadata:s:a:0", "language=vie", "-metadata:s:a:0", "title=Tiếng Việt (Thuyết Minh)",
             "-disposition:a:0", "default", "-muxdelay", "0", "-muxpreload", "0",
+            *(["-output_ts_offset", f"{delta:.6f}"] if delta else []),
             "-f", "segment", "-segment_format", "mpegts", "-segment_times", times,
-            "-segment_time_delta", "0.001", "-segment_start_number", str(start_seg),
+            "-segment_time_delta", "0.001", "-segment_start_number", str(start_seg - lead),
             "-reset_timestamps", "0",
             "-segment_list", str(d / "live.m3u8"), "-segment_list_type", "m3u8",
             "-segment_list_flags", "live", str(d / "seg%05d.ts")]
+
+
+_landings: dict = {}
+
+
+def _seek_landing(src, t):
+    """PTS of the first video packet ffmpeg's own input seek to t lands on
+    (cached). ffprobe's -read_intervals seeks differently (reported 903.0
+    where ffmpeg lands on 898.04), so ask ffmpeg: framecrc prints pts."""
+    key = (src.split("?")[0], round(t, 3))
+    if key in _landings:
+        return _landings[key]
+    try:
+        out = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", *dubmux.ua_for(src), "-copyts",
+                              "-ss", f"{t:.6f}", "-i", src, "-map", "0:v:0", "-c", "copy",
+                              "-frames:v", "1", "-f", "framecrc", "-"],
+                             capture_output=True, timeout=90).stdout.decode()
+        tb = next(l for l in out.splitlines() if l.startswith("#tb 0:")).split(":")[1].strip()
+        num, den = (int(x) for x in tb.split("/"))
+        pkt = next(l for l in out.splitlines() if l and not l.startswith("#"))
+        v = int(pkt.split(",")[2]) * num / den
+    except Exception:  # noqa: BLE001
+        return None
+    _landings[key] = v
+    return v
 
 
 def _run_dir(d, start_seg):
@@ -1118,6 +1165,9 @@ def _jit_start(k, video_url, dub_id, lag, tab, start_seg=0, end_seg=None):
             names = sorted(f.name for f in rd.glob("seg*.ts"))
         for name in names:
             f = rd / name
+            if f.exists() and int(name[3:8]) < start_seg:
+                f.unlink(missing_ok=True)      # remote-seek lead-in: not a table segment
+                continue
             if f.exists():
                 os.replace(f, d / name)
                 prod["cursor"] = max(prod["cursor"], int(name[3:8]))
