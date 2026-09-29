@@ -1694,6 +1694,22 @@ async fn item_for_user(
         );
     }
 
+    // PATCH (uduchi2nd, 2026-09-29): a page opened without MediaSources (or a
+    // show page) fetches the stream list in the background, so pressing play
+    // finds it ready (services::open_prefetch).
+    if media.kind == db::MediaKind::Series
+        || (!needs_streams
+            && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode))
+    {
+        crate::services::open_prefetch::prefetch_on_open(
+            &state.ctx,
+            &media,
+            session
+                .user
+                .id,
+        );
+    }
+
     let user_stream_filter = session
         .user
         .policy
