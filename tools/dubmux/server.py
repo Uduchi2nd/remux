@@ -464,6 +464,13 @@ def _alias_from(k_old, dub_new, hq_new, video_url):
         except OSError:
             shutil.copyfile(src, dst)
     result = dict(old)
+    # Older piecewise records find their aligned track only by name
+    # (<old pair>.aligned.m4a, no "aligned" field): the alias must point at it
+    # explicitly, or the new pair plays the raw dub at lag 0 — correct for the
+    # first run only (Queen of News E02: 21 s off from 3:00, 2026-09-29).
+    if old.get("verdict") == "accept" and not old.get("aligned") \
+            and (MATCH / f"{k_old}.aligned.m4a").exists():
+        result["aligned"] = f"{k_old}.aligned.m4a"
     result.update({"dub": dub_new, "video": hq_new, "video_url": video_url,
                    "aliased_from": k_old, "created": int(time.time())})
     json.dump(result, open(_match_path(k_new), "w"), indent=1)
