@@ -393,7 +393,10 @@ def dub_source(url, log=sys.stderr):
     address: the VN extractor gets a MediaFlow-style wrap (origin + h_Referer,
     which it unwraps), the seedbox fallback the same wrap with the password.
     Falls back to the URL itself when vnphim does not know it."""
-    if "_token_" not in url or not (VNPHIM_URL and VNPHIM_KEY):
+    # a vnphim seekable-file stream (/vn/<id>/file.ts, Americas viewers) is
+    # asked for too: vnphim answers for the playlist behind it
+    is_file = "/vn/" in url and "/file.ts" in url
+    if ("_token_" not in url and not is_file) or not (VNPHIM_URL and VNPHIM_KEY):
         return url
     from urllib.parse import quote, urlencode
     req = urllib.request.Request(f"{VNPHIM_URL}/_internal/dub-source?u={quote(url, safe='')}",
@@ -407,9 +410,11 @@ def dub_source(url, log=sys.stderr):
     origin = info.get("origin")
     if not origin:
         return url
-    if origin.startswith(VNPHIM_URL):
-        return origin  # /y/ or /h/: open segments, fetch as-is
-    mf = url.split("/_token_")[0]
+    if info.get("direct") or origin.startswith(VNPHIM_URL):
+        return origin  # /y/, /h/ or a directly reachable playlist: fetch as-is
+    mf = (info.get("mediaflow") or "").rstrip("/") or url.split("/_token_")[0]
+    if is_file and not info.get("mediaflow"):
+        return url
     params = [("d", origin)]
     if MF_PASSWORD:
         params.append(("api_password", MF_PASSWORD))

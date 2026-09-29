@@ -478,3 +478,22 @@ plain `xcorr` over the segments reads +0.12 s there. That is the gap between
 the two tracks' first audio packets, not a sync error; the audit corrects
 for it.) Two Queen of News E01 sessions built by the old code (−1.56 s) were
 deleted on 2026-09-29.
+
+## Americas viewers get files only; the dub wait stops at the first ready version (2026-09-29)
+- **vnphim (`43748fd`):** a viewer whose IP geolocates to the Americas (US,
+  Canada, Mexico, Central/South America, Caribbean; `geo.AMERICAS`) gets
+  EVERY vnphim stream that can be one file as its seekable
+  `…/vn/<id>/file.ts` instead of HLS. Filenames and bingeGroups are
+  unchanged, so remux keeps its row ids and dub pairing; titles say
+  `· File`. Demuxed hybrids (`/h/`) stay HLS. The separate "File (US)" row
+  is now only added for other viewers outside VN. vnphim HEADs every file at
+  list time (the seedbox builds at most 2 segment tables at once); measured
+  ready within ~30 s of the listing (4K yanhh3d ~35 s).
+- **Dub sources:** remux passes the file URL to the muxer as the dub
+  source. `dub_source` now asks vnphim about `/vn/<id>/file.ts` too, and
+  vnphim answers for what the stream was before: VN-fetched playlists →
+  origin + Referer + the VN MediaFlow base (extracted in VN as before),
+  others → the playlist as-is (`direct`).
+- **remux:** `ensure_dub_rows` does a zero-wait pass over all pairs first;
+  only when no version is ready does it spend the wait (12 s) on the first
+  pair. Versions still preparing appear on a later refresh.
