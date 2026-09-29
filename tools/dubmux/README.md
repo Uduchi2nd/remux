@@ -452,5 +452,29 @@ sync self-check never ran because the session was streamed JIT.
   the session. Result stored in the record (`sync_check`).
   Validated on E02: repaired pair 0.04 s / 0.00 s (ok); the old raw-dub
   mistake −21.08 s / −21.12 s at confidence 30–40 (would reject).
-- One-time audit of every accepted pair with local data (raw copy or
-  finished session): see below.
+- One-time audit (2026-09-29) of every accepted pair with local data: 12
+  checked on the raw copy (ok) and 11 finished sessions (ok). The first pass
+  flagged 22 sessions at −1.556 s: the PAIRS were right, the sessions were
+  wrong (bug below), so the pairs were restored and the sessions deleted.
+  One pair was really out of sync and stays rejected (Love Beyond the Grave
+  E01, 26 s off mid-episode). Pairs without local data are checked when
+  their next session opens.
+
+### Sessions built from the remote release put the dub 1.56 s early (fixed)
+The segment table is on the raw copy's clock (MPEG-TS, first pts ≈ 1.56 s);
+a remote MKV starts at 0. A JIT run from the remote release (raw copy gone
+after 2 h) therefore produced segments 1.56 s off the table, with the dub
+1.56 s early. Fix in `_jit_cmd`: `delta = origin − release start`; seek the
+MKV by `T − delta`, shift the dub input by `−delta` and every output
+timestamp by `+delta` (`-output_ts_offset`). A second trap: an MKV input
+seek lands on the previous INDEXED keyframe (cues every few seconds — 898.04
+for a 903.0 target), and ffprobe's `-read_intervals` reports a different
+landing than ffmpeg actually uses. `_seek_landing` asks ffmpeg itself
+(`-f framecrc`, one packet), and the run then cuts the stretch before the
+segment start as a lead-in segment numbered `start_seg − 1`, which the mover
+discards. Verified on Early Spring E01 runs from segments 0 / 150 / 300:
+first pts 1.56 / 904.56 / 1803.76 = the table, dub vs original 0.000 s. (A
+plain `xcorr` over the segments reads +0.12 s there. That is the gap between
+the two tracks' first audio packets, not a sync error; the audit corrects
+for it.) Two Queen of News E01 sessions built by the old code (−1.56 s) were
+deleted on 2026-09-29.
