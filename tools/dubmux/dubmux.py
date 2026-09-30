@@ -64,23 +64,38 @@ RESOLVE_TTL_S = 3 * 3600      # debrid CDN links stay valid for hours
 BG_RESOLVE_GAP_S = float(os.environ.get("DUBMUX_BG_RESOLVE_GAP_S", "20"))
 
 
-# Circuit breaker for BACKGROUND resolves: the first placeholder answer pauses
-# them 30 min, doubling per consecutive trip up to 4 h; a real answer resets.
-_breaker = {"until": 0.0, "last": 0.0}
+# Circuit breaker for BACKGROUND resolves, PER RESOLVER HOST (2026-09-30:
+# Torrentio's per-IP limit must not pause AIOStreams/TorBox preparations, and
+# vice versa): the first placeholder answer pauses that host's background
+# resolves 30 min, doubling per consecutive trip up to 4 h; a real answer
+# from the host resets its backoff.
+_breakers: dict = {}          # host -> {"until": t, "last": pause}
 BREAKER_FIRST_S, BREAKER_MAX_S = 1800, 4 * 3600
 
 
-def breaker_remaining():
-    return max(0, int(_breaker["until"] - time.time()))
+def _host(url):
+    from urllib.parse import urlsplit
+    return urlsplit(url or "").netloc.lower()
 
 
-def _trip_breaker():
-    if time.time() < _breaker["until"]:
+def breaker_remaining(url=None):
+    """Seconds left on the breaker of `url`'s resolver host; without a url,
+    the longest pause of any host (health/status)."""
+    now = time.time()
+    if url is not None:
+        b = _breakers.get(_host(url))
+        return max(0, int(b["until"] - now)) if b else 0
+    return max([0] + [int(b["until"] - now) for b in _breakers.values()])
+
+
+def _trip_breaker(url):
+    b = _breakers.setdefault(_host(url), {"until": 0.0, "last": 0.0})
+    if time.time() < b["until"]:
         return
-    last = _breaker["last"]
-    pause = BREAKER_FIRST_S if not last else min(last * 2, BREAKER_MAX_S)
-    _breaker.update(until=time.time() + pause, last=pause)
-    print(f"  resolver rate-limited: background resolves paused {pause // 60} min", file=sys.stderr, flush=True)
+    pause = BREAKER_FIRST_S if not b["last"] else min(b["last"] * 2, BREAKER_MAX_S)
+    b.update(until=time.time() + pause, last=pause)
+    print(f"  resolver rate-limited ({_host(url)}): background resolves paused {pause // 60} min",
+          file=sys.stderr, flush=True)
 
 
 def resolve_url(url, timeout=20, background=False):
@@ -97,8 +112,9 @@ def resolve_url(url, timeout=20, background=False):
     if hit and now - hit[1] < RESOLVE_TTL_S:
         return hit[0]
     if background:
-        if breaker_remaining():
-            raise SourceUnavailable(f"background resolves paused {breaker_remaining()}s (resolver rate limit)")
+        if breaker_remaining(url):
+            raise SourceUnavailable(f"background resolves paused {breaker_remaining(url)}s "
+                                    f"({_host(url)} rate limit)")
         with _resolve_lock:
             gap = _last_bg_resolve[0] + BG_RESOLVE_GAP_S - time.time()
             if gap > 0:
@@ -114,10 +130,11 @@ def resolve_url(url, timeout=20, background=False):
     except Exception:  # noqa: BLE001
         return url
     if _PLACEHOLDER.search(final.split("?")[0]):
-        _trip_breaker()
+        _trip_breaker(url)
         raise SourceUnavailable(f"resolver returned a placeholder ({final.rsplit('/', 1)[-1]})")
-    if time.time() >= _breaker["until"]:
-        _breaker["last"] = 0.0          # answering normally again: reset the backoff
+    b = _breakers.get(_host(url))
+    if b and time.time() >= b["until"]:
+        b["last"] = 0.0                 # answering normally again: reset the backoff
     if final != url:
         _resolved[url] = (final, now)
         if len(_resolved) > 5000:

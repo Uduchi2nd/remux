@@ -731,8 +731,9 @@ async def prepare(req: Request):
         hit = _index_get(origin, name) if origin else None
         if not hit or hit.get("pair") == k:
             return {"status": "skipped", "stage": "cached_only"}
-    if priority > 9 and dubmux.breaker_remaining() and not _jobs.get(k):
-        return {"status": "skipped", "stage": f"paused {dubmux.breaker_remaining()}s (resolver rate limit)"}
+    if priority > 9 and dubmux.breaker_remaining(video["url"]) and not _jobs.get(k):
+        return {"status": "skipped",
+                "stage": f"paused {dubmux.breaker_remaining(video['url'])}s (resolver rate limit)"}
     with _lock:
         job = _jobs.get(k)
         if not job or (job["status"] in ("error",) and time.time() - job.get("finished", 0) > 60):
