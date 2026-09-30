@@ -324,7 +324,11 @@ impl StreamDescriptor {
 /// observations so opening an item repeatedly does not repeat the request.
 const CONFIRMED_MISSING_TTL: std::time::Duration =
     std::time::Duration::from_secs(10 * 60);
-const OTHER_HEAD_RESULT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+// PATCH (uduchi2nd, 2026-09-30): was 30 s, so every PlaybackInfo re-resolved
+// every version's redirect chain — for Torrentio versions one Torrentio
+// request each, which helped trip its per-IP limit. Debrid CDN links stay
+// valid for hours; 20 min keeps repeated opens off the resolvers.
+const OTHER_HEAD_RESULT_TTL: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 static STREAM_HEAD_CACHE: std::sync::LazyLock<
     std::sync::Mutex<
         std::collections::HashMap<(Uuid, u64), (std::time::Instant, bool, Option<String>)>,
@@ -393,8 +397,15 @@ async fn check_http_stream(id: Uuid, info: &StreamInfo) -> HttpHeadResult {
                     .flatten()
             })
             .flatten();
+        // A resolver's rate-limit/error clip (AIOStreams /static/429.mp4,
+        // Torrentio /videos/limits_exceeded_v2.mp4) is never the release:
+        // do not hand it out, and ask again soon.
+        let placeholder = is_placeholder_url(response.url().as_str());
+        let redirected_url = if placeholder { None } else { redirected_url };
         let ttl = if missing {
             CONFIRMED_MISSING_TTL
+        } else if placeholder {
+            std::time::Duration::from_secs(30)
         } else {
             OTHER_HEAD_RESULT_TTL
         };
@@ -433,6 +444,22 @@ pub async fn stream_is_confirmed_missing(id: Uuid, info: &StreamInfo) -> bool {
 /// Return a safe final URL after an HTTP redirect, if a successful HEAD probe
 /// has already resolved one. This keeps signed redirect targets in memory only
 /// and avoids repeating the HEAD during the same short playback-info window.
+/// Resolver placeholder clips served instead of a release when rate limited.
+pub(crate) fn is_placeholder_url(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    let path = u
+        .path()
+        .to_ascii_lowercase();
+    let host = u
+        .host_str()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    (host == "torrentio.strem.fun" && path.starts_with("/videos/") && path.ends_with(".mp4"))
+        || (path.starts_with("/static/") && path.ends_with(".mp4"))
+}
+
 pub async fn redirected_client_url(id: Uuid, info: &StreamInfo) -> Option<String> {
     check_http_stream(id, info).await.redirected_url
 }

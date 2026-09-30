@@ -25,6 +25,11 @@ const MAX_OPEN: Duration = Duration::from_secs(4 * 3600);
 /// AIOStreams' static error clips are ~2 minutes long.
 const PLACEHOLDER_MIN_SECS: i64 = 110;
 const PLACEHOLDER_MAX_SECS: i64 = 130;
+/// Torrentio's per-IP limit answers with a 30 s clip
+/// (`/videos/limits_exceeded_v2.mp4`, 2026-09-30); only counted when the
+/// probe already judged the stream far shorter than the item's runtime.
+const TORRENTIO_MIN_SECS: i64 = 28;
+const TORRENTIO_MAX_SECS: i64 = 32;
 /// This many placeholder answers within [`TRIP_WINDOW`] trip the breaker (a
 /// single short release is not a rate limit).
 const TRIP_COUNT: usize = 3;
@@ -102,7 +107,9 @@ pub(crate) fn trip(reason: &str) {
 /// A probe produced media of `probed_secs` duration that failed the
 /// short-stream check. Placeholder-length answers count toward a trip.
 pub(crate) fn note_short_probe(probed_secs: i64) {
-    if !(PLACEHOLDER_MIN_SECS..=PLACEHOLDER_MAX_SECS).contains(&probed_secs) {
+    if !(PLACEHOLDER_MIN_SECS..=PLACEHOLDER_MAX_SECS).contains(&probed_secs)
+        && !(TORRENTIO_MIN_SECS..=TORRENTIO_MAX_SECS).contains(&probed_secs)
+    {
         return;
     }
     let trip_now = {
