@@ -50,7 +50,13 @@ class SourceUnavailable(RuntimeError):
 # AIOStreams answers a rate-limited or failed playback request with a 307 to a
 # short placeholder video (`/static/429.mp4`, `/static/500.mp4`, ...). Muxing
 # that produced a dub row that "loads but never plays" (2026-09-27).
-_PLACEHOLDER = re.compile(r"/static/\d{3}[^/]*\.mp4$|/static/[a-z_-]*error[^/]*\.mp4$", re.I)
+# Torrentio does the same with its own clips under /videos/ (30 s
+# `limits_exceeded_v2.mp4` when its per-IP limit is hit; also downloading_*,
+# failed_*): those were "rejected" as a duration mismatch, i.e. permanently
+# (Against the Current E1, 2026-09-30) instead of retried.
+_PLACEHOLDER = re.compile(r"/static/\d{3}[^/]*\.mp4$|/static/[a-z_-]*error[^/]*\.mp4$"
+                          r"|torrentio\.strem\.fun/videos/[^/]+\.mp4$"
+                          r"|/videos/[a-z_]*(?:limit|exceed|fail|error|download|unavailable)[^/]*\.mp4$", re.I)
 _resolved: dict = {}          # url -> (final url, time)
 _resolve_lock = threading.Lock()
 _last_bg_resolve = [0.0]
