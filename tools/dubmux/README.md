@@ -497,3 +497,6 @@ deleted on 2026-09-29.
 - **remux:** `ensure_dub_rows` does a zero-wait pass over all pairs first;
   only when no version is ready does it spend the wait (12 s) on the first
   pair. Versions still preparing appear on a later refresh.
+
+## Keeper (2026-09-30)
+`~/dubmux/keeper.sh` on the seedbox, cron every 2 min: starts the container when it is not running (rootless podman does not revive a container stopped by a SIGTERM — Whatbox maintenance on 2026-09-29 left the muxer down while every other keeper-managed container came back), and restarts it only after two failed `/health` checks in a row (5-min cooldown; a restart cuts playback). Log: `~/dubmux/keeper.log`.
