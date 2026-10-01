@@ -397,12 +397,52 @@ def vn_sizes(urls, timeout=300):
     return out
 
 
+_vn_conns = threading.local()
+
+
+def _vn_conn(fresh=False):
+    """This thread's kept-alive HTTPS connection to the VN extractor (through
+    the seedbox's userspace tailscaled CONNECT proxy). A new connection costs
+    ~0.6 s of CONNECT + TLS round trips at 215 ms RTT before any byte moves
+    (2026-09-30); reusing one, a request costs one round trip."""
+    import http.client
+    import ssl
+    from urllib.parse import urlsplit
+    c = getattr(_vn_conns, "c", None)
+    if c is None or fresh:
+        if c is not None:
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+        vn = urlsplit(VN_EXTRACTOR)
+        proxy = urlsplit(os.environ.get("DUBMUX_VN_PROXY", "http://127.0.0.1:1055"))
+        c = http.client.HTTPSConnection(proxy.hostname, proxy.port, timeout=120,
+                                        context=ssl.create_default_context())
+        c.set_tunnel(vn.hostname, vn.port or 443)
+        _vn_conns.c = c
+    return c
+
+
 def vn_segment(url, timeout=120):
-    """One origin segment, fetched in VN and relayed over the tailnet."""
-    from urllib.parse import quote
-    req = urllib.request.Request(VN_EXTRACTOR + "/seg?u=" + quote(url, safe=""))
-    with vn_opener().open(req, timeout=timeout) as r:
-        return r.read()
+    """One origin segment, fetched in VN and relayed over the tailnet, over a
+    kept-alive connection (retried once on a fresh one)."""
+    from urllib.parse import quote, urlsplit
+    path = urlsplit(VN_EXTRACTOR).path.rstrip("/") + "/seg?u=" + quote(url, safe="")
+    for attempt in (0, 1):
+        c = _vn_conn(fresh=attempt == 1)
+        try:
+            c.timeout = timeout
+            c.request("GET", path)
+            r = c.getresponse()
+            body = r.read()
+            if r.status != 200:
+                raise IOError(f"VN /seg HTTP {r.status}: {body[:120]!r}")
+            return body
+        except (OSError, Exception) as e:  # noqa: BLE001
+            if attempt == 1:
+                raise
+            print(f"  VN connection reset ({str(e)[:80]}); retrying on a new one", file=sys.stderr, flush=True)
 
 
 VNPHIM_URL = os.environ.get("DUBMUX_VNPHIM_URL", "").rstrip("/")
