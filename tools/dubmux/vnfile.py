@@ -167,8 +167,11 @@ def _build(hls, match, fid, d, tp):
     json.dump(table, open(tp, "w"))
     d.mkdir(parents=True, exist_ok=True)
     _tables[fid] = table
-    # players read the start and the END (duration) first: have them ready
-    for i in sorted({0, 1, 2, len(segs) - 1}):
+    # players read the start and the END (duration) first: have them ready.
+    # Only the first and last piece: every listed file is warmed at once and
+    # the VN line tops out near 2 MB/s, so four pieces per file crowded out
+    # the one the viewer actually opened (2026-09-30).
+    for i in sorted({0, len(segs) - 1}):
         _submit(hls, match, fid, i, False)
     print(f"vnfile {fid}: {len(segs)} segments, {sum(slots) / 1e6:.0f} MB, vn={vn} rebase={rebase}",
           file=sys.stderr, flush=True)
@@ -286,7 +289,12 @@ def _submit(hls, match, fid, i, urgent):
     with _lock:
         f = _inflight.get(key)
         if f and not f.done():
-            return f
+            # A player is waiting for a segment that is only QUEUED for
+            # prefetch (behind every warm-up of every listed file): pull it
+            # out of that queue and fetch it now (2026-09-30: the first bytes
+            # of a fresh kkphim file took 57 s this way).
+            if not (urgent and f.cancel()):
+                return f
         pool = URGENT if urgent else PREFETCH
         f = pool.submit(_fetch, hls, match, fid, i)
         _inflight[key] = f
@@ -306,12 +314,20 @@ def ensure(hls, match, fid, i, timeout=90):
     (d / ".touched").write_text(str(int(time.time())))
     out = d / f"s{i:05d}.ts"
     n = len(table["segs"])
-    for j in range(i + 1, min(n, i + 1 + AHEAD)):
-        if not (d / f"s{j:05d}.ts").exists():
-            _submit(hls, match, fid, j, False)
+
+    def read_ahead(_=None):
+        for j in range(i + 1, min(n, i + 1 + AHEAD)):
+            if not (d / f"s{j:05d}.ts").exists():
+                _submit(hls, match, fid, j, False)
     if out.exists():
+        read_ahead()
         return out
-    return _submit(hls, match, fid, i, True).result(timeout=timeout)
+    # the piece the player waits for goes first; the read-ahead starts once
+    # it has arrived, so 12 prefetches do not share the ~2 MB/s VN line with
+    # it (seeks took 3-5 s with them competing, 2026-09-30)
+    fut = _submit(hls, match, fid, i, True)
+    fut.add_done_callback(read_ahead)
+    return fut.result(timeout=timeout)
 
 
 def sweep(hls):

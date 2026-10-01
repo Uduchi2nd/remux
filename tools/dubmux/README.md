@@ -505,3 +505,15 @@ deleted on 2026-09-29.
 - Torrentio answers its per-IP limit with a 30 s clip (`torrentio.strem.fun/videos/limits_exceeded_v2.mp4`). The placeholder check only knew AIOStreams' `/static/429.mp4`, so such pairs were rejected as a duration mismatch, i.e. permanently (Against the Current E1: 3 of 5 pairs). `_PLACEHOLDER` now also matches Torrentio's `/videos/*.mp4` clips → `SourceUnavailable` (retry later, trips the resolver breaker). 12 such records + 3 test-run records rejected against the 2-minute AIOStreams clip were moved to `data/match-placeholder-rejects-20260930/` so they are prepared again.
 - After the 2026-09-29 maintenance podman listed the container as stopped while its process (and its conmon) kept serving. `podman start` then only produced copies failing on the busy port, and a redeploy (`run.sh`) could not bind until the old conmon was killed (it restarts its child otherwise). The keeper now trusts `/health` over podman's state. If this recurs: kill the old container's `conmon` (match its container id in `ps`), then its uvicorn, then `run.sh`.
 - The resolver breaker is now PER HOST (`dubmux._breakers`): a Torrentio limit pauses only background preparations whose release link goes through `torrentio.strem.fun`; AIOStreams/TorBox pairs keep going (and vice versa). `/health` `breaker_secs` reports the longest pause of any host. Page opens (priority 10) are "background" for this rule; playback (≤ 9) is never paused.
+
+## vnphim file latency (2026-09-30)
+Measured on cold Early Spring episodes (US viewer, `.ts` file versions):
+
+| | before | after |
+|---|---|---|
+| kkphim (via the VN box), start of episode, first byte | 57.5 s | 4.9 s |
+| kkphim, seek to an uncached spot, first byte | 3.5–8.4 s | 2.6–3.4 s |
+| kkphim, sustained | 1.25 MB/s | 1.86 MB/s |
+| hotphim / yanhh3d (seedbox fetches directly), start or seek | 0.7 s | — |
+
+Causes and fixes: an urgent read piggybacked on the same segment's QUEUED prefetch (behind every warm-up) → urgent requests now cancel a not-yet-started prefetch and run in the urgent pool; warm-up per file cut to the first + last piece; read-ahead starts only after the waited-for piece arrived; VN `/seg` requests reuse a kept-alive HTTPS connection per thread (a new CONNECT + TLS costs ~0.6 s at 215 ms RTT). Limits measured: one VN→US connection ≈ 0.6 MB/s, the VN line ≈ 2 MB/s aggregate (16 parallel), the VN box itself fetches a kkphim piece in ~0.47 s; splitting a piece into parallel ranges does not help; `tcp_slow_start_after_idle=0` on the VN host did not help (reverted).
