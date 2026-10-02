@@ -2346,11 +2346,14 @@ async fn item_for_user(
                             .media_streams
                             .get_or_insert_with(Vec::new);
                         list.retain(|s| {
+                            let sub = matches!(s.type_, Some(api::MediaStreamType::Subtitle));
                             !is_ext_sub(s)
-                                && !(matches!(
-                                    s.type_,
-                                    Some(api::MediaStreamType::Subtitle)
-                                ) && ext_idx.contains(&s.index))
+                                && !(sub && ext_idx.contains(&s.index))
+                                // a dub row's release tracks dropped by the
+                                // language filter (SubtitleLanguages) go too
+                                && !(sub
+                                    && s.index
+                                        >= crate::services::dubmux::SUBTITLE_INDEX_OFFSET)
                         });
                         list.extend(ext);
                         base_item.has_subtitles = Some(true);
