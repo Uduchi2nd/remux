@@ -2284,6 +2284,7 @@ async fn item_for_user(
                     .subtitle_languages
                     .clone()
                     .unwrap_or_default();
+                let dub_row_langs = sub_langs.clone();
                 super::subtitles::inject_external_subtitles(
                     &state,
                     &mut subtitle_media,
@@ -2309,7 +2310,9 @@ async fn item_for_user(
                         .device
                         .access_token
                         .expose(),
+                    &dub_row_langs,
                 );
+                super::subtitles::sync_subtitle_default_flags(sources);
                 for source in sources.iter_mut() {
                     for s in &mut source.media_streams {
                         if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {

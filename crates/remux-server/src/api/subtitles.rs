@@ -2053,6 +2053,7 @@ pub(crate) fn present_dub_row_embedded_subtitles(
     media_sources: &mut [api::MediaSourceInfo],
     item_id: Uuid,
     api_key: &str,
+    sub_langs: &[String],
 ) {
     for source in media_sources.iter_mut() {
         if !crate::services::dubmux::is_mux_path(
@@ -2065,16 +2066,26 @@ pub(crate) fn present_dub_row_embedded_subtitles(
         let source_id = source
             .id
             .clone();
-        // Players that ignore DefaultSubtitleStreamIndex follow the tracks'
-        // own default flags: only the server's chosen track keeps one.
-        if let Some(default_idx) = source.default_subtitle_stream_index {
-            for stream in source
+        // The release's own text tracks follow the same language filter as
+        // add-on subtitles (SubtitleLanguages, e.g. en+vi): a dub row listed
+        // every Chinese/Arabic/... track of the release, and VidHub picked
+        // the first one (Chinese) — 2026-10-02.
+        if !sub_langs.is_empty() {
+            source
                 .media_streams
-                .iter_mut()
-                .filter(|s| matches!(s.type_, Some(api::MediaStreamType::Subtitle)))
-            {
-                stream.is_default = Some(stream.index == default_idx);
-            }
+                .retain(|s| {
+                    !matches!(s.type_, Some(api::MediaStreamType::Subtitle))
+                        || s.index < crate::services::dubmux::SUBTITLE_INDEX_OFFSET
+                        || s.is_external
+                        || s.language
+                            .as_deref()
+                            .and_then(lang_to_two_letter)
+                            .is_some_and(|l| {
+                                sub_langs
+                                    .iter()
+                                    .any(|w| w.eq_ignore_ascii_case(&l))
+                            })
+                });
         }
         for stream in source
             .media_streams
@@ -2122,6 +2133,26 @@ pub(crate) fn present_dub_row_embedded_subtitles(
                     t.push_str(" (release)");
                 }
             }
+        }
+    }
+}
+
+/// Players that ignore `DefaultSubtitleStreamIndex` (VidHub) follow the
+/// tracks' own default flags: only the server's chosen track keeps one.
+pub(crate) fn sync_subtitle_default_flags(media_sources: &mut [api::MediaSourceInfo]) {
+    for source in media_sources.iter_mut() {
+        let Some(default_idx) = source.default_subtitle_stream_index else {
+            continue;
+        };
+        if default_idx < 0 {
+            continue;
+        }
+        for stream in source
+            .media_streams
+            .iter_mut()
+            .filter(|s| matches!(s.type_, Some(api::MediaStreamType::Subtitle)))
+        {
+            stream.is_default = Some(stream.index == default_idx);
         }
     }
 }

@@ -632,6 +632,10 @@ async fn items_playbackinfo_inner(
                 .device
                 .access_token
                 .expose(),
+            &probe_cfg
+                .subtitle_languages
+                .clone()
+                .unwrap_or_default(),
         );
     }
 
@@ -650,6 +654,7 @@ async fn items_playbackinfo_inner(
         );
         ensure_remote_hls_audio_default(source);
     }
+    super::subtitles::sync_subtitle_default_flags(&mut media_sources);
 
     // Cache the group-resolved stream UUID so the stream endpoint can find it
     // without re-running filter_sources (which could pick a different candidate).
