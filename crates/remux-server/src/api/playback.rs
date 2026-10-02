@@ -898,6 +898,10 @@ async fn items_playbackinfo_inner(
         true,
     )
     .await;
+    let dub_row_langs = probe_cfg
+        .subtitle_languages
+        .clone()
+        .unwrap_or_default();
     super::subtitles::present_dub_row_embedded_subtitles(
         &mut media_sources,
         id,
@@ -905,6 +909,7 @@ async fn items_playbackinfo_inner(
             .device
             .access_token
             .expose(),
+        &dub_row_langs,
     );
 
     // Re-resolve defaults after external subtitles were injected so language
@@ -922,6 +927,7 @@ async fn items_playbackinfo_inner(
         );
         ensure_remote_hls_audio_default(source);
     }
+    super::subtitles::sync_subtitle_default_flags(&mut media_sources);
 
     // Rank sources by how well they match the device's capabilities (transcode
     // cost, observed or explicitly supported 4K, HDR tier, bit depth, audio quality, embedded subs)
