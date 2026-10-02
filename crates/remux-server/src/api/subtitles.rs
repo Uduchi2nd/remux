@@ -1799,7 +1799,19 @@ fn mark_subtitle_auto_synced(stream: &mut api::MediaStream) {
         let (stem, extension) = path
             .rsplit_once('.')
             .unwrap_or((path.as_str(), "vtt"));
-        *path = format!("{stem} [Synced].{extension}");
+        // keep a trailing language code (".vie") right before the extension
+        let (stem, lang) = match stem.rsplit_once('.') {
+            Some((base, code))
+                if (2..=3).contains(&code.len())
+                    && code
+                        .chars()
+                        .all(|c| c.is_ascii_alphabetic()) =>
+            {
+                (base, format!(".{code}"))
+            }
+            _ => (stem, String::new()),
+        };
+        *path = format!("{stem} [Synced]{lang}.{extension}");
     }
 }
 
@@ -2053,6 +2065,17 @@ pub(crate) fn present_dub_row_embedded_subtitles(
         let source_id = source
             .id
             .clone();
+        // Players that ignore DefaultSubtitleStreamIndex follow the tracks'
+        // own default flags: only the server's chosen track keeps one.
+        if let Some(default_idx) = source.default_subtitle_stream_index {
+            for stream in source
+                .media_streams
+                .iter_mut()
+                .filter(|s| matches!(s.type_, Some(api::MediaStreamType::Subtitle)))
+            {
+                stream.is_default = Some(stream.index == default_idx);
+            }
+        }
         for stream in source
             .media_streams
             .iter_mut()
@@ -2081,7 +2104,15 @@ pub(crate) fn present_dub_row_embedded_subtitles(
                 .path
                 .is_none()
             {
-                stream.path = Some(format!("{lang} (release).vtt"));
+                // the trailing ".<lang>.vtt" is how Jellyfin sidecars carry
+                // their language; VidHub's language preference reads it
+                // (2026-10-02: it picked the first track, Chinese, without)
+                let name = stream
+                    .display_title
+                    .clone()
+                    .unwrap_or_else(|| lang.clone());
+                let name = name.replace(" (release)", "");
+                stream.path = Some(format!("{name} (release).{lang}.vtt"));
             }
             if let Some(t) = stream
                 .display_title
@@ -2178,7 +2209,12 @@ pub(crate) async fn inject_external_subtitles(
             // "(vnphim N)": addon tracks are numbered per language so two
             // Vietnamese files (and the release's own) can be told apart.
             let label = labels[i].clone();
-            stream.path = Some(format!("{label}.vtt"));
+            let code = sub
+                .lang
+                .as_deref()
+                .unwrap_or("und")
+                .to_ascii_lowercase();
+            stream.path = Some(format!("{label}.{code}.vtt"));
             stream.display_title = Some(label);
             if let Some(descriptor) = sub
                 .url
@@ -2377,6 +2413,20 @@ mod tests {
         // A subsequent selection must replace the previous fallback mapping.
         save_subtitle_source(ctx, "player-a", item, item, item);
         assert_eq!(resolve_subtitle_source(ctx, "player-a", item, item), item);
+    }
+
+    #[test]
+    fn synced_marker_goes_before_the_language_code() {
+        let mut stream = api::MediaStream {
+            language: Some("vie".into()),
+            display_title: Some("vie (1)".into()),
+            path: Some("vie (1).vie.vtt".into()),
+            ..Default::default()
+        };
+        mark_subtitle_auto_synced(&mut stream);
+        mark_subtitle_auto_synced(&mut stream);
+        assert_eq!(stream.path.as_deref(), Some("vie (1) [Synced].vie.vtt"));
+        assert_eq!(stream.display_title.as_deref(), Some("vie (1) [Synced]"));
     }
 
     #[test]
