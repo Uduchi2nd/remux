@@ -2034,17 +2034,34 @@ async fn validate_external_subtitles_for_advertising(
 fn external_subtitle_labels<'a>(
     langs: impl Iterator<Item = Option<&'a str>>,
 ) -> Vec<String> {
-    let mut seen: std::collections::HashMap<String, usize> = Default::default();
-    langs
+    // (2026-10-02) full language names, matching the release's own tracks:
+    // "Vietnamese (online)" — numbered only when a language has several.
+    let langs: Vec<String> = langs
         .map(|l| {
-            let lang = l
-                .unwrap_or("und")
-                .to_ascii_lowercase();
+            l.unwrap_or("und")
+                .to_ascii_lowercase()
+        })
+        .collect();
+    let mut totals: std::collections::HashMap<&str, usize> = Default::default();
+    for l in &langs {
+        *totals
+            .entry(l.as_str())
+            .or_insert(0) += 1;
+    }
+    let mut seen: std::collections::HashMap<&str, usize> = Default::default();
+    langs
+        .iter()
+        .map(|lang| {
             let n = seen
-                .entry(lang.clone())
+                .entry(lang.as_str())
                 .or_insert(0);
             *n += 1;
-            format!("{lang} ({n})")
+            let name = remux_sdks::remux::language_label(lang);
+            if totals[lang.as_str()] > 1 {
+                format!("{name} (online {n})")
+            } else {
+                format!("{name} (online)")
+            }
         })
         .collect()
 }
@@ -2118,21 +2135,16 @@ pub(crate) fn present_dub_row_embedded_subtitles(
                 // the trailing ".<lang>.vtt" is how Jellyfin sidecars carry
                 // their language; VidHub's language preference reads it
                 // (2026-10-02: it picked the first track, Chinese, without)
-                let name = stream
-                    .display_title
-                    .clone()
-                    .unwrap_or_else(|| lang.clone());
-                let name = name.replace(" (release)", "");
+                let name = remux_sdks::remux::language_label(&lang);
                 stream.path = Some(format!("{name} (release).{lang}.vtt"));
             }
-            if let Some(t) = stream
-                .display_title
-                .as_mut()
-            {
-                if !t.contains("(release)") {
-                    t.push_str(" (release)");
-                }
-            }
+            // "English (release)", like the online tracks' "English (online)"
+            let forced = stream.is_forced;
+            stream.display_title = Some(format!(
+                "{}{} (release)",
+                remux_sdks::remux::language_label(&lang),
+                if forced { " forced" } else { "" }
+            ));
         }
     }
 }
@@ -2299,10 +2311,10 @@ mod label_tests {
         assert_eq!(
             l,
             [
-                "vie (1)",
-                "vie (2)",
-                "eng (1)",
-                "und (1)"
+                "Vietnamese (online 1)",
+                "Vietnamese (online 2)",
+                "English (online)",
+                "und (online)"
             ]
         );
     }
@@ -2450,14 +2462,14 @@ mod tests {
     fn synced_marker_goes_before_the_language_code() {
         let mut stream = api::MediaStream {
             language: Some("vie".into()),
-            display_title: Some("vie (1)".into()),
-            path: Some("vie (1).vie.vtt".into()),
+            display_title: Some("Vietnamese (online 1)".into()),
+            path: Some("Vietnamese (online 1).vie.vtt".into()),
             ..Default::default()
         };
         mark_subtitle_auto_synced(&mut stream);
         mark_subtitle_auto_synced(&mut stream);
-        assert_eq!(stream.path.as_deref(), Some("vie (1) [Synced].vie.vtt"));
-        assert_eq!(stream.display_title.as_deref(), Some("vie (1) [Synced]"));
+        assert_eq!(stream.path.as_deref(), Some("Vietnamese (online 1) [Synced].vie.vtt"));
+        assert_eq!(stream.display_title.as_deref(), Some("Vietnamese (online 1) [Synced]"));
     }
 
     #[test]
