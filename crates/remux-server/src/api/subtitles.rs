@@ -1344,6 +1344,25 @@ fn external_subtitle_candidate_index(
     index_at_base(current_base).or_else(|| previous_base.and_then(index_at_base))
 }
 
+/// Pick the current external-subtitle index range, or a previously advertised
+/// range when the requested index now falls below it. Only retained embedded
+/// indexes are reserved; raw probe tracks filtered from PlaybackInfo may have
+/// occupied the same index as an external subtitle the client was shown.
+fn external_subtitle_request_base(
+    stream_index: i64,
+    current_base: i64,
+    embedded_indices: &std::collections::HashSet<i64>,
+    previous_base: Option<i64>,
+) -> Option<i64> {
+    if embedded_indices.contains(&stream_index) {
+        return None;
+    }
+    if stream_index >= current_base {
+        return Some(current_base);
+    }
+    previous_base.filter(|base| *base >= 0 && *base <= stream_index)
+}
+
 pub(crate) fn inject_sidecar_subtitles(
     source: &mut api::MediaSourceInfo,
     subtitles: Vec<crate::addons::SubtitleInfo>,
@@ -1656,47 +1675,29 @@ async fn subtitles_stream_inner(
                     .flatten()
                     .map(|entry| entry.index),
             );
-            let mut i = stream_index - next_idx;
-            let mut request_base = next_idx;
-            let mut external = i >= 0 && !embedded_indices.contains(&stream_index);
-            let is_embedded_subtitle = source
-                .probe_data
-                .as_ref()
-                .is_some_and(|p| {
-                    p.media_streams
-                        .iter()
-                        .any(|s| {
-                            s.index == stream_index
-                                && matches!(
-                                    s.type_,
-                                    Some(api::MediaStreamType::Subtitle)
-                                )
-                        })
-                });
-            let previous_base = (!is_embedded_subtitle)
-                .then(|| {
-                    advertised_external_base(
-                        &state.ctx,
-                        item_id,
-                        &[advertised_source_id, media_source_id],
-                        stream_index,
-                        next_idx,
-                    )
-                })
-                .flatten();
-            // PATCH (uduchi2nd, 2026-09-29): the client may hold a layout
-            // advertised BEFORE the source was probed (no embedded streams →
-            // the add-on track was index 0); after the probe that index is
-            // the video and the request 404ed (VidHub, No Pain No Gain E20).
-            // An index that now points at a video/audio stream (or below the
-            // external range) is read with the numbering we advertised.
-            if !external {
-                if let Some(base) = previous_base {
-                    i = stream_index - base;
-                    request_base = base;
-                    external = true;
-                    debug!(item_id = %item_id, stream_index, base, "subtitle index read with the advertised numbering");
-                }
+            let previous_base = advertised_external_base(
+                &state.ctx,
+                item_id,
+                &[advertised_source_id, media_source_id],
+                stream_index,
+                next_idx,
+            );
+            let selected_base = external_subtitle_request_base(
+                stream_index,
+                next_idx,
+                &embedded_indices,
+                previous_base,
+            );
+            let i = selected_base
+                .map(|base| stream_index - base)
+                .unwrap_or(-1);
+            let request_base = selected_base.unwrap_or(next_idx);
+            let external = selected_base.is_some();
+            // PATCH (uduchi2nd, 2026-09-29): clients can retain an index from
+            // an earlier, pre-probe layout. Resolve with that base when the
+            // current filtered PlaybackInfo no longer reserves the index.
+            if let Some(base) = selected_base.filter(|base| *base != next_idx) {
+                debug!(item_id = %item_id, stream_index, base, "subtitle index read with the advertised numbering");
             }
             // Only attempt external resolution if the index is not an embedded stream.
             if external {
@@ -1772,11 +1773,7 @@ async fn subtitles_stream_inner(
                         .flatten(),
                     scored.len(),
                 )
-                .or_else(|| {
-                    usize::try_from(i)
-                        .ok()
-                        .filter(|index| *index < scored.len())
-                });
+                .or_else(|| usize::try_from(i).ok().filter(|index| *index < scored.len()));
                 if let Some(sub) = candidate_index.and_then(|index| scored.get(index)) {
                     if let Some(ref descriptor) = sub.url {
                         let output_format = format.to_ascii_lowercase();
@@ -3509,6 +3506,28 @@ mod tests {
     fn external_subtitle_index_rejects_missing_or_negative_candidates() {
         assert_eq!(external_subtitle_candidate_index(3, 0, None, 1), None);
         assert_eq!(external_subtitle_candidate_index(0, 1, Some(1), 1), None);
+    }
+
+    #[test]
+    fn external_subtitle_request_uses_prior_layout_for_filtered_probe_index() {
+        let retained_embedded = std::collections::HashSet::new();
+
+        // Raw probe data may contain this index, but if PlaybackInfo filtered
+        // it out, a prior external index remains valid for the selected track.
+        assert_eq!(
+            external_subtitle_request_base(3, 4, &retained_embedded, Some(3)),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn external_subtitle_request_never_reuses_a_retained_embedded_index() {
+        let retained_embedded = [3].into_iter().collect();
+
+        assert_eq!(
+            external_subtitle_request_base(3, 4, &retained_embedded, Some(0)),
+            None
+        );
     }
 
     #[test]
