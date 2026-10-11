@@ -2327,7 +2327,7 @@ fn should_preserve_ready_redirect(
     release_ready_first_redirect && index == 0 && has_verified_external_redirect(source)
 }
 
-/// Add prefetched subtitles to PlaybackInfo sources. Tests and callers without
+/// Add validated addon subtitles to media sources. Tests and callers without
 /// context omit alignment labels and readiness routing.
 pub(crate) fn append_external_subtitles(
     media_sources: &mut [api::MediaSourceInfo],
@@ -2439,10 +2439,16 @@ fn append_external_subtitles_inner(
                 "/Videos/{item_id}/{source_id}/Subtitles/{idx}/0/Stream.vtt?ApiKey={api_key}",
                 source_id = source.id,
             ));
-            // Vidhub requires Path to discover external subtitles and uses its
-            // basename as the label. Keep credentials in DeliveryUrl only.
+            // VidHub requires Path to discover external subtitles and reads
+            // the trailing language extension for its language preference.
+            // Keep credentials in DeliveryUrl only.
             let label = labels[i].clone();
-            stream.path = Some(format!("{label}.vtt"));
+            let language = stream
+                .language
+                .as_deref()
+                .unwrap_or("und")
+                .to_ascii_lowercase();
+            stream.path = Some(format!("{label}.{language}.vtt"));
             stream.display_title = Some(label);
             if let (Some(ctx), Some(descriptor)) = (ctx, sub.url.as_ref()) {
                 apply_subtitle_sync_label(ctx, item_id, source, descriptor, &sub.id, &mut stream);
@@ -2621,6 +2627,67 @@ pub(super) async fn validate_external_subtitles_for_advertising(
     advertised
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum EmptySubtitleGatePolicy {
+    /// PlaybackInfo advertises readiness only for sources with real probe data.
+    ProbedSources,
+    /// Item details advertise the gate for every source, even without subtitles.
+    AllSources,
+}
+
+/// Validate addon tracks and inject the surviving tracks through the same
+/// source-specific filtering, labeling, and cache-backed sync restoration path.
+pub(crate) async fn inject_prefetched_external_subtitles(
+    state: &AppState,
+    media_sources: &mut [api::MediaSourceInfo],
+    item_id: Uuid,
+    subs: Vec<crate::addons::SubtitleInfo>,
+    sub_langs: &[String],
+    device_profile: Option<&api::DeviceProfile>,
+    api_key: &str,
+    dedup: SubtitleDedupSettings,
+    release_ready_first_redirect: bool,
+    empty_gate_policy: EmptySubtitleGatePolicy,
+) {
+    let subs = validate_external_subtitles_for_advertising(
+        state,
+        item_id,
+        subs,
+        media_sources,
+        sub_langs,
+        device_profile,
+        dedup,
+    )
+    .await;
+
+    if subs.is_empty() && matches!(empty_gate_policy, EmptySubtitleGatePolicy::AllSources) {
+        for (index, source) in media_sources.iter_mut().enumerate() {
+            advertise_subtitle_gate(
+                &state.ctx,
+                source,
+                item_id,
+                api_key,
+                index,
+                release_ready_first_redirect,
+            );
+        }
+        return;
+    }
+
+    append_external_subtitles_with_context(
+        &state.ctx,
+        media_sources,
+        &subs,
+        sub_langs,
+        device_profile,
+        item_id,
+        api_key,
+        dedup,
+        release_ready_first_redirect,
+    )
+    .await;
+}
+
 /// PATCH (uduchi2nd): the "[+VN dub]" muxed rows carry the HQ release's
 /// embedded text subtitles at `SUBTITLE_INDEX_OFFSET + n` (they are served by
 /// this server, not by the muxer's playlist). Stored probes keep them
@@ -2786,117 +2853,19 @@ pub(crate) async fn inject_external_subtitles(
         .addons
         .fetch_subtitles(subtitle_media, ctx, false, user_id)
         .await;
-    let subs = validate_external_subtitles_for_advertising(
+    inject_prefetched_external_subtitles(
         state,
+        media_sources,
         item_id,
         subs,
-        media_sources,
         &sub_langs,
         device_profile,
+        api_key,
         dedup,
+        release_ready_first_redirect,
+        EmptySubtitleGatePolicy::AllSources,
     )
     .await;
-    if subs.is_empty() {
-        for (index, source) in media_sources.iter_mut().enumerate() {
-            advertise_subtitle_gate(
-                ctx,
-                source,
-                item_id,
-                api_key,
-                index,
-                release_ready_first_redirect,
-            );
-        }
-        return;
-    }
-
-    for (index, source) in media_sources.iter_mut().enumerate() {
-        if !has_real_probe_data(source) {
-            continue;
-        }
-        let next_idx = source
-            .media_streams
-            .iter()
-            .map(|s| s.index)
-            .max()
-            .map_or(0, |m| m + 1);
-        remember_external_base(&state.ctx, item_id, source.id, next_idx);
-        let scored = filter_external_subtitles_for_source(
-            source,
-            provider_filename(source),
-            &subs,
-            &sub_langs,
-            device_profile,
-            dedup,
-        );
-        let labels = external_subtitle_labels(
-            scored
-                .iter()
-                .map(|s| {
-                    s.lang
-                        .as_deref()
-                }),
-        );
-        let wants_default = !sub_langs.is_empty()
-            && source.default_subtitle_stream_index.is_none();
-        for (i, sub) in scored.into_iter().enumerate() {
-            let mut stream = crate::conversions::subtitle_to_media_stream(sub);
-            let idx = next_idx + i as i64;
-            stream.index = idx;
-            stream.delivery_url = Some(format!(
-                "/Videos/{item_id}/{source_id}/Subtitles/{idx}/0/Stream.vtt?ApiKey={api_key}",
-                source_id = source.id,
-            ));
-            // Vidhub requires Path to discover external subtitles and uses its
-            // basename as the label. Keep credentials in DeliveryUrl only.
-            // "(vnphim N)": addon tracks are numbered per language so two
-            // Vietnamese files (and the release's own) can be told apart.
-            let label = labels[i].clone();
-            let code = sub
-                .lang
-                .as_deref()
-                .unwrap_or("und")
-                .to_ascii_lowercase();
-            stream.path = Some(format!("{label}.{code}.vtt"));
-            stream.display_title = Some(label);
-            if let Some(descriptor) = sub
-                .url
-                .as_ref()
-            {
-                apply_subtitle_sync_label(
-                    ctx,
-                    item_id,
-                    source,
-                    descriptor,
-                    &sub.id,
-                    &mut stream,
-                );
-                restore_persisted_subtitle_sync_label(
-                    ctx,
-                    item_id,
-                    source.id,
-                    &sub.id,
-                    sub.lang
-                        .as_deref(),
-                    &mut stream,
-                )
-                .await;
-            }
-            if wants_default && i == 0 {
-                stream.is_default = Some(true);
-                source.default_subtitle_stream_index = Some(idx);
-            }
-            source.media_streams.push(stream);
-        }
-        advertise_subtitle_gate(
-            ctx,
-            source,
-            item_id,
-            api_key,
-            index,
-            release_ready_first_redirect,
-        );
-    }
 }
 
 fn has_real_probe_data(source: &api::MediaSourceInfo) -> bool {
@@ -3513,6 +3482,10 @@ mod tests {
         );
         assert_eq!(sources[0].media_streams[2].index, 3);
         assert_eq!(sources[0].media_streams[2].is_external, true);
+        assert_eq!(
+            sources[0].media_streams[2].path.as_deref(),
+            Some("English (online).eng.vtt")
+        );
         assert_eq!(
             sources[1]
                 .media_streams

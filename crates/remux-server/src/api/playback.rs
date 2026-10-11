@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use axum::Json;
 
 use super::subtitles::{
-    SidecarSubtitleRoute, SubtitleDedupSettings, append_external_subtitles_with_context,
+    SidecarSubtitleRoute, SubtitleDedupSettings,
     drop_unsupported_embedded_subtitles_with_external_match,
     filter_external_subtitles_for_source, inject_sidecar_subtitles, provider_filename,
     save_sidecar_subtitle_routes,
@@ -873,29 +873,20 @@ async fn items_playbackinfo_inner(
         .subtitle_languages
         .clone()
         .unwrap_or_default();
-    let external_subtitles = super::subtitles::validate_external_subtitles_for_advertising(
+    super::subtitles::inject_prefetched_external_subtitles(
         &state,
+        &mut media_sources,
         id,
         external_subtitles,
-        &media_sources,
         &sub_langs,
         sort_device_profile.as_ref(),
-        subtitle_dedup,
-    )
-    .await;
-    append_external_subtitles_with_context(
-        &state.ctx,
-        &mut media_sources,
-        &external_subtitles,
-        &sub_langs,
-        sort_device_profile.as_ref(),
-        id,
         session
             .device
             .access_token
             .expose(),
         subtitle_dedup,
         true,
+        super::subtitles::EmptySubtitleGatePolicy::ProbedSources,
     )
     .await;
     let dub_row_langs = probe_cfg
