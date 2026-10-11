@@ -368,6 +368,7 @@ async fn reference_text(
         input,
         &format!("0:{index}"),
         source,
+        source,
         index,
         api::SubtitleCodec::Srt,
         codec,

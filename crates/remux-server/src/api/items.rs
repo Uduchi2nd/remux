@@ -2609,44 +2609,43 @@ async fn item_for_user(
                         s.is_text_subtitle_stream = s.is_text_subtitle_stream();
                     }
                 }
-                // Jellyfin mirrors the primary source's streams at the item's
-                // top level; VidHub reads its subtitle list from there.
-                if let Some(first) = sources.first() {
-                    let is_ext_sub = |s: &api::MediaStream| {
-                        s.is_external
-                            && matches!(s.type_, Some(api::MediaStreamType::Subtitle))
-                    };
-                    let ext: Vec<api::MediaStream> = first
-                        .media_streams
+            }
+            // Jellyfin mirrors the primary source's streams at the item's top
+            // level; VidHub reads its subtitle list from there.
+            if let Some(first) = sources.first() {
+                let is_ext_sub = |s: &api::MediaStream| {
+                    s.is_external
+                        && matches!(s.type_, Some(api::MediaStreamType::Subtitle))
+                };
+                let ext: Vec<api::MediaStream> = first
+                    .media_streams
+                    .iter()
+                    .filter(|s| is_ext_sub(s))
+                    .cloned()
+                    .collect();
+                if !ext.is_empty() {
+                    // A dub row presents the release's embedded text tracks
+                    // as external under the SAME index: drop the embedded
+                    // originals too, or the item lists every track twice.
+                    let ext_idx: std::collections::HashSet<i64> = ext
                         .iter()
-                        .filter(|s| is_ext_sub(s))
-                        .cloned()
+                        .map(|s| s.index)
                         .collect();
-                    if !ext.is_empty() {
-                        // A dub row presents the release's embedded text
-                        // tracks as external under the SAME index: drop the
-                        // embedded originals too, or the item lists every
-                        // such track twice with one index (VidHub, 2026-09-28).
-                        let ext_idx: std::collections::HashSet<i64> = ext
-                            .iter()
-                            .map(|s| s.index)
-                            .collect();
-                        let list = base_item
-                            .media_streams
-                            .get_or_insert_with(Vec::new);
-                        list.retain(|s| {
-                            let sub = matches!(s.type_, Some(api::MediaStreamType::Subtitle));
-                            !is_ext_sub(s)
-                                && !(sub && ext_idx.contains(&s.index))
-                                // a dub row's release tracks dropped by the
-                                // language filter (SubtitleLanguages) go too
-                                && !(sub
-                                    && s.index
-                                        >= crate::services::dubmux::SUBTITLE_INDEX_OFFSET)
-                        });
-                        list.extend(ext);
-                        base_item.has_subtitles = Some(true);
-                    }
+                    let list = base_item
+                        .media_streams
+                        .get_or_insert_with(Vec::new);
+                    list.retain(|s| {
+                        let sub = matches!(s.type_, Some(api::MediaStreamType::Subtitle));
+                        !is_ext_sub(s)
+                            && !(sub && ext_idx.contains(&s.index))
+                            // A dub row's release tracks dropped by the
+                            // language filter (SubtitleLanguages) go too.
+                            && !(sub
+                                && s.index
+                                    >= crate::services::dubmux::SUBTITLE_INDEX_OFFSET)
+                    });
+                    list.extend(ext);
+                    base_item.has_subtitles = Some(true);
                 }
             }
         }
