@@ -1636,26 +1636,31 @@ async fn rank_item_sources(
         );
     }
 
-    crate::services::StreamService::rank_sources(sources, ranking, |source| {
-        let mut info = api::MediaSourceInfo::from(source.clone());
-        crate::conversions::apply_filename_guess(&mut info, source);
-        info.resolve_default_streams(
-            user_cfg,
-            server_metadata_language,
-            original_language,
-            None,
-            None,
-            None,
-            None,
-        );
-        (
-            info,
-            extraction
-                .get(&source.id)
-                .copied()
-                .unwrap_or(false),
-        )
-    });
+    crate::services::StreamService::rank_sources(
+        sources,
+        ranking,
+        crate::services::StreamService::source_order_band,
+        |source| {
+            let mut info = api::MediaSourceInfo::from(source.clone());
+            crate::conversions::apply_filename_guess(&mut info, source);
+            info.resolve_default_streams(
+                user_cfg,
+                server_metadata_language,
+                original_language,
+                None,
+                None,
+                None,
+                None,
+            );
+            (
+                info,
+                extraction
+                    .get(&source.id)
+                    .copied()
+                    .unwrap_or(false),
+            )
+        },
+    );
 }
 
 async fn item_for_user(

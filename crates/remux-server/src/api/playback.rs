@@ -53,7 +53,10 @@ use crate::{
         session::{TranscodeSession, TranscodeState},
     },
     sdks,
-    services::{MediaResolveService, ProbeResult, StreamService, StreamServiceConfig},
+    services::{
+        MediaResolveService, ProbeResult, SourceOrderBand, StreamService,
+        StreamServiceConfig,
+    },
     torrent,
 };
 use axum_anyhow::ApiResult as Result;
@@ -71,6 +74,9 @@ struct SourceExtras {
     /// an explicit, admin-authored priority (drag-and-drop in the dashboard),
     /// not something a device-capability sort should second-guess.
     group_id: Option<Uuid>,
+    /// Keep verified VN dub rows ahead of releases and unchecked rows behind
+    /// them when applying device-capability ranking.
+    source_order_band: SourceOrderBand,
     /// Whether extraction is feasible varies per source (a local file vs. a
     /// remote debrid/torrent release of the same item), so the ranking pass
     /// needs it per source, not just for the main transcode decision.
@@ -859,6 +865,7 @@ async fn items_playbackinfo_inner(
             subtitle_routes: (subtitle_source_id, routes),
             effective_source_id: effective_stream.id,
             group_id: stream.group_id,
+            source_order_band: StreamService::source_order_band(&stream),
             allow_subtitle_extraction,
             subtitle_prefetch,
         });
@@ -964,9 +971,14 @@ async fn items_playbackinfo_inner(
             .drain(..)
             .zip(source_extras.drain(..))
             .collect();
-        StreamService::rank_sources(&mut paired, ranking, |(source, extras)| {
-            (source.clone(), extras.allow_subtitle_extraction)
-        });
+        StreamService::rank_sources(
+            &mut paired,
+            ranking,
+            |(_, extras)| extras.source_order_band,
+            |(source, extras)| {
+                (source.clone(), extras.allow_subtitle_extraction)
+            },
+        );
         for (source, extras) in paired {
             media_sources.push(source);
             source_extras.push(extras);

@@ -27,6 +27,16 @@ pub(crate) struct ProbedStreams {
     pub specific_requested: bool,
 }
 
+/// Preserve the dubmux contract around capability ranking: decode-checked
+/// Vietnamese rows stay ahead of releases, ordinary releases are ranked for
+/// the device, and unchecked dub rows stay last until verified.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum SourceOrderBand {
+    CheckedDub,
+    Ranked,
+    UncheckedDub,
+}
+
 pub(crate) struct StreamServiceConfig {
     pub ctx: AppContext,
     pub item_id: Uuid,
@@ -61,20 +71,44 @@ fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
 }
 
 impl StreamService {
-    /// Capability-ranks `items` best-first. `describe` yields each item's
-    /// `MediaSourceInfo` and whether on-demand subtitle extraction is
+    /// Capability-ranks ordinary releases while preserving the explicit
+    /// checked/unchecked dubmux ordering around them. `describe` yields each
+    /// item's `MediaSourceInfo` and whether on-demand subtitle extraction is
     /// feasible for it (only ever true for a local source) — the one place
     /// that per-source flag is applied, so every caller ranks the same way.
-    /// Stable, so `SortMediaSourcesMode::Disabled` keeps the input order.
     pub fn rank_sources<T>(
         items: &mut [T],
         ranking: crate::device_profile::SourceRankingContext<'_>,
+        order_band: impl Fn(&T) -> SourceOrderBand,
         describe: impl Fn(&T) -> (api::MediaSourceInfo, bool),
     ) {
-        items.sort_by_cached_key(|item| {
+        // `sort_by_key` is stable, so checked dub rows keep their negative-idx
+        // ordering, and unchecked rows keep their deferred order. Only normal
+        // releases are reordered by device capability.
+        items.sort_by_key(&order_band);
+        let ranked_start = items
+            .iter()
+            .take_while(|item| order_band(item) == SourceOrderBand::CheckedDub)
+            .count();
+        let ranked_count = items
+            .iter()
+            .filter(|item| order_band(item) == SourceOrderBand::Ranked)
+            .count();
+        let ranked_end = ranked_start + ranked_count;
+        items[ranked_start..ranked_end].sort_by_cached_key(|item| {
             let (info, allow_subtitle_extraction) = describe(item);
             std::cmp::Reverse(ranking.sort_key(&info, allow_subtitle_extraction))
         });
+    }
+
+    pub(crate) fn source_order_band(stream: &db::Media) -> SourceOrderBand {
+        if !super::dubmux::is_dubmux_row(stream) {
+            SourceOrderBand::Ranked
+        } else if stream.idx.is_some_and(|idx| idx < 0) {
+            SourceOrderBand::CheckedDub
+        } else {
+            SourceOrderBand::UncheckedDub
+        }
     }
 
     pub fn new(cfg: StreamServiceConfig) -> Self {
@@ -1420,6 +1454,107 @@ mod tests {
         assert_eq!(
             probe_ids,
             vec![original_ids[1], original_ids[2], original_ids[0]]
+        );
+    }
+
+    #[test]
+    fn capability_sort_keeps_verified_dubs_first_and_unverified_dubs_last() {
+        struct Candidate {
+            name: &'static str,
+            band: SourceOrderBand,
+            bitrate: i64,
+        }
+
+        let mut candidates = vec![
+            Candidate {
+                name: "release-low",
+                band: SourceOrderBand::Ranked,
+                bitrate: 100,
+            },
+            Candidate {
+                name: "dub-checked-first",
+                band: SourceOrderBand::CheckedDub,
+                bitrate: 10,
+            },
+            Candidate {
+                name: "release-high",
+                band: SourceOrderBand::Ranked,
+                bitrate: 900,
+            },
+            Candidate {
+                name: "dub-unchecked",
+                band: SourceOrderBand::UncheckedDub,
+                bitrate: 10_000,
+            },
+            Candidate {
+                name: "dub-checked-second",
+                band: SourceOrderBand::CheckedDub,
+                bitrate: 1_000,
+            },
+        ];
+        let ranking = crate::device_profile::SourceRankingContext {
+            mode: remux_sdks::remux::SortMediaSourcesMode::Best,
+            device_profile: None,
+            is_4k_capable: false,
+            subtitle_mode: remux_sdks::remux::EmbeddedSubtitleHandling::Burn,
+            explicit_subtitle_index: None,
+            max_bitrate: None,
+        };
+
+        StreamService::rank_sources(
+            &mut candidates,
+            ranking,
+            |candidate| candidate.band,
+            |candidate| {
+                (
+                    api::MediaSourceInfo {
+                        bitrate: Some(candidate.bitrate),
+                        ..Default::default()
+                    },
+                    false,
+                )
+            },
+        );
+
+        let names: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "dub-checked-first",
+                "dub-checked-second",
+                "release-high",
+                "release-low",
+                "dub-unchecked",
+            ],
+            "capability ranking may reorder releases, but checked dubs stay in their idx order at the front and unchecked rows stay deferred"
+        );
+    }
+
+    #[test]
+    fn source_order_band_uses_dubmux_check_state() {
+        let row = |idx, filename: &str| db::Media {
+            idx: Some(idx),
+            stream_info: Some(StreamInfo {
+                filename: Some(filename.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            StreamService::source_order_band(&row(-1, "Film.VNDub-vnphim.ts")),
+            SourceOrderBand::CheckedDub
+        );
+        assert_eq!(
+            StreamService::source_order_band(&row(100_000, "Film.VNDub-vnphim.ts")),
+            SourceOrderBand::UncheckedDub
+        );
+        assert_eq!(
+            StreamService::source_order_band(&row(0, "Film.1080p.WEB-DL.mkv")),
+            SourceOrderBand::Ranked
         );
     }
 
