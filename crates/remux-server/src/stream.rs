@@ -397,7 +397,7 @@ async fn check_http_stream(id: Uuid, info: &StreamInfo) -> HttpHeadResult {
 
     let request = request_headers
         .iter()
-        .fold(HEAD_CLIENT.head(url), |request, (name, value)| {
+        .fold(AVAILABILITY_CLIENT.head(url), |request, (name, value)| {
             request.header(name.as_str(), value.as_str())
         });
     if let Ok(Ok(response)) =

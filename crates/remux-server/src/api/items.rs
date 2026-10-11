@@ -1799,8 +1799,6 @@ async fn item_for_user(
                         .user
                         .id,
                 ),
-                persisted_device_profile.as_ref(),
-                super::subtitles::SubtitleDedupSettings::from_config(&server_config),
             )
             .await
             .log_err("failed to refresh sources");

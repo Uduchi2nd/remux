@@ -719,6 +719,56 @@ async fn extract_subtitles_to_cache(
     Ok(())
 }
 
+/// Extract one embedded subtitle for alignment's reference timeline. Reuse
+/// the same atomic-output and empty-file checks as the normal batched cache
+/// path, while keeping this isolated extraction in the caller's temporary
+/// directory.
+pub(super) async fn extract_subtitle_to_cache(
+    data_dir: &std::path::Path,
+    input_url: &str,
+    map_spec: &str,
+    item_id: Uuid,
+    media_source_id: Uuid,
+    stream_index: i64,
+    cache_codec: api::SubtitleCodec,
+    source_codec: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let cache_path = subtitle_cache_path(
+        data_dir,
+        item_id,
+        media_source_id,
+        stream_index,
+        &cache_codec,
+    );
+    if is_cached(&cache_path) {
+        return Ok(cache_path);
+    }
+
+    let stream = ExtractableSubtitle {
+        stream_index,
+        map_spec: map_spec.to_string(),
+        ffmpeg_codec: subtitle_cache_ffmpeg_codec(&cache_codec, source_codec),
+        cache_codec,
+        // This helper extracts only one stream, so an unknown codec cannot
+        // poison a batch containing otherwise-convertible tracks.
+        known_codec: false,
+    };
+    extract_subtitles_to_cache(
+        data_dir,
+        input_url,
+        item_id,
+        media_source_id,
+        &[stream],
+    )
+    .await?;
+
+    if is_cached(&cache_path) {
+        Ok(cache_path)
+    } else {
+        anyhow::bail!("subtitle extraction produced empty output")
+    }
+}
+
 /// Ensures `stream_index`'s subtitle is cached, batch-extracting every
 /// not-yet-cached extractable stream on the source in one pass if needed
 /// (see `extract_subtitles_to_cache`). Single-flight per source: concurrent
