@@ -163,7 +163,7 @@ fn has_reference(streams: &[api::MediaStream]) -> bool {
 }
 fn eligible(streams: &[api::MediaStream], language: Option<&str>) -> bool {
     has_reference(streams)
-        && alignment::alignment_skip_reason(language, streams).is_none()
+        && alignment::alignment_skip_reason(language).is_none()
 }
 
 pub(crate) fn advertise(
@@ -390,18 +390,19 @@ mod tests {
         ));
     }
     #[test]
-    fn only_missing_target_language_with_text_reference_requires_gate() {
-        let mut reference = api::MediaStream {
+    fn gate_prepares_targets_even_when_an_embedded_match_exists() {
+        let reference = api::MediaStream {
             type_: Some(api::MediaStreamType::Subtitle),
             codec: Some("srt".into()),
             language: Some("eng".into()),
             ..Default::default()
         };
         assert!(eligible(&[reference.clone()], Some("vie")));
-        assert!(!eligible(&[reference.clone()], Some("eng")));
+        assert!(eligible(&[reference.clone()], Some("eng")));
         assert!(!eligible(&[reference.clone()], Some("fra")));
-        reference.is_forced = true;
-        assert!(!eligible(&[reference], Some("vie")));
+        let mut forced_reference = reference;
+        forced_reference.is_forced = true;
+        assert!(!eligible(&[forced_reference], Some("vie")));
     }
     #[tokio::test]
     async fn unavailable_alignment_still_serves_the_original_subtitle() {
