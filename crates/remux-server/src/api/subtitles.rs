@@ -1327,6 +1327,23 @@ fn next_external_subtitle_index(
         .map_or(0, |index| index + 1)
 }
 
+/// Resolve an add-on subtitle against the current index base, then retry a
+/// previously advertised base if the current layout has no candidate at that
+/// offset. Item details and PlaybackInfo can number the same external track
+/// differently when a source is probed between the two requests.
+fn external_subtitle_candidate_index(
+    stream_index: i64,
+    current_base: i64,
+    previous_base: Option<i64>,
+    candidate_count: usize,
+) -> Option<usize> {
+    let index_at_base = |base| {
+        let index = usize::try_from(stream_index.checked_sub(base)?).ok()?;
+        (index < candidate_count).then_some(index)
+    };
+    index_at_base(current_base).or_else(|| previous_base.and_then(index_at_base))
+}
+
 pub(crate) fn inject_sidecar_subtitles(
     source: &mut api::MediaSourceInfo,
     subtitles: Vec<crate::addons::SubtitleInfo>,
@@ -1640,7 +1657,33 @@ async fn subtitles_stream_inner(
                     .map(|entry| entry.index),
             );
             let mut i = stream_index - next_idx;
+            let mut request_base = next_idx;
             let mut external = i >= 0 && !embedded_indices.contains(&stream_index);
+            let is_embedded_subtitle = source
+                .probe_data
+                .as_ref()
+                .is_some_and(|p| {
+                    p.media_streams
+                        .iter()
+                        .any(|s| {
+                            s.index == stream_index
+                                && matches!(
+                                    s.type_,
+                                    Some(api::MediaStreamType::Subtitle)
+                                )
+                        })
+                });
+            let previous_base = (!is_embedded_subtitle)
+                .then(|| {
+                    advertised_external_base(
+                        &state.ctx,
+                        item_id,
+                        &[advertised_source_id, media_source_id],
+                        stream_index,
+                        next_idx,
+                    )
+                })
+                .flatten();
             // PATCH (uduchi2nd, 2026-09-29): the client may hold a layout
             // advertised BEFORE the source was probed (no embedded streams →
             // the add-on track was index 0); after the probe that index is
@@ -1648,27 +1691,9 @@ async fn subtitles_stream_inner(
             // An index that now points at a video/audio stream (or below the
             // external range) is read with the numbering we advertised.
             if !external {
-                let is_embedded_subtitle = source
-                    .probe_data
-                    .as_ref()
-                    .is_some_and(|p| {
-                        p.media_streams
-                            .iter()
-                            .any(|s| {
-                                s.index == stream_index
-                                    && matches!(s.type_, Some(api::MediaStreamType::Subtitle))
-                            })
-                    });
-                if !is_embedded_subtitle
-                    && let Some(base) = advertised_external_base(
-                        &state.ctx,
-                        item_id,
-                        &[advertised_source_id, media_source_id],
-                        stream_index,
-                        next_idx,
-                    )
-                {
+                if let Some(base) = previous_base {
                     i = stream_index - base;
+                    request_base = base;
                     external = true;
                     debug!(item_id = %item_id, stream_index, base, "subtitle index read with the advertised numbering");
                 }
@@ -1739,7 +1764,20 @@ async fn subtitles_stream_inner(
                     device_profile.as_ref(),
                     dedup,
                 );
-                if let Some(sub) = scored.get(i as usize) {
+                let candidate_index = external_subtitle_candidate_index(
+                    stream_index,
+                    request_base,
+                    (request_base == next_idx)
+                        .then_some(previous_base)
+                        .flatten(),
+                    scored.len(),
+                )
+                .or_else(|| {
+                    usize::try_from(i)
+                        .ok()
+                        .filter(|index| *index < scored.len())
+                });
+                if let Some(sub) = candidate_index.and_then(|index| scored.get(index)) {
                     if let Some(ref descriptor) = sub.url {
                         let output_format = format.to_ascii_lowercase();
                         if !bypass {
@@ -3452,6 +3490,25 @@ mod tests {
     #[test]
     fn external_subtitles_follow_sidecars() {
         assert_eq!(next_external_subtitle_index([0, 1], [2]), 3);
+    }
+
+    #[test]
+    fn external_subtitle_index_falls_back_to_previous_advertised_base() {
+        // Item details advertised this one subtitle at index 3. After probing,
+        // the route's current base is 0, so index 3 is outside the one-track
+        // candidate list; it must still resolve to candidate zero.
+        assert_eq!(external_subtitle_candidate_index(3, 0, Some(3), 1), Some(0));
+    }
+
+    #[test]
+    fn external_subtitle_index_prefers_a_valid_current_base() {
+        assert_eq!(external_subtitle_candidate_index(1, 0, Some(1), 2), Some(1));
+    }
+
+    #[test]
+    fn external_subtitle_index_rejects_missing_or_negative_candidates() {
+        assert_eq!(external_subtitle_candidate_index(3, 0, None, 1), None);
+        assert_eq!(external_subtitle_candidate_index(0, 1, Some(1), 1), None);
     }
 
     #[test]
