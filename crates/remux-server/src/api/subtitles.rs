@@ -1363,6 +1363,26 @@ fn external_subtitle_request_base(
     previous_base.filter(|base| *base >= 0 && *base <= stream_index)
 }
 
+/// A request using an older advertised base already names a track PlaybackInfo
+/// showed to this client. The current source probe can contain an embedded
+/// same-language track that was absent from that advertised layout, so keep
+/// the language cap but do not deduplicate the explicitly selected external
+/// track against that newer probe state.
+fn external_subtitle_resolution_dedup(
+    dedup: SubtitleDedupSettings,
+    selected_base: Option<i64>,
+    current_base: i64,
+) -> SubtitleDedupSettings {
+    if selected_base.is_some_and(|base| base != current_base) {
+        SubtitleDedupSettings {
+            enabled: false,
+            max_external_per_language_when_disabled: dedup.max_external_per_language() as i64,
+        }
+    } else {
+        dedup
+    }
+}
+
 pub(crate) fn inject_sidecar_subtitles(
     source: &mut api::MediaSourceInfo,
     subtitles: Vec<crate::addons::SubtitleInfo>,
@@ -1684,6 +1704,8 @@ async fn subtitles_stream_inner(
                 .unwrap_or(-1);
             let request_base = selected_base.unwrap_or(next_idx);
             let external = selected_base.is_some();
+            let resolution_dedup =
+                external_subtitle_resolution_dedup(dedup, selected_base, next_idx);
             // PATCH (uduchi2nd, 2026-09-29): clients can retain an index from
             // an earlier, pre-probe layout. Resolve with that base when the
             // current filtered PlaybackInfo no longer reserves the index.
@@ -1733,7 +1755,7 @@ async fn subtitles_stream_inner(
                     std::slice::from_ref(&resolved_probe),
                     &sub_langs,
                     device_profile.as_ref(),
-                    dedup,
+                    resolution_dedup,
                 )
                 .await;
                 let source_filename = source
@@ -1746,7 +1768,7 @@ async fn subtitles_stream_inner(
                     &validated_subs,
                     &sub_langs,
                     device_profile.as_ref(),
-                    dedup,
+                    resolution_dedup,
                 );
                 let candidate_index = external_subtitle_candidate_index(
                     stream_index,
@@ -3532,6 +3554,114 @@ mod tests {
         assert_eq!(
             external_subtitle_request_base(3, 4, &retained_embedded, Some(3)),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn previously_advertised_external_track_survives_current_embedded_dedup() {
+        let profile = api::DeviceProfile {
+            subtitle_profiles: vec![api::SubtitleProfile {
+                format: Some("subrip".into()),
+                method: Some(api::SubtitleDeliveryMethod::Embed),
+            }],
+            ..Default::default()
+        };
+        let external = crate::addons::SubtitleInfo {
+            id: "online-vie".into(),
+            url: Some(crate::stream::StreamDescriptor::http(
+                "https://example.com/Episode.vie.srt",
+            )),
+            lang: Some("vie".into()),
+            is_forced: false,
+            is_hi: false,
+            filename: None,
+            from_trusted: None,
+            ai_translated: None,
+        };
+        let mut probe = source_with_subtitles(vec![
+            api::MediaStream {
+                index: 0,
+                type_: Some(api::MediaStreamType::Video),
+                ..Default::default()
+            },
+            api::MediaStream {
+                index: 1,
+                type_: Some(api::MediaStreamType::Audio),
+                ..Default::default()
+            },
+            api::MediaStream {
+                index: 2,
+                type_: Some(api::MediaStreamType::Audio),
+                ..Default::default()
+            },
+            api::MediaStream {
+                index: 110,
+                type_: Some(api::MediaStreamType::Subtitle),
+                codec: Some("subrip".into()),
+                language: Some("vie".into()),
+                ..Default::default()
+            },
+            api::MediaStream {
+                index: 111,
+                type_: Some(api::MediaStreamType::Subtitle),
+                codec: Some("subrip".into()),
+                language: Some("msa".into()),
+                ..Default::default()
+            },
+        ]);
+
+        filter_playback_embedded_subtitles(
+            &mut probe,
+            std::slice::from_ref(&external),
+            Some(&profile),
+            false,
+            remux_sdks::remux::EmbeddedSubtitleHandling::Burn,
+            DEDUP_ON,
+        );
+        let embedded_indices: std::collections::HashSet<i64> = probe
+            .media_streams
+            .iter()
+            .map(|stream| stream.index)
+            .collect();
+        let current_base = next_external_subtitle_index(embedded_indices.iter().copied(), []);
+        let selected_base = external_subtitle_request_base(
+            3,
+            current_base,
+            &embedded_indices,
+            Some(3),
+        );
+        assert_eq!(current_base, 112);
+        assert_eq!(selected_base, Some(3));
+        assert!(
+            filter_external_subtitles_for_source(
+                &probe,
+                None,
+                std::slice::from_ref(&external),
+                &["vie".into()],
+                Some(&profile),
+                DEDUP_ON,
+            )
+            .is_empty(),
+            "current source dedup would otherwise hide the advertised online track"
+        );
+
+        let resolution_dedup =
+            external_subtitle_resolution_dedup(DEDUP_ON, selected_base, current_base);
+        assert!(!resolution_dedup.enabled);
+        assert_eq!(resolution_dedup.max_external_per_language_when_disabled, 1);
+        let scored = filter_external_subtitles_for_source(
+            &probe,
+            None,
+            std::slice::from_ref(&external),
+            &["vie".into()],
+            Some(&profile),
+            resolution_dedup,
+        );
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].id, "online-vie");
+        assert_eq!(
+            external_subtitle_candidate_index(3, 3, None, scored.len()),
+            Some(0)
         );
     }
 
