@@ -1630,37 +1630,28 @@ async fn subtitles_stream_inner(
             } else {
                 None
             };
-            // Only the embedded streams PlaybackInfo kept, dropped by the same
-            // two steps in the same order: add-on externals are numbered after
-            // those, not after every probed stream.
-            let embedded_indices: std::collections::HashSet<i64> = source
+            // Rebuild PlaybackInfo's filtered view once, and use the same
+            // probe both for index numbering and external-track dedup below.
+            // Using the raw probe for the latter can hide the exact online
+            // subtitle PlaybackInfo advertised when a filtered embedded
+            // same-language track is still present in stored probe data.
+            let mut resolved_probe = source
                 .probe_data
                 .clone()
-                .map(|mut probe| {
-                    probe
-                        .media_streams
-                        .retain(|s| {
-                            crate::device_profile::keeps_embedded_subtitle(
-                                s,
-                                device_profile.as_ref(),
-                                allow_subtitle_extraction,
-                                subtitle_mode,
-                            )
-                        });
-                    if let Some(ref subs) = subs {
-                        drop_unsupported_embedded_subtitles_with_external_match(
-                            &mut probe,
-                            subs,
-                            device_profile.as_ref(),
-                        );
-                    }
-                    probe
-                        .media_streams
-                        .iter()
-                        .map(|s| s.index)
-                        .collect()
-                })
                 .unwrap_or_default();
+            filter_playback_embedded_subtitles(
+                &mut resolved_probe,
+                subs.as_deref().unwrap_or_default(),
+                device_profile.as_ref(),
+                allow_subtitle_extraction,
+                subtitle_mode,
+                dedup,
+            );
+            let embedded_indices: std::collections::HashSet<i64> = resolved_probe
+                .media_streams
+                .iter()
+                .map(|stream| stream.index)
+                .collect();
             // Sidecars are inserted before add-on subtitles in PlaybackInfo,
             // but are not present in the source's probe data. Include their
             // advertised indexes so the requested add-on matches the selected
@@ -1716,33 +1707,25 @@ async fn subtitles_stream_inner(
                 // Embed-only guard and let a stale/best-effort profile
                 // reach its codec fallback instead of agreeing with what was
                 // actually advertised.
-                let resolved_probe = source
-                    .probe_data
-                    .clone()
-                    .map(|mut probe| {
-                        for stream in &mut probe.media_streams {
-                            if matches!(
-                                stream.type_,
-                                Some(api::MediaStreamType::Subtitle)
-                            ) {
-                                stream.is_text_subtitle_stream =
-                                    stream.is_text_subtitle_stream();
-                            }
-                        }
-                        crate::playback::decision::apply_subtitle_delivery(
-                            &mut probe,
-                            item_id,
-                            session
-                                .device
-                                .access_token
-                                .expose(),
-                            &device_profile,
-                            subtitle_mode,
-                            allow_subtitle_extraction,
-                        );
-                        probe
-                    })
-                    .unwrap_or_default();
+                for stream in &mut resolved_probe.media_streams {
+                    if matches!(
+                        stream.type_,
+                        Some(api::MediaStreamType::Subtitle)
+                    ) {
+                        stream.is_text_subtitle_stream = stream.is_text_subtitle_stream();
+                    }
+                }
+                crate::playback::decision::apply_subtitle_delivery(
+                    &mut resolved_probe,
+                    item_id,
+                    session
+                        .device
+                        .access_token
+                        .expose(),
+                    &device_profile,
+                    subtitle_mode,
+                    allow_subtitle_extraction,
+                );
                 let validated_subs = validate_external_subtitles_for_advertising(
                     &state,
                     item_id,
@@ -2152,6 +2135,38 @@ pub(crate) fn filter_external_subtitles_for_source<'a>(
         !dedup.enabled || !has_supported_embedded_subtitle(source, sub, device_profile)
     })
     .collect()
+}
+
+/// Apply the embedded-stream filtering PlaybackInfo uses before it numbers
+/// external subtitles. The stream endpoint reconstructs that same view from
+/// the stored probe; sharing this keeps its index base and dedup decision in
+/// sync with what the client was shown.
+pub(crate) fn filter_playback_embedded_subtitles(
+    source: &mut api::MediaSourceInfo,
+    external_subtitles: &[crate::addons::SubtitleInfo],
+    device_profile: Option<&api::DeviceProfile>,
+    allow_extraction: bool,
+    subtitle_mode: remux_sdks::remux::EmbeddedSubtitleHandling,
+    dedup: SubtitleDedupSettings,
+) {
+    source
+        .media_streams
+        .retain(|stream| {
+            crate::device_profile::keeps_embedded_subtitle(
+                stream,
+                device_profile,
+                allow_extraction,
+                subtitle_mode,
+            )
+        });
+
+    if dedup.enabled {
+        drop_unsupported_embedded_subtitles_with_external_match(
+            source,
+            external_subtitles,
+            device_profile,
+        );
+    }
 }
 
 // The exact media path and subtitle descriptor make aliases harmless and avoid
@@ -3991,6 +4006,86 @@ mod tests {
                 .len(),
             1,
             "an embed-supported subtitle is free to deliver — never drop it in favor of external"
+        );
+    }
+
+    #[test]
+    fn external_subtitle_resolution_uses_the_filtered_probe_view() {
+        let mut probe = source_with_subtitles(vec![
+            api::MediaStream {
+                index: 0,
+                type_: Some(api::MediaStreamType::Video),
+                ..Default::default()
+            },
+            api::MediaStream {
+                index: 1,
+                type_: Some(api::MediaStreamType::Audio),
+                ..Default::default()
+            },
+            api::MediaStream {
+                index: 2,
+                type_: Some(api::MediaStreamType::Audio),
+                ..Default::default()
+            },
+            api::MediaStream {
+                index: 110,
+                type_: Some(api::MediaStreamType::Subtitle),
+                codec: Some("subrip".into()),
+                language: Some("vie".into()),
+                ..Default::default()
+            },
+        ]);
+        let external = crate::addons::SubtitleInfo {
+            id: "online-vie".into(),
+            url: Some(crate::stream::StreamDescriptor::http(
+                "https://example.com/Episode.vie.srt",
+            )),
+            lang: Some("vie".into()),
+            is_forced: false,
+            is_hi: false,
+            filename: None,
+            from_trusted: None,
+            ai_translated: None,
+        };
+        let profile = no_embed_profile();
+
+        // This mirrors the route's reconstruction for a remote source: the
+        // unsupported embedded track is absent from PlaybackInfo, so the
+        // online track starts immediately after the video and two audio tracks.
+        filter_playback_embedded_subtitles(
+            &mut probe,
+            std::slice::from_ref(&external),
+            Some(&profile),
+            false,
+            remux_sdks::remux::EmbeddedSubtitleHandling::Burn,
+            DEDUP_ON,
+        );
+        let embedded_indices: std::collections::HashSet<i64> = probe
+            .media_streams
+            .iter()
+            .map(|stream| stream.index)
+            .collect();
+        assert_eq!(
+            next_external_subtitle_index(embedded_indices.iter().copied(), []),
+            3
+        );
+        assert!(!embedded_indices.contains(&110));
+
+        // Revalidate and score against that same filtered view; the selected
+        // subtitle remains candidate zero at the advertised index.
+        let scored = filter_external_subtitles_for_source(
+            &probe,
+            None,
+            std::slice::from_ref(&external),
+            &["vie".into()],
+            Some(&profile),
+            DEDUP_ON,
+        );
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].id, "online-vie");
+        assert_eq!(
+            external_subtitle_candidate_index(3, 3, None, scored.len()),
+            Some(0)
         );
     }
 

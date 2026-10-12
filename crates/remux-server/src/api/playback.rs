@@ -3,8 +3,8 @@ use axum::Json;
 
 use super::subtitles::{
     SidecarSubtitleRoute, SubtitleDedupSettings,
-    drop_unsupported_embedded_subtitles_with_external_match,
-    filter_external_subtitles_for_source, inject_sidecar_subtitles, provider_filename,
+    filter_external_subtitles_for_source, filter_playback_embedded_subtitles,
+    inject_sidecar_subtitles, provider_filename,
     save_sidecar_subtitle_routes,
 };
 use axum::{
@@ -558,31 +558,18 @@ async fn items_playbackinfo_inner(
                     .db,
             )
             .await;
-        source
-            .media_streams
-            .retain(|s| {
-                crate::device_profile::keeps_embedded_subtitle(
-                    s,
-                    device_profile.as_ref(),
-                    allow_subtitle_extraction,
-                    subtitle_mode,
-                )
-            });
-
-        // Independent of subtitle_mode: an embedded subtitle that won't be
-        // Embed delivery anyway (slow on-demand HTTP extraction to serve it)
-        // gets dropped when a confidently-matching addon external already
-        // covers it — no reason to offer the slow path when a fast one
-        // exists. Must also run before resolve_default_streams below.
-        // Gated on the dedup setting: with it off, the user asked to see
-        // every subtitle option, embedded ones included.
-        if subtitle_dedup.enabled {
-            drop_unsupported_embedded_subtitles_with_external_match(
-                &mut source,
-                &external_subtitles,
-                device_profile.as_ref(),
-            );
-        }
+        // Keep this shared with the subtitle stream endpoint: it reconstructs
+        // this filtered probe to resolve the external index the client sees.
+        // Must run before resolve_default_streams so dropped tracks cannot
+        // become the default or affect the transcode decision.
+        filter_playback_embedded_subtitles(
+            &mut source,
+            &external_subtitles,
+            device_profile.as_ref(),
+            allow_subtitle_extraction,
+            subtitle_mode,
+            subtitle_dedup,
+        );
 
         // Resolve default audio/subtitle stream indexes for this source. These are
         // per-request API values (never persisted); resolving before the transcode
