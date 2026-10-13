@@ -2586,6 +2586,7 @@ async fn item_for_user(
                     .device
                     .access_token
                     .expose(),
+                &session.device.id,
                 sub_langs,
                 Some(
 

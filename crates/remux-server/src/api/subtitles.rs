@@ -1068,16 +1068,14 @@ fn external_subtitle_response(
 fn cached_external_subtitle_response(
     bytes: axum::body::Bytes,
     output_format: &str,
-    auto_synced: bool,
+    alignment: &'static str,
 ) -> Response<Body> {
     let mut response = external_subtitle_response(bytes, output_format);
     response
         .headers_mut()
         .insert(
             "X-Remux-Subtitle-Alignment",
-            if auto_synced { "aligned" } else { "unchanged" }
-                .parse()
-                .unwrap(),
+            alignment.parse().unwrap(),
         );
     response
         .headers_mut()
@@ -1088,6 +1086,114 @@ fn cached_external_subtitle_response(
                 .unwrap(),
         );
     response
+}
+
+async fn external_subtitle_route_response(
+    state: &AppState,
+    source: Option<&db::Media>,
+    item_id: Uuid,
+    source_alias: Uuid,
+    stream_index: i64,
+    subtitle: &crate::addons::SubtitleInfo,
+    format: &str,
+    bypass: bool,
+) -> Option<Response<Body>> {
+    let descriptor = subtitle.url.as_ref()?;
+    let output_format = format.to_ascii_lowercase();
+
+    if !bypass {
+        let mut source_ids = vec![source_alias];
+        if let Some(source) = source {
+            source_ids.push(source.id);
+            source_ids.push(api::MediaSourceInfo::from(source.clone()).id);
+        }
+        source_ids.sort_unstable();
+        source_ids.dedup();
+
+        for source_id in source_ids {
+            let Some(key) = good_track_key(
+                "ready",
+                item_id,
+                Some(source_id),
+                &subtitle.id,
+                subtitle.lang.as_deref(),
+                Some(&output_format),
+            ) else {
+                continue;
+            };
+            if let Some(cached) = load_good_track(&state.ctx, &key).await {
+                return Some(cached_external_subtitle_response(
+                    cached.bytes,
+                    &output_format,
+                    if cached.auto_synced {
+                        "aligned"
+                    } else {
+                        "unchanged"
+                    },
+                ));
+            }
+        }
+    }
+
+    let raw_key = good_track_key(
+        "raw",
+        item_id,
+        None,
+        &subtitle.id,
+        subtitle.lang.as_deref(),
+        None,
+    );
+    let cached_raw = if bypass {
+        None
+    } else if let Some(key) = raw_key.as_deref() {
+        load_good_track(&state.ctx, key)
+            .await
+            .map(|track| track.bytes)
+    } else {
+        None
+    };
+    let bytes = match cached_raw {
+        Some(bytes) => bytes,
+        None => match fetch_external_subtitle_bytes(state, descriptor).await {
+            Ok(bytes) => {
+                if !bypass {
+                    if let Some(key) = raw_key.as_deref() {
+                        let _ = save_good_track(&state.ctx, key, &bytes, false).await;
+                    }
+                }
+                bytes
+            }
+            Err(_) => {
+                warn!(%item_id, stream_index, "external subtitle unavailable");
+                return Some((StatusCode::NOT_FOUND, "subtitle unavailable").into_response());
+            }
+        },
+    };
+
+    if let Some(source) = source {
+        Some(
+            aligned_external_response(
+                state,
+                source,
+                item_id,
+                Some(&subtitle.id),
+                Some(source_alias),
+                Some(stream_index),
+                descriptor,
+                bytes,
+                subtitle.lang.as_deref(),
+                &output_format,
+                bypass,
+            )
+            .await,
+        )
+    } else {
+        Some(cached_external_subtitle_response(
+            bytes,
+            &output_format,
+            "original",
+        ))
+    }
 }
 
 async fn aligned_external_response(
@@ -1228,6 +1334,77 @@ async fn aligned_external_response(
 pub(crate) struct SidecarSubtitleRoute {
     pub(crate) index: i64,
     pub(crate) subtitle: crate::addons::SubtitleInfo,
+}
+
+#[derive(Clone)]
+struct ExternalSubtitleRoute {
+    index: i64,
+    subtitle: crate::addons::SubtitleInfo,
+}
+
+fn external_subtitle_routes_key(
+    device_id: &str,
+    item_id: Uuid,
+    media_source_id: Uuid,
+) -> String {
+    format!("external-subtitle-routes:{device_id}:{item_id}:{media_source_id}")
+}
+
+fn save_external_subtitle_routes(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    media_source_id: Uuid,
+    routes: Vec<ExternalSubtitleRoute>,
+) {
+    ctx.store.save(
+        external_subtitle_routes_key(device_id, item_id, media_source_id),
+        routes,
+        std::time::Duration::from_secs(6 * 60 * 60),
+    );
+}
+
+fn load_external_subtitle_routes(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    media_source_id: Uuid,
+) -> Option<std::sync::Arc<Vec<ExternalSubtitleRoute>>> {
+    ctx.store.get::<Vec<ExternalSubtitleRoute>>(&external_subtitle_routes_key(
+        device_id,
+        item_id,
+        media_source_id,
+    ))
+}
+
+pub(crate) fn copy_external_subtitle_routes(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    from_source_id: Uuid,
+    to_source_id: Uuid,
+) {
+    if from_source_id == to_source_id {
+        return;
+    }
+    if let Some(routes) =
+        load_external_subtitle_routes(ctx, device_id, item_id, from_source_id)
+    {
+        save_external_subtitle_routes(
+            ctx,
+            device_id,
+            item_id,
+            to_source_id,
+            routes.as_ref().clone(),
+        );
+    }
+}
+
+fn external_subtitle_route_for_index(
+    routes: &[ExternalSubtitleRoute],
+    stream_index: i64,
+) -> Option<&ExternalSubtitleRoute> {
+    routes.iter().find(|route| route.index == stream_index)
 }
 
 pub(crate) fn save_subtitle_source(
@@ -1583,6 +1760,42 @@ async fn subtitles_stream_inner(
         return Ok(response);
     }
 
+    // Resolve the exact route that was shown to this device before recomputing
+    // indexes from a later probe. A newly discovered embedded stream can shift
+    // the arithmetic base and otherwise send a valid cached track to extraction.
+    if let Some(routes) = load_external_subtitle_routes(
+        &state.ctx,
+        &session.device.id,
+        item_id,
+        advertised_source_id,
+    ) {
+        if let Some(route) = external_subtitle_route_for_index(routes.as_slice(), stream_index) {
+            let source = crate::services::StreamService::lookup(
+                &state.ctx,
+                item_id,
+                Some(media_source_id),
+                None,
+                Some(session.user.id),
+            )
+            .await
+            .ok();
+            if let Some(response) = external_subtitle_route_response(
+                &state,
+                source.as_ref(),
+                item_id,
+                advertised_source_id,
+                stream_index,
+                &route.subtitle,
+                &format,
+                bypass,
+            )
+            .await
+            {
+                return Ok(response);
+            }
+        }
+    }
+
     // Try to resolve as an external subtitle injected during PlaybackInfo.
     // fetch_subtitles is cached (24h Stremio / SQLite Opendal) so this is cheap.
     if let Some(mut item_media) = db::Media::get_by_id(
@@ -1780,90 +1993,19 @@ async fn subtitles_stream_inner(
                 )
                 .or_else(|| usize::try_from(i).ok().filter(|index| *index < scored.len()));
                 if let Some(sub) = candidate_index.and_then(|index| scored.get(index)) {
-                    if let Some(ref descriptor) = sub.url {
-                        let output_format = format.to_ascii_lowercase();
-                        if !bypass {
-                            if let Some(key) = good_track_key(
-                                "ready",
-                                item_id,
-                                Some(source.id),
-                                &sub.id,
-                                sub.lang
-                                    .as_deref(),
-                                Some(&output_format),
-                            ) {
-                                if let Some(cached) =
-                                    load_good_track(&state.ctx, &key).await
-                                {
-                                    return Ok(cached_external_subtitle_response(
-                                        cached.bytes,
-                                        &output_format,
-                                        cached.auto_synced,
-                                    ));
-                                }
-                            }
-                        }
-                        let raw_key = good_track_key(
-                            "raw",
-                            item_id,
-                            None,
-                            &sub.id,
-                            sub.lang
-                                .as_deref(),
-                            None,
-                        );
-                        let bytes = if !bypass {
-                            match raw_key.as_deref() {
-                                Some(key) => load_good_track(&state.ctx, key)
-                                    .await
-                                    .map(|track| track.bytes),
-                                None => None,
-                            }
-                        } else {
-                            None
-                        };
-                        let bytes = match bytes {
-                            Some(bytes) => bytes,
-                            None => {
-                                match fetch_external_subtitle_bytes(&state, descriptor)
-                                    .await
-                                {
-                                    Ok(bytes) => {
-                                        if let Some(key) = raw_key.as_deref() {
-                                            let _ = save_good_track(
-                                                &state.ctx, key, &bytes, false,
-                                            )
-                                            .await;
-                                        }
-                                        bytes
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, item_id = %item_id, stream_index,
-                                        "external subtitle unavailable");
-                                        return Ok((
-                                            StatusCode::NOT_FOUND,
-                                            "subtitle unavailable",
-                                        )
-                                            .into_response());
-                                    }
-                                }
-                            }
-                        };
-                        return Ok(aligned_external_response(
-                            &state,
-                            source,
-                            item_id,
-                            Some(&sub.id),
-                            Some(advertised_source_id),
-                            Some(stream_index),
-                            descriptor,
-                            bytes,
-                            sub.lang
-                                .as_deref(),
-                            &output_format,
-                            bypass,
-                        )
-                        .await);
+                    if let Some(response) = external_subtitle_route_response(
+                        &state,
+                        Some(source),
+                        item_id,
+                        advertised_source_id,
+                        stream_index,
+                        sub,
+                        &format,
+                        bypass,
+                    )
+                    .await
+                    {
+                        return Ok(response);
                     }
                 }
             }
@@ -2462,6 +2604,7 @@ pub(crate) fn append_external_subtitles(
 ) {
     let _ = append_external_subtitles_inner(
         None,
+        "",
         media_sources,
         subs,
         sub_langs,
@@ -2475,6 +2618,7 @@ pub(crate) fn append_external_subtitles(
 
 pub(crate) async fn append_external_subtitles_with_context(
     ctx: &crate::AppContext,
+    device_id: &str,
     media_sources: &mut [api::MediaSourceInfo],
     subs: &[crate::addons::SubtitleInfo],
     sub_langs: &[String],
@@ -2486,6 +2630,7 @@ pub(crate) async fn append_external_subtitles_with_context(
 ) {
     let restore_targets = append_external_subtitles_inner(
         Some(ctx),
+        device_id,
         media_sources,
         subs,
         sub_langs,
@@ -2515,6 +2660,7 @@ pub(crate) async fn append_external_subtitles_with_context(
 
 fn append_external_subtitles_inner(
     ctx: Option<&crate::AppContext>,
+    device_id: &str,
     media_sources: &mut [api::MediaSourceInfo],
     subs: &[crate::addons::SubtitleInfo],
     sub_langs: &[String],
@@ -2546,6 +2692,17 @@ fn append_external_subtitles_inner(
             device_profile,
             dedup,
         );
+        if let Some(ctx) = ctx {
+            let routes = scored
+                .iter()
+                .enumerate()
+                .map(|(offset, subtitle)| ExternalSubtitleRoute {
+                    index: next_idx + offset as i64,
+                    subtitle: (*subtitle).clone(),
+                })
+                .collect();
+            save_external_subtitle_routes(ctx, device_id, item_id, source.id, routes);
+        }
         let labels = external_subtitle_labels(
             scored
                 .iter()
@@ -2767,6 +2924,7 @@ pub(crate) async fn inject_prefetched_external_subtitles(
     sub_langs: &[String],
     device_profile: Option<&api::DeviceProfile>,
     api_key: &str,
+    device_id: &str,
     dedup: SubtitleDedupSettings,
     release_ready_first_redirect: bool,
     empty_gate_policy: EmptySubtitleGatePolicy,
@@ -2798,6 +2956,7 @@ pub(crate) async fn inject_prefetched_external_subtitles(
 
     append_external_subtitles_with_context(
         &state.ctx,
+        device_id,
         media_sources,
         &subs,
         sub_langs,
@@ -2964,6 +3123,7 @@ pub(crate) async fn inject_external_subtitles(
     media_sources: &mut Vec<api::MediaSourceInfo>,
     item_id: Uuid,
     api_key: &str,
+    device_id: &str,
     sub_langs: Vec<String>,
     user_id: Option<Uuid>,
     device_profile: Option<&api::DeviceProfile>,
@@ -2983,6 +3143,7 @@ pub(crate) async fn inject_external_subtitles(
         &sub_langs,
         device_profile,
         api_key,
+        device_id,
         dedup,
         release_ready_first_redirect,
         EmptySubtitleGatePolicy::AllSources,
@@ -4532,6 +4693,148 @@ mod tests {
         assert!(
             !args.contains(&"-reconnect".to_string()),
             "a local path should not get http reconnect args: {args:?}"
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod advertised_external_route_tests {
+    use super::*;
+    use http::StatusCode;
+
+    use crate::integration_test::authenticated_server;
+
+    #[tokio::test]
+    async fn advertised_external_route_serves_its_cached_track_by_exact_index() {
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = guard.0.clone();
+        let state = crate::AppState {
+            tasks: crate::tasks::TaskService::new(ctx.clone())
+                .await
+                .unwrap(),
+            ctx: ctx.clone(),
+        };
+        let item = Uuid::new_v4();
+        let source = Uuid::new_v4();
+        let subtitle = crate::addons::SubtitleInfo {
+            id: "advertised-vietnamese-track".into(),
+            url: Some(crate::stream::StreamDescriptor::http(
+                "https://subtitles.example.test/advertised.vtt",
+            )),
+            lang: Some("vi".into()),
+            is_forced: false,
+            is_hi: false,
+            filename: None,
+            from_trusted: None,
+            ai_translated: None,
+        };
+        let neighboring = crate::addons::SubtitleInfo {
+            id: "neighboring-track".into(),
+            url: subtitle.url.clone(),
+            lang: Some("en".into()),
+            is_forced: false,
+            is_hi: false,
+            filename: None,
+            from_trusted: None,
+            ai_translated: None,
+        };
+        save_external_subtitle_routes(
+            &ctx,
+            "player-a",
+            item,
+            source,
+            vec![
+                ExternalSubtitleRoute {
+                    index: 3,
+                    subtitle: subtitle.clone(),
+                },
+                ExternalSubtitleRoute {
+                    index: 4,
+                    subtitle: neighboring.clone(),
+                },
+            ],
+        );
+
+        let routes = load_external_subtitle_routes(&ctx, "player-a", item, source).unwrap();
+        let route = external_subtitle_route_for_index(routes.as_slice(), 3).unwrap();
+        assert_eq!(route.subtitle.id, "advertised-vietnamese-track");
+        assert!(load_external_subtitle_routes(&ctx, "player-b", item, source).is_none());
+        assert!(load_external_subtitle_routes(&ctx, "player-a", item, Uuid::new_v4()).is_none());
+
+        let original = axum::body::Bytes::from_static(
+            b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nXin chao\n",
+        );
+        let raw_key = good_track_key(
+            "raw",
+            item,
+            None,
+            &subtitle.id,
+            subtitle.lang.as_deref(),
+            None,
+        )
+        .unwrap();
+        save_good_track(&ctx, &raw_key, &original, false)
+            .await
+            .unwrap();
+
+        let response = external_subtitle_route_response(
+            &state,
+            None,
+            item,
+            source,
+            route.index,
+            &route.subtitle,
+            "vtt",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("X-Remux-Subtitle-Alignment")
+                .unwrap(),
+            http::HeaderValue::from_static("original")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 2_000_000)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Xin chao"));
+
+        let ready_key = good_track_key(
+            "ready",
+            item,
+            Some(source),
+            &neighboring.id,
+            neighboring.lang.as_deref(),
+            Some("vtt"),
+        )
+        .unwrap();
+        save_good_track(&ctx, &ready_key, &original, true)
+            .await
+            .unwrap();
+        let neighboring_route =
+            external_subtitle_route_for_index(routes.as_slice(), 4).unwrap();
+        let response = external_subtitle_route_response(
+            &state,
+            None,
+            item,
+            source,
+            neighboring_route.index,
+            &neighboring_route.subtitle,
+            "vtt",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("X-Remux-Subtitle-Alignment")
+                .unwrap(),
+            http::HeaderValue::from_static("aligned")
         );
     }
 }
