@@ -76,6 +76,11 @@ front of the source list for every accepted pair.
   external (`Path <lang>.vtt`) so VidHub/Infuse list them.
 
 ## Operations
+- Paid media admission: [TRANSFER-LIMITS.md](TRANSFER-LIMITS.md) describes the
+  shared persistent Premiumize/TorBox daily reservation budgets, concurrency,
+  start pacing and private authentication. Uncached preparation now requires
+  an authenticated request with provider and whole-file size. Existing caches
+  and direct device-to-CDN playback are unaffected by admission limits.
 - Release subtitle preservation: when Remux supplies a probed text-track plan,
   the existing raw-video ffmpeg pass losslessly captures ASS/SSA/SRT tracks in
   a local subtitle-only file. After the video passes its complete/decode checks,
@@ -89,7 +94,7 @@ front of the source list for every accepted pair.
   on old raw/mux files are not backfilled by re-downloading those files.
   Remux's optional `DUBMUX_SUBTITLE_CACHE_URL` enables this read-only lookup
   independently of `DUBMUX_URL`, so pausing new mux preparation stays effective.
-- Deploy: copy `dubmux.py server.py release_subtitles.py align.py vnfile.py Containerfile run.sh` to seedbox
+- Deploy: copy `dubmux.py server.py provider_budget.py release_subtitles.py align.py vnfile.py Containerfile run.sh` to seedbox
   `~/dubmux/`, `podman build -t localhost/dubmux:latest -f Containerfile .`,
   `./run.sh`. Data in `~/dubmux/data/{audio,match,hls}`.
 - Debug: `GET /health`, `GET /jobs` (in-memory job states, errors),

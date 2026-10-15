@@ -519,6 +519,7 @@ async fn reference_text(
     index: i64,
     codec: Option<&str>,
     allow_extraction: bool,
+    read_budget: Option<crate::services::media_budget::ReadBudget>,
 ) -> Option<String> {
     let dir = state
         .ctx
@@ -596,6 +597,7 @@ async fn reference_text(
         index,
         api::SubtitleCodec::Srt,
         codec,
+        read_budget,
     )
     .await
     .ok()?;
@@ -811,6 +813,10 @@ pub(super) async fn resolve(
         .save(key.clone(), Outcome::Pending, Duration::from_secs(900));
     let job_state = state.clone();
     let job_key = key.clone();
+    let read_budget = crate::services::media_budget::ReadBudget::for_media(
+        &state.ctx, source, "full",
+    )
+    .await;
     tokio::spawn(async move {
         let state = job_state;
         let key = job_key;
@@ -840,6 +846,7 @@ pub(super) async fn resolve(
                     index,
                     codec.as_deref(),
                     allow_reference_extraction,
+                    Some(read_budget.clone()),
                 )
                 .await
                 else {
@@ -1241,7 +1248,8 @@ mod tests {
                 identity,
                 23,
                 Some("srt"),
-                false
+                false,
+                None
             )
             .await
             .unwrap()
@@ -1255,7 +1263,8 @@ mod tests {
                 identity,
                 22,
                 Some("srt"),
-                false
+                false,
+                None
             )
             .await
             .is_none()

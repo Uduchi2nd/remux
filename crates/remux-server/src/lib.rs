@@ -653,6 +653,11 @@ pub struct Config {
     /// Read-only text cache API. Does not enable mux preparation or prefetch.
     #[serde(default)]
     pub dubmux_subtitle_cache_url: Option<String>,
+    /// Shared, authenticated admission ledger for automated paid media reads.
+    #[serde(default)]
+    pub media_transfer_budget_url: Option<String>,
+    #[serde(default)]
+    pub media_transfer_budget_token_file: Option<std::path::PathBuf>,
     /// How long a playback request waits for a still-running dub preparation
     /// before answering without the dub rows (default 10 s). Background stream
     /// refreshes never wait.
@@ -849,6 +854,8 @@ impl Default for Config {
             dubmux_url: None,
             dubmux_public_url: None,
             dubmux_subtitle_cache_url: None,
+            media_transfer_budget_url: None,
+            media_transfer_budget_token_file: None,
             dubmux_prepare_wait_secs: default_dubmux_prepare_wait_secs(),
             dubmux_prefetch_episodes: default_dubmux_prefetch_episodes(),
             dubmux_premux_next: default_dubmux_premux_next(),

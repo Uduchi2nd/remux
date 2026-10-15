@@ -19,7 +19,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Minimum spacing between two background probes.
-pub(crate) const BACKGROUND_GAP: Duration = Duration::from_secs(30);
+// The persistent provider ledger additionally requires 60s for Premiumize,
+// 5s for TorBox, and enforces its per-provider concurrency/daily allowance.
+pub(crate) const BACKGROUND_GAP: Duration = Duration::from_secs(5);
 const FIRST_OPEN: Duration = Duration::from_secs(30 * 60);
 const MAX_OPEN: Duration = Duration::from_secs(4 * 3600);
 /// AIOStreams' static error clips are ~2 minutes long.

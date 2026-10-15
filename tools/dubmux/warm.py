@@ -146,9 +146,20 @@ def sid(it):
 
 
 def prepare(dub, hq, key):
-    body = json.dumps({"dub": {"id": key[0], "url": dub["url"]}, "video": {"id": key[1], "url": hq["url"]},
+    token = os.environ.get("DUBMUX_TRANSFER_TOKEN", "")
+    token_path = os.path.join(HERE, "media-transfer-budget-token")
+    if not token and os.path.isfile(token_path):
+        with open(token_path) as config:
+            token = config.read().strip()
+    if not token:
+        return {"status": "limited", "stage": "media budget authorization not configured"}
+    data = hq.get("streamData") or {}
+    provider = (data.get("service") or {}).get("id") or "premiumize"
+    size = (hq.get("behaviorHints") or {}).get("videoSize") or 0
+    body = json.dumps({"dub": {"id": key[0], "url": dub["url"]}, "video": {"id": key[1], "url": hq["url"],
+                       "provider": provider, "size": size},
                        "wait": 0, "priority": PRIORITY}).encode()
-    req = urllib.request.Request(f"{MUXER}/prepare", data=body, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(f"{MUXER}/prepare", data=body, headers={"Content-Type": "application/json", "Authorization":"Bearer " + token})
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.loads(r.read())
 
@@ -193,6 +204,8 @@ def warm(it):
         except Exception as e:  # noqa: BLE001
             log(f"  prepare error: {str(e)[:120]}")
             continue
+        if st.get("status") == "limited":
+            return "deferred"
         if st.get("status") == "ready":
             res = st.get("result") or {}
             return "accepted" + (" (reused)" if res.get("aliased_from") or st.get("cached") else "")
@@ -229,12 +242,18 @@ def main():
     batch = fresh[:BATCH]
     log(f"{len(cands)} candidate episodes/movies, {len(fresh)} not warmed in {REPEAT_DAYS} d, warming {len(batch)} (muxer backlog {b})")
     for it in batch:
+        if os.path.exists(PAUSE_FLAG):
+            log("paused; stopping before the next title")
+            return
         t0 = time.time()
         try:
             outcome = warm(it)
         except Exception as e:  # noqa: BLE001
             outcome = f"error: {str(e)[:100]}"
         log(f"  {outcome:22} {it['label']}  {time.time() - t0:.0f}s")
+        if outcome == "deferred":
+            log("provider budget deferred this run; leaving it eligible for a later run")
+            break
         if not outcome.startswith("error"):
             state[it["key"]] = time.time()
             state = {k: v for k, v in state.items() if v > time.time() - 3 * REPEAT_DAYS * 86400}

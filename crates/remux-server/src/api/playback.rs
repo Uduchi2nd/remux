@@ -993,11 +993,7 @@ async fn items_playbackinfo_inner(
         })
     {
         crate::api::subtitles::prefetch_embedded_subtitles(
-            state
-                .ctx
-                .config
-                .data_dir
-                .clone(),
+            state.ctx.clone(),
             prefetch.input_url,
             prefetch.probe,
             id,

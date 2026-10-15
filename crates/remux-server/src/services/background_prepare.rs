@@ -189,6 +189,16 @@ async fn probe_background_streams(
         if !upstream_budget::background_slot().await {
             break;
         }
+        let budget =
+            crate::services::media_budget::ReadBudget::for_media(ctx, &source, "probe")
+                .await;
+        let Ok(_budget_permit) = budget
+            .acquire()
+            .await
+        else {
+            debug!(source = %source.id, "background probe deferred by provider media budget");
+            continue;
+        };
         checked += 1;
         let id = source.id;
         if probe_background_candidate(

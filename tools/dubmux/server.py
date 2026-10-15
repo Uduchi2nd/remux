@@ -15,7 +15,7 @@ State on disk under DUBMUX_DATA:
   match/<dub_id>__<video_id>.json cross-correlation result
   hls/<dub_id>__<video_id>/       segments + playlist (+ .done when VOD)
 """
-import asyncio, hashlib, json, os, re, shutil, subprocess, sys, threading, time
+import asyncio, hashlib, hmac, json, os, re, shutil, subprocess, sys, threading, time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -26,6 +26,7 @@ import dubmux  # noqa: E402
 import vnfile  # noqa: E402
 import align  # noqa: E402
 import release_subtitles  # noqa: E402
+import provider_budget  # noqa: E402
 
 DATA = Path(os.environ.get("DUBMUX_DATA", "/data"))
 AUDIO, MATCH, HLS = DATA / "audio", DATA / "match", DATA / "hls"
@@ -33,6 +34,7 @@ SUBTITLES = DATA / "subtitles"
 for d in (AUDIO, MATCH, HLS):
     d.mkdir(parents=True, exist_ok=True)
 dubmux.CACHE = str(AUDIO)
+MEDIA_READS = provider_budget.MediaReads(DATA)
 
 RETENTION_DAYS = int(os.environ.get("DUBMUX_RETENTION_DAYS", "30"))
 HLS_BUDGET_GB = float(os.environ.get("DUBMUX_HLS_BUDGET_GB", "100"))
@@ -46,6 +48,49 @@ MASTER_WAIT_S = float(os.environ.get("DUBMUX_MASTER_WAIT_S", "50"))
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 
 app = FastAPI(title="dubmux")
+
+
+def _budget_authorized(request):
+    token = os.environ.get("DUBMUX_TRANSFER_TOKEN", "")
+    return bool(token) and hmac.compare_digest(request.headers.get("Authorization", ""), "Bearer " + token)
+
+
+def _require_budget_auth(request):
+    if not _budget_authorized(request):
+        raise HTTPException(401, "media budget authorization required")
+
+
+@app.exception_handler(provider_budget.Limited)
+async def budget_limited(_request, error):
+    return JSONResponse({"allowed": False, "reason": error.reason, "retry_after": error.retry_after},
+                        status_code=429, headers={"Retry-After": str(error.retry_after)})
+
+
+@app.post("/transfer-budget/reserve")
+async def reserve_transfer(request: Request):
+    _require_budget_auth(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "invalid reservation")
+    try:
+        lease = MEDIA_READS.ledger.reserve(body.get("provider"), body.get("bytes"), body.get("kind", "full"))
+    except ValueError:
+        raise HTTPException(400, "invalid read kind") from None
+    return {"allowed": True, "lease": lease}
+
+
+@app.post("/transfer-budget/release/{lease}")
+def release_transfer(lease: str, request: Request):
+    _require_budget_auth(request)
+    MEDIA_READS.ledger.release(lease)
+    return {"ok": True}
+
+
+@app.get("/transfer-budget/status")
+def transfer_status(request: Request):
+    _require_budget_auth(request)
+    return MEDIA_READS.ledger.status()
+
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}       # prepare jobs keyed dub__video
 _sessions: dict[str, dict] = {}   # running ffmpeg muxes keyed dub__video
@@ -280,6 +325,13 @@ def _corrupt_video(d, samples=4, max_errors=4):
 
 
 def _raw_copy(hq_id, video_url, k, priority):
+    if (_raw_dir(hq_id) / ".done").exists():
+        return _raw_dir(hq_id)
+    with MEDIA_READS.scope(hq_id, video_url):
+        return _raw_copy_unlimited(hq_id, video_url, k, priority)
+
+
+def _raw_copy_unlimited(hq_id, video_url, k, priority):
     """Pass 1 of the two-pass mux: stream-copy the release ONCE into a local
     HLS (video + every original audio track, no dub). Shared by every dub
     paired with this release; the alignment reads its audio from local disk
@@ -306,7 +358,7 @@ def _raw_copy(hq_id, video_url, k, priority):
             subtitle_identity, subtitle_outputs = release_subtitles.outputs(MATCH, hq_id, d / "subtitles")
             cmd += subtitle_outputs
             with open(d / "ffmpeg.log", "w") as log:
-                rc = subprocess.run(cmd, stdout=log, stderr=log).returncode
+                rc = subprocess.run(cmd, stdout=log, stderr=log, timeout=900).returncode
             if rc != 0 or not (d / "index.m3u8").exists():
                 shutil.rmtree(d, ignore_errors=True)
                 return None
@@ -508,6 +560,7 @@ def _prepare_worker(dub, video, k):
     raw_thread = None
     raw_box: dict = {}
     rejected = True
+    budget_lease = None
     try:
         # Interactive requests (someone is waiting): download the release in
         # parallel with the dub extraction. Background/evaluation ones wait
@@ -524,10 +577,12 @@ def _prepare_worker(dub, video, k):
                            result=result, aliased_from=hit["pair"])
                 print(f"prepare {k}: reused {hit['pair']} ({result['verdict']})", file=sys.stderr, flush=True)
                 if not rejected and job["priority"] <= 9:
-                    _start_mux(k, dubmux.resolve_url(video["url"]), dub["id"], result["lag"])
+                    _ensure_mux(k, dub["id"], result, video["url"])
                 return
         orig_url = video["url"]   # kept in the record: the release identity (file name)
+        budget_lease = MEDIA_READS.acquire(hq_id, orig_url)
         video["url"] = dubmux.resolve_url(video["url"], background=job["priority"] > 9)
+        MEDIA_READS.check_resolved(hq_id, orig_url, video["url"])
         job["video_url"] = video["url"]
         _raw_ref(hq_id, k)
         if job["priority"] <= 99 and not (_raw_dir(hq_id) / ".done").exists():
@@ -536,6 +591,8 @@ def _prepare_worker(dub, video, k):
                     raw_box["dir"] = _raw_copy(hq_id, video["url"], k, job["priority"])
                 except CorruptSource as e:
                     raw_box["corrupt"] = e
+                except (provider_budget.Limited, subprocess.TimeoutExpired) as error:
+                    raw_box["error"] = error
             raw_thread = threading.Thread(target=_dl, daemon=True)
             raw_thread.start()
         meta = AUDIO / f"{dub['id']}.json"
@@ -630,6 +687,8 @@ def _prepare_worker(dub, video, k):
                         if raw_box.get("corrupt"):
                             raise raw_box["corrupt"]
                     rd = raw_box.get("dir")
+                    if not rd:
+                        raise RuntimeError("raw release unavailable; refusing a second full remote audio read")
                     job["stage"] = "match:piecewise"
                     rep = align.align(video["url"], dubfile, str(MATCH), k,
                                       hq_audio=str(rd / "audio.mka") if rd else None)
@@ -680,7 +739,12 @@ def _prepare_worker(dub, video, k):
                 raw_thread = None
                 if raw_box.get("corrupt"):
                     raise raw_box["corrupt"]
+                if not raw_box.get("dir"):
+                    raise RuntimeError("raw release unavailable; refusing a second remote download")
             _start_mux(k, video["url"], dub["id"], result["lag"])
+    except provider_budget.Limited as error:
+        rejected = False
+        job.update(status="limited", stage=error.reason, retry_at=time.time()+error.retry_after)
     except CorruptSource as e:
         result = {"dub": dub["id"], "video": video["id"], "verdict": "reject:corrupt-source",
                   "detail": str(e), "created": int(time.time()), "align_version": ALIGN_VERSION,
@@ -704,6 +768,8 @@ def _prepare_worker(dub, video, k):
             job.update(status="rejected", result=result)
             rejected = True
         _raw_release(hq_id, k, rejected)
+        if budget_lease:
+            budget_lease.close()
         job["finished"] = time.time()
 
 
@@ -715,7 +781,9 @@ async def prepare(req: Request):
         _check_id(v)
     if not (dub.get("url") and video.get("url")):
         raise HTTPException(400, "dub.url and video.url required")
-    release_subtitles.register(MATCH, video)
+    if _budget_authorized(req):
+        MEDIA_READS.register(video)
+        release_subtitles.register(MATCH, video)
     k = _key(dub["id"], video["id"])
     cached = _load_match(k)
     if cached:
@@ -726,6 +794,7 @@ async def prepare(req: Request):
             cached["file_size"] = lay[2] if lay else None
         return {"status": "ready" if cached["verdict"] == "accept" else "rejected",
                 "stage": "done", "result": cached, "cached": True}
+    _require_budget_auth(req)
     # Lower = sooner. remux sends 0 for the episode being played, ~100+ for
     # the on-play walk (next episodes first; a pair's rank within its
     # episode is added, so every episode's FIRST dub version is served before
@@ -748,7 +817,8 @@ async def prepare(req: Request):
                 "stage": f"paused {dubmux.breaker_remaining(video['url'])}s (resolver rate limit)"}
     with _lock:
         job = _jobs.get(k)
-        if not job or (job["status"] in ("error",) and time.time() - job.get("finished", 0) > 60):
+        if not job or (job["status"] == "error" and time.time() - job.get("finished", 0) > 60) or \
+                (job["status"] == "limited" and time.time() >= job.get("retry_at", 0)):
             job = {"status": "running", "stage": "queued", "started": time.time(),
                    "priority": priority}
             _jobs[k] = job
@@ -1150,17 +1220,28 @@ def _jit_start(k, video_url, dub_id, lag, tab, start_seg=0, end_seg=None):
                 return  # already producing towards this segment
             old["proc"].kill()
             old["proc"].wait()
+            if old.get("budget_lease"): old["budget_lease"].close()
         rd = _run_dir(d, start_seg)
         shutil.rmtree(rd, ignore_errors=True)
         rd.mkdir()
         dubfile, lag = _dub_input(k, dub_id, lag)
         src, remote = _mux_source(k, video_url)
-        cmd = _jit_cmd(k, src, remote, dubfile, lag, tab, start_seg, rd)
+        lease = MEDIA_READS.acquire(hq_id_of(k), video_url) if remote else None
+        try:
+            cmd = _jit_cmd(k, src, remote, dubfile, lag, tab, start_seg, rd)
+        except Exception:
+            if lease: lease.close()
+            raise
         log = open(d / "ffmpeg.log", "a")
         log.write(f"\n# start_seg={start_seg} end_seg={end_seg} src={'remote' if remote else 'raw'}\n"); log.flush()
-        proc = subprocess.Popen(cmd, stdout=log, stderr=log)
+        try:
+            proc = subprocess.Popen(cmd, stdout=log, stderr=log)
+        except Exception:
+            if lease: lease.close()
+            raise
         prod = {"proc": proc, "start": start_seg, "cursor": start_seg - 1, "n": len(durs),
-                "started": time.time(), "fills": (old or {}).get("fills", 0), "stopped": False}
+                "started": time.time(), "fills": (old or {}).get("fills", 0), "stopped": False,
+                "budget_lease": lease}
         _producers[k] = prod
         _touch_pair(k, dub_id)
 
@@ -1209,6 +1290,7 @@ def _jit_start(k, video_url, dub_id, lag, tab, start_seg=0, end_seg=None):
                 break
             time.sleep(0.3)
         proc.wait()
+        if lease: lease.close()
         move_ready(True)
         shutil.rmtree(rd, ignore_errors=True)
         with _lock:
@@ -1271,6 +1353,19 @@ def _audio_window(src, start, span, remote):
 
 
 def _sync_check(k, dub_id):
+    if (_raw_dir(hq_id_of(k)) / "audio.mka").exists():
+        return _sync_check_unlimited(k, dub_id)
+    m = _load_match(k) or {}
+    if m.get("verdict") != "accept" or not m.get("video_url"):
+        return None
+    try:
+        with MEDIA_READS.scope(hq_id_of(k), m["video_url"]):
+            return _sync_check_unlimited(k, dub_id)
+    except provider_budget.Limited:
+        return None  # a deferred check is not evidence of a bad pair
+
+
+def _sync_check_unlimited(k, dub_id):
     """Does the dub the mux will use line up with the release's own audio?
     Two 45 s stretches past the 3-minute mark (lag searched +-30 s) (where a wrong or missing
     alignment shows); the release audio is the raw copy's (local) or the
@@ -1291,6 +1386,7 @@ def _sync_check(k, dub_id):
     else:
         try:
             src, remote = dubmux.resolve_url(m.get("video_url", "")), True
+            MEDIA_READS.check_resolved(hq_id_of(k), m["video_url"], src)
         except Exception:  # noqa: BLE001
             return None
     try:
@@ -1448,7 +1544,8 @@ def _open_session(k, dub_id, m, video_url):
     """Make sure the pair's play session exists (JIT or finished); returns its
     directory. Shared by the playlist and the seekable-file endpoints."""
     d = _session_dir(k)
-    if not m.get("sync_check"):
+    if not m.get("sync_check") and ((_raw_dir(hq_id_of(k)) / "audio.mka").exists()
+                                     or not (d / ".done").exists()):
         _sync_check_bg(k, dub_id)
     if (d / ".done").exists() and not _session_consistent(d):
         # a finished session whose playlist does not describe its segments
@@ -1456,6 +1553,8 @@ def _open_session(k, dub_id, m, video_url):
         print(f"mux {k}: inconsistent finished session, rebuilding", file=sys.stderr, flush=True)
         shutil.rmtree(d, ignore_errors=True)
     if not (d / ".done").exists():
+      if not (_raw_dir(hq_id_of(k)) / ".done").exists():
+        MEDIA_READS.check(hq_id_of(k), video_url)
       try:
         if (d / ".jit").exists():
             _resume_session(k)                       # orphaned by a restart? continue it
@@ -1486,12 +1585,24 @@ def _session_consistent(d):
     return "#EXT-X-ENDLIST" in idx and idx.count("#EXTINF") == n_files > 0
 
 
+def _jit_source_url(k, video_url):
+    if (_raw_dir(hq_id_of(k)) / ".done").exists():
+        return video_url  # the muxer uses its completed local raw copy
+    MEDIA_READS.check(hq_id_of(k), video_url)
+    resolved = dubmux.resolve_url(video_url)
+    MEDIA_READS.check_resolved(hq_id_of(k), video_url, resolved)
+    return resolved
+
+
 def _ensure_mux(k, dub_id, m, video_url):
     if (_session_dir(k) / ".done").exists():
         return
+    if (_raw_dir(hq_id_of(k)) / ".done").exists():
+        return _start_mux(k, video_url, dub_id, m["lag"])
+    resolved = _jit_source_url(k, video_url)
     m["video_url"] = video_url
     json.dump(m, open(_match_path(k), "w"), indent=1)
-    _start_mux(k, dubmux.resolve_url(video_url), dub_id, m["lag"])
+    _start_mux(k, resolved, dub_id, m["lag"])
 
 
 @app.post("/mux/{dub_id}/{video_id}/touch")
@@ -1520,6 +1631,8 @@ def start(dub_id: str, video_id: str, request: Request):
         raise HTTPException(400, "video url required (query ?video=)")
     d = _session_dir(k)
     if not (d / ".done").exists():
+        if not (_raw_dir(hq_id_of(k)) / ".done").exists():
+            MEDIA_READS.check(hq_id_of(k), video_url)
         threading.Thread(target=_ensure_mux, args=(k, dub_id, m, video_url), daemon=True).start()
     return {"ok": True, "done": (d / ".done").exists()}
 
@@ -1568,7 +1681,7 @@ def _ensure_segment(k, dub_id, n):
             if tab and (not running or n < prod["start"] or n > prod["cursor"] + JIT_AHEAD):
                 # far seek (or producer gone): restart at this segment
                 try:
-                    src = dubmux.resolve_url(m.get("video_url", ""))   # cached: no resolver hit per seek
+                    src = _jit_source_url(k, m.get("video_url", ""))
                 except dubmux.SourceUnavailable as e:
                     raise HTTPException(503, f"source temporarily unavailable: {e}", headers={"Retry-After": "30"})
                 try:
@@ -1944,7 +2057,7 @@ def _resume_session(k):
         (d / ".done").write_text(str(int(time.time())))
         return False
     end = next((i for i in range(hole + 1, n) if (d / f"seg{i:05d}.ts").exists()), None)
-    _jit_start(k, dubmux.resolve_url(m["video_url"]), k.split("__", 1)[0], m.get("lag", 0.0), tab, hole, end)
+    _jit_start(k, _jit_source_url(k, m["video_url"]), k.split("__", 1)[0], m.get("lag", 0.0), tab, hole, end)
     return True
 
 

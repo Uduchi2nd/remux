@@ -31,6 +31,7 @@ pub(crate) struct DubmuxConfig<'a> {
     pub api: &'a str,
     pub public: &'a str,
     pub wait_secs: u64,
+    pub token_file: Option<&'a std::path::Path>,
 }
 
 impl<'a> DubmuxConfig<'a> {
@@ -45,6 +46,9 @@ impl<'a> DubmuxConfig<'a> {
                 .as_deref()?
                 .trim_end_matches('/'),
             wait_secs: config.dubmux_prepare_wait_secs,
+            token_file: config
+                .media_transfer_budget_token_file
+                .as_deref(),
         })
     }
 }
@@ -308,30 +312,48 @@ async fn prepare(
     cfg: &DubmuxConfig<'_>,
     dub_id: &str,
     dub_url: &str,
-    hq_id: &str,
-    hq_url: &str,
-    subtitle_source: Option<&serde_json::Value>,
+    video: &serde_json::Value,
     wait: u64,
     priority: u32,
     cached_only: bool,
 ) -> anyhow::Result<PrepareReply> {
     let body = serde_json::json!({
         "dub": {"id": dub_id, "url": dub_url},
-        "video": {"id": hq_id, "url": hq_url, "subtitle_source": subtitle_source},
+        "video": video,
         "wait": wait,
         "priority": priority,
         "cached_only": cached_only,
     });
-    let reply = client
+    let request = client
         .post(format!("{}/prepare", cfg.api))
         .timeout(Duration::from_secs(wait + 8))
-        .json(&body)
+        .json(&body);
+    let request = if let Some(path) = cfg.token_file {
+        request.bearer_auth(
+            tokio::fs::read_to_string(path)
+                .await?
+                .trim(),
+        )
+    } else {
+        request
+    };
+    let reply = request
         .send()
         .await?
         .error_for_status()?
         .json::<PrepareReply>()
         .await?;
     Ok(reply)
+}
+
+fn video_request(hq: &db::Media) -> serde_json::Value {
+    let info = hq
+        .stream_info
+        .as_ref()
+        .expect("HQ candidate has stream info");
+    serde_json::json!({"id":hq.id.simple().to_string(),"url":http_url(hq),
+        "provider":super::media_budget::provider(info), "size":info.size,
+        "subtitle_source":subtitle_source(hq)})
 }
 
 /// The muxer writes these text tracks while reading the selected release for
@@ -632,11 +654,6 @@ pub(crate) async fn ensure_dub_rows(
             .iter()
             .copied()
         {
-            let hq_url = http_url(hq).unwrap();
-            let hq_id = hq
-                .id
-                .simple()
-                .to_string();
             for (dub, _provider, dub_id) in &dubs {
                 let pair_priority = if n == 0 {
                     priority
@@ -650,17 +667,15 @@ pub(crate) async fn ensure_dub_rows(
                     http_url(dub)
                         .unwrap()
                         .to_string(),
-                    hq_id.clone(),
-                    hq_url.to_string(),
-                    subtitle_source(hq),
+                    video_request(hq),
                     pair_priority,
                     cached_only,
                 ));
             }
         }
         pre = futures::future::join_all(specs.iter().map(
-            |(dub_id, dub_url, hq_id, hq_url, subtitles, pr, co)| {
-                prepare(&client, &cfg, dub_id, dub_url, hq_id, hq_url, subtitles.as_ref(), 0, *pr, *co)
+            |(dub_id, dub_url, video, pr, co)| {
+                prepare(&client, &cfg, dub_id, dub_url, video, 0, *pr, *co)
             },
         ))
         .await
@@ -698,9 +713,7 @@ pub(crate) async fn ensure_dub_rows(
                         &cfg,
                         dub_id,
                         dub_url,
-                        &hq_id,
-                        hq_url,
-                        subtitle_source(hq).as_ref(),
+                        &video_request(hq),
                         wait,
                         pair_priority,
                         cached_only,

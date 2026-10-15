@@ -1,9 +1,10 @@
-pub(crate) mod four_k_capability;
 pub mod background_prepare;
 pub(crate) mod dubmux;
-pub(crate) mod open_prefetch;
+pub(crate) mod four_k_capability;
 pub mod image;
+pub(crate) mod media_budget;
 pub mod media_tracker;
+pub(crate) mod open_prefetch;
 pub(crate) mod resolve;
 pub mod stream_provider;
 pub(crate) mod stream_service;

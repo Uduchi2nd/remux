@@ -1,3 +1,4 @@
+use crate::services::media_budget::ReadBudget;
 use anyhow::anyhow;
 use axum::{
     body::Body,
@@ -483,7 +484,7 @@ static SUBTITLE_EXTRACTION_INFLIGHT: std::sync::LazyLock<
 /// source, in the same pass) in the background, so the subtitle request that
 /// follows PlaybackInfo finds the cache written or joins the running pass.
 pub(crate) fn prefetch_embedded_subtitles(
-    data_dir: std::path::PathBuf,
+    ctx: crate::AppContext,
     input_url: String,
     probe: api::MediaSourceInfo,
     item_id: Uuid,
@@ -493,14 +494,20 @@ pub(crate) fn prefetch_embedded_subtitles(
 ) {
     let cache_codec = subtitle_cache_codec(delivery_format);
     tokio::spawn(async move {
+        let budget = match db::Media::get_by_id(&ctx.db, &media_source_id).await {
+            Ok(Some(media)) => Some(ReadBudget::for_media(&ctx, &media, "full").await),
+            _ => None,
+        };
         if let Err(e) = ensure_subtitle_cached(
-            &data_dir,
+            &ctx.config
+                .data_dir,
             &input_url,
             &probe,
             item_id,
             media_source_id,
             stream_index,
             cache_codec,
+            budget,
         )
         .await
         {
@@ -635,6 +642,16 @@ fn build_subtitle_extraction_args(
             .iter()
             .map(|s| s.to_string()),
     );
+    if ffmpeg_http_input_args(input_url).contains(&"-reconnect") {
+        // A failed read must obtain a fresh reservation rather than silently
+        // reconnecting and reading the release repeatedly in one admission.
+        args.extend([
+            "-reconnect".into(),
+            "0".into(),
+            "-reconnect_streamed".into(),
+            "0".into(),
+        ]);
+    }
     args.push("-i".to_string());
     args.push(input_url.to_string());
     let mut cache_paths = Vec::with_capacity(streams.len());
@@ -691,6 +708,7 @@ async fn extract_subtitles_to_cache(
     item_id: Uuid,
     media_source_id: Uuid,
     streams: &[ExtractableSubtitle],
+    read_budget: Option<ReadBudget>,
 ) -> anyhow::Result<()> {
     if streams.is_empty() {
         return Ok(());
@@ -707,6 +725,19 @@ async fn extract_subtitles_to_cache(
         media_source_id,
         streams,
     )?;
+    let _budget_permit =
+        if input_url.starts_with("http://") || input_url.starts_with("https://") {
+            Some(
+                read_budget
+                    .ok_or_else(|| {
+                        anyhow!("media transfer budget missing for remote extraction")
+                    })?
+                    .acquire()
+                    .await?,
+            )
+        } else {
+            None
+        };
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.hide_console();
     cmd.kill_on_drop(true);
@@ -775,6 +806,7 @@ pub(super) async fn extract_subtitle_to_cache(
     stream_index: i64,
     cache_codec: api::SubtitleCodec,
     source_codec: Option<&str>,
+    read_budget: Option<ReadBudget>,
 ) -> anyhow::Result<std::path::PathBuf> {
     let cache_path = subtitle_cache_path(
         data_dir,
@@ -802,6 +834,7 @@ pub(super) async fn extract_subtitle_to_cache(
         item_id,
         media_source_id,
         &[stream],
+        read_budget,
     )
     .await?;
 
@@ -828,6 +861,7 @@ async fn ensure_subtitle_cached(
     media_source_id: Uuid,
     stream_index: i64,
     requested_cache_codec: api::SubtitleCodec,
+    read_budget: Option<ReadBudget>,
 ) -> anyhow::Result<std::path::PathBuf> {
     let requested_path = subtitle_cache_path(
         data_dir,
@@ -889,6 +923,7 @@ async fn ensure_subtitle_cached(
                 .collect();
                 let data_dir = data_dir.to_path_buf();
                 let input_url = input_url.to_string();
+                let read_budget = read_budget.clone();
                 let future: BoxFuture<'static, ExtractionOutcome> =
                     Box::pin(async move {
                         let result = extract_subtitles_to_cache(
@@ -897,6 +932,7 @@ async fn ensure_subtitle_cached(
                             item_id,
                             media_source_id,
                             &missing,
+                            read_budget,
                         )
                         .await
                         .map_err(|e| e.to_string());
@@ -2256,11 +2292,18 @@ async fn subtitles_stream_inner(
 
     // Binary formats (PGS/SUP): extract on-the-fly as raw bytes.
     if is_binary {
+        let _budget_permit = ReadBudget::for_media(&state.ctx, &media, "full")
+            .await
+            .acquire()
+            .await?;
         let mut cmd = tokio::process::Command::new(ffmpeg_bin());
         cmd.hide_console();
         cmd.kill_on_drop(true);
         cmd.args(["-copyts"]);
         cmd.args(ffmpeg_http_input_args(&url));
+        if ffmpeg_http_input_args(&url).contains(&"-reconnect") {
+            cmd.args(["-reconnect", "0", "-reconnect_streamed", "0"]);
+        }
         cmd.args(["-i", &url]);
         cmd.args([
             "-map",
@@ -2283,6 +2326,7 @@ async fn subtitles_stream_inner(
             .status
             .success()
         {
+            error!(%item_id, stream_index, %map_spec, "binary subtitle extraction failed");
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from("subtitle extraction failed"))
@@ -2314,11 +2358,23 @@ async fn subtitles_stream_inner(
         media_source_id,
         stream_index,
         cache_codec,
+        Some(ReadBudget::for_media(&state.ctx, &media, "full").await),
     )
     .await
     {
         Ok(p) => p,
         Err(e) => {
+            if e.to_string()
+                .starts_with("media transfer budget")
+            {
+                return Ok(Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("Retry-After", "60")
+                    .body(Body::from(
+                        "subtitle preparation deferred by provider limit",
+                    ))
+                    .unwrap());
+            }
             error!(%item_id, stream_index, %map_spec, "subtitle extraction failed: {e}");
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
