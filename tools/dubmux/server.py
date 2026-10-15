@@ -904,6 +904,43 @@ def status(dub_id: str, video_id: str):
     return {"status": "unknown"}
 
 
+@app.get("/cached/{dub_id}/{video_id}")
+def cached_playback(dub_id: str, video_id: str):
+    """Read-only: a match or old file layout does not prove media is cached.
+
+    Never register a source, create a layout/session, resolve a URL, start a
+    worker, or reject/update a match from this browsing-only endpoint.
+    """
+    k = _key(_check_id(dub_id), _check_id(video_id))
+    unavailable = {"status": "unknown"}
+    m = _load_match(k)
+    if not m or m.get("verdict") != "accept" or _video_check(k) != "ok":
+        return unavailable
+    if (m.get("sync_check") or {}).get("ok") is False:
+        return unavailable
+    if _needs_aligned(m) and (not m.get("aligned") or not (MATCH / m["aligned"]).is_file()):
+        return unavailable
+    d = _session_dir(k)
+    if not (d / ".done").is_file() or (d / ".failed").exists() or not _session_consistent(d):
+        return unavailable
+    try:
+        lay = _file_layout(k, dub_id, create=False)
+        if lay is None:
+            return unavailable
+        _offsets, slots, total = lay
+        entries = [line.strip() for line in (d / "index.m3u8").read_text().splitlines()
+                   if line.strip() and not line.startswith("#")]
+        if len(entries) != len(slots) or total <= 0:
+            return unavailable
+        for name, slot in zip(entries, slots):
+            if not re.fullmatch(r"seg[0-9]+\.ts", name) or not 0 < (d / name).stat().st_size <= slot:
+                return unavailable
+    except (OSError, ValueError, KeyError, TypeError):
+        return unavailable
+    return {"status": "ready", "cached": True,
+            "result": {"video_check": "ok", "file_ready": True, "file_size": total}}
+
+
 # -------------------------------------------------------------------- mux ---
 # Two caches (2026-09-27, user policy):
 #  - PLAY cache: finished muxes (HLS sessions), DUBMUX_HLS_BUDGET_GB=100 / 30 d,

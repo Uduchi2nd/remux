@@ -114,11 +114,29 @@ with tempfile.TemporaryDirectory() as directory:
         prepare = {"dub": {"id": dub_id, "url": "https://offline.invalid/dub"},
                    "video": {"id": video_id, "url": "https://offline.invalid/video"}}
         assert value("/prepare", prepare, auth=False)["cached"] is True
+        cached_route = f"/cached/{dub_id}/{video_id}"
+        assert value(cached_route, auth=False) == {"status": "unknown"}
         assert request(f"/subtitles/{identity}/22.srt")[:2] == (200, body)
         assert request(f"/mux/{dub_id}/{video_id}/start", {})[0] == 429
         session = Path(directory) / "hls" / key
         session.mkdir()
         (session / ".done").write_text(str(int(time.time())))
+        assert value(cached_route, auth=False) == {"status": "unknown"}
+        (session / "index.m3u8").write_text("#EXTM3U\n#EXTINF:6,\nseg00000.ts\n#EXT-X-ENDLIST\n")
+        segment = session / "seg00000.ts"
+        segment.write_bytes(b"x" * 188)
+        (match / ("file-" + key + ".json")).write_text(json.dumps({"slots": [376]}))
+        saved_match = match / (key + ".json")
+        content = json.loads(saved_match.read_text())
+        content["video_check"] = "ok"
+        saved_match.write_text(json.dumps(content))
+        before_cached_lookup = value("/transfer-budget/status")["providers"]
+        assert value(cached_route, auth=False) == {"status": "ready", "cached": True,
+            "result": {"video_check": "ok", "file_ready": True, "file_size": 376}}
+        segment.write_bytes(b"")
+        assert value(cached_route, auth=False) == {"status": "unknown"}
+        segment.write_bytes(b"x" * 188)
+        assert value("/transfer-budget/status")["providers"] == before_cached_lookup
         assert value(f"/mux/{dub_id}/{video_id}/start", {})["done"] is True
         prepare["video"]["id"] = uuid.uuid4().hex
         assert request("/prepare", prepare)[0] == 401
@@ -132,6 +150,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert request("/transfer-budget/reserve", {"provider": "premiumize", "bytes": 1}, True)[0] == 429
         assert value("/jobs") == {}
         print(json.dumps({"http_checks": 28, "persistent_budget": True,
+                          "cache_only_http_checks": 5,
                           "media_jobs_started": 0, "external_network": "disabled"}))
     finally:
         stop(process)

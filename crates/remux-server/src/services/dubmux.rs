@@ -91,6 +91,34 @@ pub(crate) fn is_dubmux_row(stream: &db::Media) -> bool {
     filename(stream).is_some_and(|f| f.contains(".VNDub-"))
 }
 
+/// In cache-only mode, previously visible rows must also pass the current
+/// cache lookup. An old match/row can outlive its actual media files.
+pub(crate) fn merge_dub_rows(
+    config: &crate::Config,
+    mut streams: Vec<db::Media>,
+    added: Vec<db::Media>,
+) -> Vec<db::Media> {
+    if config
+        .dubmux_url
+        .is_none()
+        && config
+            .dubmux_cache_url
+            .is_some()
+    {
+        streams.retain(|row| !is_dubmux_row(row));
+    }
+    let mut merged: Vec<_> = added
+        .into_iter()
+        .filter(|row| {
+            !streams
+                .iter()
+                .any(|existing| existing.id == row.id)
+        })
+        .collect();
+    merged.extend(streams);
+    merged
+}
+
 fn is_hq_candidate(stream: &db::Media) -> bool {
     let Some(url) = http_url(stream) else {
         return false;
@@ -549,7 +577,7 @@ pub(crate) async fn ensure_dub_rows(
     priority: u32,
 ) -> Vec<db::Media> {
     let Some(cfg) = DubmuxConfig::from(&ctx.config) else {
-        return vec![];
+        return restore_cached_dub_rows(ctx, media).await;
     };
     if !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
         return vec![];
@@ -634,215 +662,219 @@ pub(crate) async fn ensure_dub_rows(
     // wait on the first pair. Versions still preparing join the list on a
     // later refresh — the muxer keeps preparing them either way.
     for attempt in 0..2u8 {
-    if attempt == 1 && (!rows.is_empty() || wait_secs == 0) {
-        break;
-    }
-    rows.clear();
-    checked.clear();
-    rejected.clear();
-    let mut wait = if attempt == 0 { 0 } else { wait_secs };
-    let mut failures = 0u32;
-    let mut pairs_seen: u32 = 0;
-    // Pass 1 asks about every pair at once (each answer is one round trip to
-    // the seedbox, ~0.5 s; one after the other that was 3–5 s per list).
-    // Same order, priorities and cached_only rule as the walk below.
-    let mut pre: std::collections::VecDeque<anyhow::Result<PrepareReply>> = Default::default();
-    if attempt == 0 {
-        let mut specs = Vec::new();
-        let mut n: u32 = 0;
-        for hq in hqs
+        if attempt == 1 && (!rows.is_empty() || wait_secs == 0) {
+            break;
+        }
+        rows.clear();
+        checked.clear();
+        rejected.clear();
+        let mut wait = if attempt == 0 { 0 } else { wait_secs };
+        let mut failures = 0u32;
+        let mut pairs_seen: u32 = 0;
+        // Pass 1 asks about every pair at once (each answer is one round trip to
+        // the seedbox, ~0.5 s; one after the other that was 3–5 s per list).
+        // Same order, priorities and cached_only rule as the walk below.
+        let mut pre: std::collections::VecDeque<anyhow::Result<PrepareReply>> =
+            Default::default();
+        if attempt == 0 {
+            let mut specs = Vec::new();
+            let mut n: u32 = 0;
+            for hq in hqs
+                .iter()
+                .copied()
+            {
+                for (dub, _provider, dub_id) in &dubs {
+                    let pair_priority = if n == 0 {
+                        priority
+                    } else {
+                        priority + VARIANT_PENALTY + n.min(40)
+                    };
+                    let cached_only =
+                        priority > PRIORITY_LIVE_MAX && n >= BACKGROUND_NEW_PAIRS;
+                    n += 1;
+                    specs.push((
+                        dub_id.clone(),
+                        http_url(dub)
+                            .unwrap()
+                            .to_string(),
+                        video_request(hq),
+                        pair_priority,
+                        cached_only,
+                    ));
+                }
+            }
+            pre = futures::future::join_all(
+                specs
+                    .iter()
+                    .map(|(dub_id, dub_url, video, pr, co)| {
+                        prepare(&client, &cfg, dub_id, dub_url, video, 0, *pr, *co)
+                    }),
+            )
+            .await
+            .into_iter()
+            .collect();
+        }
+        'pairs: for hq in hqs
             .iter()
             .copied()
         {
-            for (dub, _provider, dub_id) in &dubs {
-                let pair_priority = if n == 0 {
+            let hq_url = http_url(hq).unwrap();
+            let hq_id = hq
+                .id
+                .simple()
+                .to_string();
+            for (dub, provider, dub_id) in &dubs {
+                let dub_url = http_url(dub).unwrap();
+                let pair_priority = if pairs_seen == 0 {
                     priority
                 } else {
-                    priority + VARIANT_PENALTY + n.min(40)
+                    priority + VARIANT_PENALTY + pairs_seen.min(40)
                 };
-                let cached_only = priority > PRIORITY_LIVE_MAX && n >= BACKGROUND_NEW_PAIRS;
-                n += 1;
-                specs.push((
-                    dub_id.clone(),
-                    http_url(dub)
-                        .unwrap()
-                        .to_string(),
-                    video_request(hq),
-                    pair_priority,
-                    cached_only,
-                ));
-            }
-        }
-        pre = futures::future::join_all(specs.iter().map(
-            |(dub_id, dub_url, video, pr, co)| {
-                prepare(&client, &cfg, dub_id, dub_url, video, 0, *pr, *co)
-            },
-        ))
-        .await
-        .into_iter()
-        .collect();
-    }
-    'pairs: for hq in hqs
-        .iter()
-        .copied()
-    {
-        let hq_url = http_url(hq).unwrap();
-        let hq_id = hq
-            .id
-            .simple()
-            .to_string();
-        for (dub, provider, dub_id) in &dubs {
-            let dub_url = http_url(dub).unwrap();
-            let pair_priority = if pairs_seen == 0 {
-                priority
-            } else {
-                priority + VARIANT_PENALTY + pairs_seen.min(40)
-            };
-            // PATCH (uduchi2nd): outside playback / the next episode, only the
-            // first BACKGROUND_NEW_PAIRS pairs of an episode may start a new
-            // preparation (each costs a debrid link); later pairs are only
-            // reported when the muxer already has them.
-            let cached_only =
-                priority > PRIORITY_LIVE_MAX && pairs_seen >= BACKGROUND_NEW_PAIRS;
-            pairs_seen += 1;
-            let answer = match pre.pop_front() {
-                Some(r) => r,
-                None => {
-                    prepare(
-                        &client,
-                        &cfg,
-                        dub_id,
-                        dub_url,
-                        &video_request(hq),
-                        wait,
-                        pair_priority,
-                        cached_only,
-                    )
-                    .await
-                }
-            };
-            let reply = match answer {
-                Ok(r) => r,
-                Err(e) => {
-                    // A busy muxer answers late, not wrong: the job it was
-                    // asked for keeps running server-side. Skip this pair
-                    // and give up on the walk only if it keeps failing.
-                    failures += 1;
-                    warn!(item = %media.id, failures, "dubmux prepare failed: {e:#}");
-                    wait = 0;
-                    if failures >= 2 {
-                        break 'pairs;
+                // PATCH (uduchi2nd): outside playback / the next episode, only the
+                // first BACKGROUND_NEW_PAIRS pairs of an episode may start a new
+                // preparation (each costs a debrid link); later pairs are only
+                // reported when the muxer already has them.
+                let cached_only =
+                    priority > PRIORITY_LIVE_MAX && pairs_seen >= BACKGROUND_NEW_PAIRS;
+                pairs_seen += 1;
+                let answer = match pre.pop_front() {
+                    Some(r) => r,
+                    None => {
+                        prepare(
+                            &client,
+                            &cfg,
+                            dub_id,
+                            dub_url,
+                            &video_request(hq),
+                            wait,
+                            pair_priority,
+                            cached_only,
+                        )
+                        .await
+                    }
+                };
+                let reply = match answer {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // A busy muxer answers late, not wrong: the job it was
+                        // asked for keeps running server-side. Skip this pair
+                        // and give up on the walk only if it keeps failing.
+                        failures += 1;
+                        warn!(item = %media.id, failures, "dubmux prepare failed: {e:#}");
+                        wait = 0;
+                        if failures >= 2 {
+                            break 'pairs;
+                        }
+                        continue;
+                    }
+                };
+                // Only the first pair spends the caller's wait budget; the muxer
+                // runs the other preparations concurrently anyway.
+                wait = 0;
+                if reply.status != "ready" {
+                    debug!(item = %media.id, provider, hq = %hq.id, status = reply.status,
+                       stage = ?reply.stage, "dubmux pair not ready");
+                    if reply.status == "rejected" {
+                        rejected.push(row_id(media, dub_id, &hq.id));
                     }
                     continue;
                 }
-            };
-            // Only the first pair spends the caller's wait budget; the muxer
-            // runs the other preparations concurrently anyway.
-            wait = 0;
-            if reply.status != "ready" {
-                debug!(item = %media.id, provider, hq = %hq.id, status = reply.status,
-                       stage = ?reply.stage, "dubmux pair not ready");
-                if reply.status == "rejected" {
-                    rejected.push(row_id(media, dub_id, &hq.id));
+                let mut row = hq.clone();
+                row.id = row_id(media, dub_id, &hq.id);
+                if reply.video_checked() {
+                    checked.push(row.id);
                 }
-                continue;
-            }
-            let mut row = hq.clone();
-            row.id = row_id(media, dub_id, &hq.id);
-            if reply.video_checked() {
-                checked.push(row.id);
-            }
-            row.parent_id = Some(media.id);
-            row.idx = Some(-(rows.len() as i64) - 1);
-            row.created_at = now;
-            row.updated_at = now;
-            row.title = format!("[+VN dub · {provider}] {}", hq.title);
-            if let Some(si) = row
-                .stream_info
-                .as_mut()
-            {
-                let stem = filename(hq)
-                    .and_then(|f| {
-                        f.rsplit_once('.')
-                            .map(|(s, _)| s)
-                    })
-                    .unwrap_or("stream");
-                // PATCH (uduchi2nd, 2026-09-28): a pair the muxer can serve as
-                // one seekable file (`file.ts`: fixed-size segment slots, a
-                // known size, byte ranges produced on demand) is handed out as
-                // that file — Infuse and VidHub then stream, seek AND download
-                // it like any other file. Otherwise the HLS playlist.
-                let (leaf, ext) = if reply.file_ready() {
-                    ("file.ts", "ts")
+                row.parent_id = Some(media.id);
+                row.idx = Some(-(rows.len() as i64) - 1);
+                row.created_at = now;
+                row.updated_at = now;
+                row.title = format!("[+VN dub · {provider}] {}", hq.title);
+                if let Some(si) = row
+                    .stream_info
+                    .as_mut()
+                {
+                    let stem = filename(hq)
+                        .and_then(|f| {
+                            f.rsplit_once('.')
+                                .map(|(s, _)| s)
+                        })
+                        .unwrap_or("stream");
+                    // PATCH (uduchi2nd, 2026-09-28): a pair the muxer can serve as
+                    // one seekable file (`file.ts`: fixed-size segment slots, a
+                    // known size, byte ranges produced on demand) is handed out as
+                    // that file — Infuse and VidHub then stream, seek AND download
+                    // it like any other file. Otherwise the HLS playlist.
+                    let (leaf, ext) = if reply.file_ready() {
+                        ("file.ts", "ts")
+                    } else {
+                        ("master.m3u8", "m3u8")
+                    };
+                    si.filename = Some(format!("{stem}.VNDub-{provider}.{ext}"));
+                    // the file's real size, not the release's (Infuse shows it and
+                    // may size a download by it)
+                    si.size = if reply.file_ready() {
+                        reply
+                            .file_size()
+                            .or(si.size)
+                    } else {
+                        si.size
+                    };
+                    si.descriptor = StreamDescriptor::Http {
+                        url: format!(
+                            "{}/mux/{dub_id}/{hq_id}/{leaf}?video={}",
+                            cfg.public,
+                            urlencoding::encode(hq_url)
+                        ),
+                        request_headers: Default::default(),
+                        response_headers: Default::default(),
+                    };
+                }
+                // Even a filename-guess probe of the HQ gives the row its track
+                // list (dub first, default) from the moment it exists; the next
+                // refresh rebuilds it from the HQ's real probe. Without it a
+                // just-created row showed no Vietnamese track until then.
+                let rebuilt = hq
+                    .probe_data
+                    .as_ref()
+                    .map(|p| mux_probe(p, provider))
+                    .unwrap_or_else(|| minimal_probe(provider));
+                let stored_probe = stored
+                    .iter()
+                    .find(|r| r.id == row.id)
+                    .and_then(|r| {
+                        r.probe_data
+                            .clone()
+                    });
+                let mut probe = richer_probe(rebuilt, stored_probe);
+                probe.container = Some(if reply.file_ready() {
+                    VideoContainer::Ts
                 } else {
-                    ("master.m3u8", "m3u8")
-                };
-                si.filename = Some(format!("{stem}.VNDub-{provider}.{ext}"));
-                // the file's real size, not the release's (Infuse shows it and
-                // may size a download by it)
-                si.size = if reply.file_ready() {
-                    reply
-                        .file_size()
-                        .or(si.size)
-                } else {
-                    si.size
-                };
-                si.descriptor = StreamDescriptor::Http {
-                    url: format!(
-                        "{}/mux/{dub_id}/{hq_id}/{leaf}?video={}",
-                        cfg.public,
-                        urlencoding::encode(hq_url)
-                    ),
-                    request_headers: Default::default(),
-                    response_headers: Default::default(),
-                };
-            }
-            // Even a filename-guess probe of the HQ gives the row its track
-            // list (dub first, default) from the moment it exists; the next
-            // refresh rebuilds it from the HQ's real probe. Without it a
-            // just-created row showed no Vietnamese track until then.
-            let rebuilt = hq
-                .probe_data
-                .as_ref()
-                .map(|p| mux_probe(p, provider))
-                .unwrap_or_else(|| minimal_probe(provider));
-            let stored_probe = stored
-                .iter()
-                .find(|r| r.id == row.id)
-                .and_then(|r| {
-                    r.probe_data
-                        .clone()
+                    VideoContainer::Other("hls".into())
                 });
-            let mut probe = richer_probe(rebuilt, stored_probe);
-            probe.container = Some(if reply.file_ready() {
-                VideoContainer::Ts
-            } else {
-                VideoContainer::Other("hls".into())
-            });
-            if reply.file_ready()
-                && let Some(size) = reply.file_size()
-            {
-                // the probe's Size wins over stream_info.size in the source
-                // document; it must be the file's, not the release's
-                probe.size = Some(size);
-            }
-            row.probe_data = Some(probe);
-            rows.push(row);
-            // HQ releases are walked in quality order, so the cap keeps the
-            // best video and its dub variants (backups against a bad dub)
-            // rather than one dub across every release.
-            if rows.len()
-                >= ctx
-                    .config
-                    .dubmux_max_rows as usize
-            {
-                break 'pairs;
+                if reply.file_ready()
+                    && let Some(size) = reply.file_size()
+                {
+                    // the probe's Size wins over stream_info.size in the source
+                    // document; it must be the file's, not the release's
+                    probe.size = Some(size);
+                }
+                row.probe_data = Some(probe);
+                rows.push(row);
+                // HQ releases are walked in quality order, so the cap keeps the
+                // best video and its dub variants (backups against a bad dub)
+                // rather than one dub across every release.
+                if rows.len()
+                    >= ctx
+                        .config
+                        .dubmux_max_rows as usize
+                {
+                    break 'pairs;
+                }
             }
         }
-    }
-    if failures >= 2 {
-        break;
-    }
+        if failures >= 2 {
+            break;
+        }
     }
     // Rows this walk could not rebuild (muxer busy, a pair not answered in
     // time) but which were fine before stay, unless the muxer now rejects
@@ -932,6 +964,156 @@ async fn existing_dub_rows(ctx: &AppContext, media: &db::Media) -> Vec<db::Media
     rows
 }
 
+/// The preparation pause must not hide completed cached playback. This path
+/// only GETs small cache metadata; it never prepares, starts, or registers a
+/// source. A match record alone is insufficient: the service must confirm a
+/// complete, decode-checked local mux with its seekable-file layout intact.
+pub(crate) async fn restore_cached_dub_rows(
+    ctx: &AppContext,
+    media: &db::Media,
+) -> Vec<db::Media> {
+    if ctx
+        .config
+        .dubmux_url
+        .is_some()
+        || !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
+    {
+        return vec![];
+    }
+    let Some(base) = ctx
+        .config
+        .dubmux_cache_url
+        .as_deref()
+    else {
+        return vec![];
+    };
+    let origin = origin_title(ctx, media).await;
+    if !origin
+        .as_ref()
+        .is_some_and(|title| {
+            is_asian_origin(
+                title
+                    .original_language
+                    .as_deref(),
+                title
+                    .country
+                    .as_deref(),
+            )
+        })
+    {
+        return vec![];
+    }
+    let Ok(client) = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return vec![];
+    };
+    let mut stored = existing_dub_rows(ctx, media).await;
+    stored.sort_by_key(|row| {
+        row.idx
+            .unwrap_or(i64::MAX)
+    });
+    let now = chrono::Utc::now().naive_utc();
+    let mut rows: Vec<_> = futures::future::join_all(
+        stored
+            .into_iter()
+            .take(MAX_HQ * MAX_DUBS)
+            .map(|row| {
+                let client = &client;
+                async move {
+                    let (dub, hq) = mux_pair_of(&row)?;
+                    let reply = cached_reply(client, base, dub, hq).await?;
+                    restore_cached_row(row, &reply, now)
+                }
+            }),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .take(
+        ctx.config
+            .dubmux_max_rows as usize,
+    )
+    .collect();
+    let checked: Vec<_> = rows
+        .iter()
+        .map(|row| row.id)
+        .collect();
+    order_rows(&mut rows, &checked);
+    if !rows.is_empty()
+        && let Err(error) = db::Media::upsert(&ctx.db, &rows).await
+    {
+        warn!(item = %media.id, "cached dub row restore failed: {error:#}");
+        return vec![];
+    }
+    rows
+}
+
+async fn cached_reply(
+    client: &reqwest::Client,
+    base: &str,
+    dub: Uuid,
+    hq: Uuid,
+) -> Option<PrepareReply> {
+    let response = client
+        .get(format!(
+            "{}/cached/{}/{}",
+            base.trim_end_matches('/'),
+            dub.simple(),
+            hq.simple()
+        ))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    // Cache replies contain flags and a size only; never consume an unbounded
+    // diagnostic body or follow a redirect to a media URL.
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .ok()?
+    {
+        if body.len() + chunk.len() > 4096 {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).ok()
+}
+
+fn restore_cached_row(
+    mut row: db::Media,
+    reply: &PrepareReply,
+    now: chrono::NaiveDateTime,
+) -> Option<db::Media> {
+    if reply.status != "ready" || !reply.video_checked() || !reply.file_ready() {
+        return None;
+    }
+    let size = reply
+        .file_size()
+        .filter(|size| *size > 0)?;
+    row.updated_at = now;
+    if let Some(info) = row
+        .stream_info
+        .as_mut()
+    {
+        info.size = Some(size);
+    }
+    if let Some(probe) = row
+        .probe_data
+        .as_mut()
+    {
+        probe.size = Some(size);
+    }
+    Some(row)
+}
+
 /// Provider label of a "[+VN dub · <provider>] …" row title.
 fn row_provider(row: &db::Media) -> String {
     row.title
@@ -1009,14 +1191,20 @@ pub(crate) fn minimal_probe(provider: &str) -> api::MediaSourceInfo {
 
 /// The HQ source id a dub row was built on (the `/mux/<dub>/<hq>/` path).
 pub(crate) fn hq_id_of(row: &db::Media) -> Option<Uuid> {
-    let url = http_url(row)?;
-    let rest = url
+    mux_pair_of(row).map(|(_, hq)| hq)
+}
+
+fn mux_pair_of(row: &db::Media) -> Option<(Uuid, Uuid)> {
+    let url = url::Url::parse(http_url(row)?).ok()?;
+    let mut parts = url
+        .path()
         .split("/mux/")
-        .nth(1)?;
-    let hq = rest
-        .split('/')
-        .nth(1)?;
-    Uuid::parse_str(hq).ok()
+        .nth(1)?
+        .split('/');
+    Some((
+        Uuid::parse_str(parts.next()?).ok()?,
+        Uuid::parse_str(parts.next()?).ok()?,
+    ))
 }
 
 /// Existing dub rows worth keeping: their HQ release is still listed and the
@@ -1188,6 +1376,202 @@ pub(crate) async fn start_mux(url: &str, item: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_playback_config_does_not_enable_preparation() {
+        let config = crate::Config {
+            dubmux_cache_url: Some("http://cache.invalid".into()),
+            dubmux_public_url: Some("https://play.invalid".into()),
+            ..Default::default()
+        };
+        assert!(DubmuxConfig::from(&config).is_none());
+    }
+
+    #[test]
+    fn cache_only_merge_hides_evicted_rows_and_keeps_confirmed_rows() {
+        let normal = http_media("https://cdn.invalid/movie.mkv", "Movie.mkv");
+        let old =
+            http_media("https://mux.invalid/old/file.ts", "Movie.VNDub-hotphim.ts");
+        let mut cached = old.clone();
+        cached.updated_at = chrono::Utc::now().naive_utc();
+        let config = crate::Config {
+            dubmux_cache_url: Some("http://cache.invalid".into()),
+            ..Default::default()
+        };
+        let rows = merge_dub_rows(&config, vec![normal.clone(), old.clone()], vec![]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, normal.id);
+        let rows = merge_dub_rows(&config, vec![normal, old], vec![cached.clone()]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].updated_at, cached.updated_at);
+        assert!(is_dubmux_row(&rows[0]));
+    }
+
+    #[test]
+    fn cached_row_keeps_tracks_and_identity_but_refreshes_size_and_timestamp() {
+        let dub = Uuid::new_v4();
+        let hq = Uuid::new_v4();
+        let mut row = http_media(
+            &format!("https://mux.invalid/mux/{dub}/{hq}/file.ts?video=private"),
+            "Movie.VNDub-hotphim.ts",
+        );
+        row.probe_data = Some(minimal_probe("hotphim"));
+        let id = row.id;
+        let tracks = serde_json::to_value(
+            &row.probe_data
+                .as_ref()
+                .unwrap()
+                .media_streams,
+        )
+        .unwrap();
+        assert_eq!(mux_pair_of(&row), Some((dub, hq)));
+        let now = chrono::Utc::now().naive_utc();
+        let reply: PrepareReply = serde_json::from_value(serde_json::json!({
+            "status":"ready", "result":{"video_check":"ok","file_ready":true,"file_size":1880}
+        })).unwrap();
+        let restored = restore_cached_row(row.clone(), &reply, now).unwrap();
+        assert_eq!(restored.id, id);
+        assert_eq!(restored.updated_at, now);
+        assert_eq!(
+            restored
+                .stream_info
+                .as_ref()
+                .unwrap()
+                .size,
+            Some(1880)
+        );
+        assert_eq!(
+            restored
+                .probe_data
+                .as_ref()
+                .unwrap()
+                .size,
+            Some(1880)
+        );
+        assert_eq!(
+            serde_json::to_value(
+                &restored
+                    .probe_data
+                    .unwrap()
+                    .media_streams
+            )
+            .unwrap(),
+            tracks
+        );
+        for result in [
+            serde_json::json!({}),
+            serde_json::json!({"video_check":"ok","file_ready":false,"file_size":1880}),
+            serde_json::json!({"video_check":"ok","file_ready":true,"file_size":0}),
+        ] {
+            let reply: PrepareReply = serde_json::from_value(
+                serde_json::json!({"status":"ready","result":result}),
+            )
+            .unwrap();
+            assert!(restore_cached_row(row.clone(), &reply, now).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_lookup_only_gets_bounded_metadata_without_redirects() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+            response::IntoResponse,
+        };
+        use std::sync::{Arc, Mutex};
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener
+            .local_addr()
+            .unwrap();
+        let app = axum::Router::new().fallback(move |request: Request<Body>| {
+            let recorded = recorded.clone();
+            async move {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((
+                        request
+                            .method()
+                            .clone(),
+                        request
+                            .uri()
+                            .to_string(),
+                    ));
+                if request
+                    .uri()
+                    .path()
+                    .ends_with(
+                        &Uuid::from_u128(2)
+                            .simple()
+                            .to_string(),
+                    )
+                {
+                    return (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [("Location", "/expensive-video")],
+                    )
+                        .into_response();
+                }
+                if request
+                    .uri()
+                    .path()
+                    .ends_with(
+                        &Uuid::from_u128(3)
+                            .simple()
+                            .to_string(),
+                    )
+                {
+                    return "x"
+                        .repeat(5000)
+                        .into_response();
+                }
+                axum::Json(serde_json::json!({"status":"ready","result":{
+                    "video_check":"ok","file_ready":true,"file_size":1880
+                }}))
+                .into_response()
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap()
+        });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let base = format!("http://{address}/");
+        let dub = Uuid::from_u128(10);
+        let reply = cached_reply(&client, &base, dub, Uuid::from_u128(1))
+            .await
+            .unwrap();
+        assert!(reply.file_ready() && reply.video_checked());
+        assert!(
+            cached_reply(&client, &base, dub, Uuid::from_u128(2))
+                .await
+                .is_none()
+        );
+        assert!(
+            cached_reply(&client, &base, dub, Uuid::from_u128(3))
+                .await
+                .is_none()
+        );
+        let requests = requests
+            .lock()
+            .unwrap();
+        assert_eq!(requests.len(), 3);
+        for (method, path) in requests.iter() {
+            assert_eq!(*method, axum::http::Method::GET);
+            assert!(path.starts_with(&format!("/cached/{}/", dub.simple())));
+            assert!(!path.contains('?'));
+        }
+        server.abort();
+    }
 
     #[test]
     fn asian_origin_by_language_then_country() {

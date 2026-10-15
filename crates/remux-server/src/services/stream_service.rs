@@ -104,7 +104,10 @@ impl StreamService {
     pub(crate) fn source_order_band(stream: &db::Media) -> SourceOrderBand {
         if !super::dubmux::is_dubmux_row(stream) {
             SourceOrderBand::Ranked
-        } else if stream.idx.is_some_and(|idx| idx < 0) {
+        } else if stream
+            .idx
+            .is_some_and(|idx| idx < 0)
+        {
             SourceOrderBand::CheckedDub
         } else {
             SourceOrderBand::UncheckedDub
@@ -193,16 +196,13 @@ impl StreamService {
                 crate::services::dubmux::PRIORITY_PLAYBACK,
             )
             .await;
-            let mut merged: Vec<db::Media> = added
-                .into_iter()
-                .filter(|a| {
-                    !db_streams
-                        .iter()
-                        .any(|s| s.id == a.id)
-                })
-                .collect();
-            merged.extend(db_streams);
-            merged
+            super::dubmux::merge_dub_rows(
+                &self
+                    .ctx
+                    .config,
+                db_streams,
+                added,
+            )
         };
         let mut raw = if db_streams.is_empty() {
             // Root item can be the stream itself (e.g. locally-imported files)
@@ -644,7 +644,8 @@ impl StreamService {
                         .stream_info
                         .as_ref()?;
                     let addon_id = si.addon_id?;
-                    let crate::stream::StreamDescriptor::Http { url, .. } = &si.descriptor
+                    let crate::stream::StreamDescriptor::Http { url, .. } =
+                        &si.descriptor
                     else {
                         return None;
                     };
@@ -672,7 +673,9 @@ impl StreamService {
                     futures::future::join_all(
                         heads
                             .iter()
-                            .map(|(id, si)| crate::stream::redirected_client_url(*id, si)),
+                            .map(|(id, si)| {
+                                crate::stream::redirected_client_url(*id, si)
+                            }),
                     )
                     .await;
                 });

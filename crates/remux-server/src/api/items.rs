@@ -1852,13 +1852,24 @@ async fn item_for_user(
     } else if want_streams
         && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
     {
-        let mut raw = media
+        // Refresh completed-cache visibility even when the addon stream list
+        // itself is fresh. This lookup cannot start preparation or media reads.
+        let cached_dubs =
+            crate::services::dubmux::restore_cached_dub_rows(&state.ctx, &media).await;
+        let raw = media
             .streams(
                 &state
                     .ctx
                     .db,
             )
             .await?;
+        let mut raw = crate::services::dubmux::merge_dub_rows(
+            &state
+                .ctx
+                .config,
+            raw,
+            cached_dubs,
+        );
         // The first source is the implicit choice in many players. Check only
         // its short fallback chain, and only for definitive HTTP 404/410s, so
         // one dead debrid URL does not make the whole episode appear broken.
@@ -2541,14 +2552,23 @@ async fn item_for_user(
             .user
             .configuration
             .as_ref()
-            .map(|c| c.0.clone())
+            .map(|c| {
+                c.0.clone()
+            })
             .unwrap_or_default();
-        if let Some(sources) = base_item.media_sources.as_mut() {
+        if let Some(sources) = base_item
+            .media_sources
+            .as_mut()
+        {
             for source in sources.iter_mut() {
                 source.resolve_default_streams(
                     &cfg,
-                    server_config.preferred_metadata_language.as_deref(),
-                    media.original_language.as_deref(),
+                    server_config
+                        .preferred_metadata_language
+                        .as_deref(),
+                    media
+                        .original_language
+                        .as_deref(),
                     None,
                     None,
                     None,
@@ -2565,7 +2585,10 @@ async fn item_for_user(
             .unwrap_or(false)
         && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
     {
-        if let Some(sources) = base_item.media_sources.as_mut() {
+        if let Some(sources) = base_item
+            .media_sources
+            .as_mut()
+        {
             // Addon subtitles (AIOStreams / vnphim) used to exist only in
             // PlaybackInfo. Infuse and VidHub build their subtitle picker from
             // the item document, so a Vietnamese track that was deliverable
@@ -2586,10 +2609,11 @@ async fn item_for_user(
                     .device
                     .access_token
                     .expose(),
-                &session.device.id,
+                &session
+                    .device
+                    .id,
                 sub_langs,
                 Some(
-
                     session
                         .user
                         .id,
@@ -2641,7 +2665,8 @@ async fn item_for_user(
                         .media_streams
                         .get_or_insert_with(Vec::new);
                     list.retain(|s| {
-                        let sub = matches!(s.type_, Some(api::MediaStreamType::Subtitle));
+                        let sub =
+                            matches!(s.type_, Some(api::MediaStreamType::Subtitle));
                         !is_ext_sub(s)
                             && !(sub && ext_idx.contains(&s.index))
                             // A dub row's release tracks dropped by the

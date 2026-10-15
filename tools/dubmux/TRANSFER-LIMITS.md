@@ -84,6 +84,17 @@ Keep the quota-incident pause in place until separately resuming automation:
 private `DUBMUX_URL` and alignment URLs unset, background refresh false, dub
 prefetch counts zero, and premux-next false. The warmer's `PAUSED` file stays.
 
+Set `DUBMUX_CACHE_URL` to the private mux service to keep already completed
+VN-dub versions visible during that pause. This is independent of `DUBMUX_URL`:
+item details and PlaybackInfo only GET small `/cached/<dub>/<hq>` metadata,
+with no redirects, a two-second timeout and a 4 KiB response limit. The read-only
+endpoint verifies the accepted/decode-checked match, completed local session,
+playlist, nonempty segments and existing seekable-file layout. An old match or
+layout alone is not enough. Missing/incomplete caches stay hidden. Lookups never
+register a source, prepare a pair, create a layout, start a mux or read upstream
+media. Existing row identities, tracks and checked-first ordering are retained.
+This does not resume preparation, alignment, warming or next-episode prefetch.
+
 Private Bearer-authenticated endpoints:
 
 - `POST /transfer-budget/reserve`: `{provider, bytes, kind: "full"|"probe"}`;

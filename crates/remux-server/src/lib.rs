@@ -650,6 +650,10 @@ pub struct Config {
     /// The same service as clients reach it, e.g. `https://dubmux.geniallark.box.ca`.
     #[serde(default)]
     pub dubmux_public_url: Option<String>,
+    /// Read-only completed-mux lookup. Keeps cached VN-dub rows visible when
+    /// DUBMUX_URL is unset, without enabling preparation or prefetch.
+    #[serde(default)]
+    pub dubmux_cache_url: Option<String>,
     /// Read-only text cache API. Does not enable mux preparation or prefetch.
     #[serde(default)]
     pub dubmux_subtitle_cache_url: Option<String>,
@@ -853,6 +857,7 @@ impl Default for Config {
             subtitle_alignment_gate_base_url: None,
             dubmux_url: None,
             dubmux_public_url: None,
+            dubmux_cache_url: None,
             dubmux_subtitle_cache_url: None,
             media_transfer_budget_url: None,
             media_transfer_budget_token_file: None,
