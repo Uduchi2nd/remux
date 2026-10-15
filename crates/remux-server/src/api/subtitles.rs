@@ -516,6 +516,23 @@ pub(crate) fn prefetch_embedded_subtitles(
     });
 }
 
+fn embedded_subtitles(streams: &[api::MediaStream]) -> Vec<&api::MediaStream> {
+    // ffmpeg's `0:s:N` stream specifier counts every embedded subtitle
+    // stream in the container, image ones included — so the ordinal has to
+    // be computed over *all* of them, in container order, not just the text
+    // ones we can actually extract. Skipping image streams from this list
+    // entirely would shift every later text stream's ordinal left, mapping
+    // it onto the wrong track whenever an image subtitle precedes it.
+    let mut embedded: Vec<&api::MediaStream> = streams
+        .iter()
+        .filter(|s| {
+            matches!(s.type_, Some(api::MediaStreamType::Subtitle)) && !s.is_external
+        })
+        .collect();
+    embedded.sort_by_key(|s| s.index);
+    embedded
+}
+
 /// Builds the list of every extractable (embedded, non-external, text)
 /// subtitle stream on `probe`, in container order, with the ffmpeg `-map`
 /// spec and cache codec(s) each one needs. Image/bitmap subtitles (PGS,
@@ -540,21 +557,7 @@ fn extractable_subtitles(
     probe: &api::MediaSourceInfo,
     requested: Option<(i64, &api::SubtitleCodec)>,
 ) -> Vec<ExtractableSubtitle> {
-    // ffmpeg's `0:s:N` stream specifier counts every embedded subtitle
-    // stream in the container, image ones included — so the ordinal has to
-    // be computed over *all* of them, in container order, not just the text
-    // ones we can actually extract. Skipping image streams from this list
-    // entirely would shift every later text stream's ordinal left, mapping
-    // it onto the wrong track whenever an image subtitle precedes it.
-    let mut embedded: Vec<&api::MediaStream> = probe
-        .media_streams
-        .iter()
-        .filter(|s| {
-            matches!(s.type_, Some(api::MediaStreamType::Subtitle)) && !s.is_external
-        })
-        .collect();
-    embedded.sort_by_key(|s| s.index);
-    embedded
+    embedded_subtitles(&probe.media_streams)
         .into_iter()
         .enumerate()
         // Image subtitle: not extractable to text (see the module doc

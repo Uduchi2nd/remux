@@ -512,15 +512,64 @@ async fn mux_cached_release_text(
     fetched
 }
 
+struct ReferenceTrack {
+    // Persistent cache identity uses the original global stream index; the
+    // indexed subtitle reader and ffmpeg use the subtitle-only ordinal.
+    index: i64,
+    ordinal: usize,
+    codec: Option<String>,
+}
+
+fn reference_tracks(
+    streams: &[api::MediaStream],
+    language: Option<&str>,
+    index_offset: i64,
+) -> Vec<ReferenceTrack> {
+    let mut candidates: Vec<_> = super::embedded_subtitles(streams)
+        .into_iter()
+        // Forced, bitmap and unknown tracks still occupy input ordinals.
+        .enumerate()
+        .filter(|(_, s)| {
+            !s.is_forced
+                && text_codec(
+                    s.codec
+                        .as_deref(),
+                )
+        })
+        .collect();
+    candidates.sort_by_key(|(_, s)| {
+        let same_language = language
+            .and_then(super::lang_to_two_letter)
+            .zip(
+                s.language
+                    .as_deref()
+                    .and_then(super::lang_to_two_letter),
+            )
+            .is_some_and(|(a, b)| a == b);
+        (!same_language, s.index)
+    });
+    candidates
+        .into_iter()
+        .take(2)
+        .map(|(ordinal, s)| ReferenceTrack {
+            index: s.index - index_offset,
+            ordinal,
+            codec: s
+                .codec
+                .clone(),
+        })
+        .collect()
+}
+
 async fn reference_text(
     state: &AppState,
     input: &str,
     source: Uuid,
-    index: i64,
-    codec: Option<&str>,
+    track: &ReferenceTrack,
     allow_extraction: bool,
     read_budget: Option<crate::services::media_budget::ReadBudget>,
 ) -> Option<String> {
+    let index = track.index;
     let dir = state
         .ctx
         .config
@@ -591,12 +640,14 @@ async fn reference_text(
     let extracted = super::extract_subtitle_to_cache(
         temp.path(),
         input,
-        &format!("0:{index}"),
+        &format!("0:s:{}", track.ordinal),
         source,
         source,
         index,
         api::SubtitleCodec::Srt,
-        codec,
+        track
+            .codec
+            .as_deref(),
         read_budget,
     )
     .await
@@ -720,43 +771,16 @@ pub(super) async fn resolve(
         }
         return result(&cached, original);
     }
-    // Use the actual input stream index. Forced/signs-only and bitmap tracks are
-    // deliberately excluded because they cannot establish whole-episode timing.
-    let mut references: Vec<_> = probe
-        .media_streams
-        .iter()
-        .filter(|s| {
-            matches!(s.type_, Some(api::MediaStreamType::Subtitle))
-                && !s.is_external
-                && !s.is_forced
-                && text_codec(
-                    s.codec
-                        .as_deref(),
-                )
-        })
-        .collect();
-    references.sort_by_key(|s| {
-        let same_language = language
-            .and_then(super::lang_to_two_letter)
-            .zip(
-                s.language
-                    .as_deref()
-                    .and_then(super::lang_to_two_letter),
-            )
-            .is_some_and(|(a, b)| a == b);
-        (!same_language, s.index)
-    });
-    let references: Vec<_> = references
-        .into_iter()
-        .take(2)
-        .map(|s| {
-            (
-                s.index,
-                s.codec
-                    .clone(),
-            )
-        })
-        .collect();
+    let dub_row_hq = crate::services::dubmux::hq_url_of(source);
+    let references = reference_tracks(
+        &probe.media_streams,
+        language,
+        if dub_row_hq.is_some() {
+            crate::services::dubmux::SUBTITLE_INDEX_OFFSET
+        } else {
+            0
+        },
+    );
     if references.is_empty() {
         return (original, "no-reference");
     }
@@ -778,26 +802,12 @@ pub(super) async fn resolve(
     // PATCH (uduchi2nd): a "[+VN dub]" row lists the HQ release's embedded
     // text tracks (at an index offset) but its own URL is a mux without them;
     // the reference is extracted from the HQ file with the original index.
-    let dub_row_hq = crate::services::dubmux::hq_url_of(source);
     let input = dub_row_hq
         .clone()
         .unwrap_or_else(|| {
             info.descriptor
                 .server_input(source.id, config.port)
         });
-    let references: Vec<_> = references
-        .into_iter()
-        .map(|(index, codec)| {
-            if dub_row_hq.is_some() {
-                (
-                    index - crate::services::dubmux::SUBTITLE_INDEX_OFFSET,
-                    codec,
-                )
-            } else {
-                (index, codec)
-            }
-        })
-        .collect();
     let external = external.to_owned();
     let duration_ticks = probe.run_time_ticks;
     let allow_reference_extraction = source
@@ -838,13 +848,12 @@ pub(super) async fn resolve(
                 .build()
                 .ok()?;
             let mut rejected = false;
-            for (index, codec) in references {
+            for track in references {
                 let Some(reference) = reference_text(
                     &state,
                     &input,
                     source_key,
-                    index,
-                    codec.as_deref(),
+                    &track,
                     allow_reference_extraction,
                     Some(read_budget.clone()),
                 )
@@ -963,6 +972,186 @@ pub(super) async fn resolve(
 mod tests {
     use super::*;
 
+    fn mixed_reference_streams() -> Vec<api::MediaStream> {
+        let subtitle = |index, codec: Option<&str>, language: &str| api::MediaStream {
+            index,
+            type_: Some(api::MediaStreamType::Subtitle),
+            codec: codec.map(str::to_owned),
+            language: Some(language.into()),
+            ..Default::default()
+        };
+        let mut forced = subtitle(2, Some("srt"), "vie");
+        forced.is_forced = true;
+        let mut external = subtitle(500, Some("srt"), "vie");
+        external.is_external = true;
+        vec![
+            api::MediaStream {
+                index: 0,
+                type_: Some(api::MediaStreamType::Video),
+                ..Default::default()
+            },
+            api::MediaStream {
+                index: 1,
+                type_: Some(api::MediaStreamType::Audio),
+                ..Default::default()
+            },
+            forced,
+            external,
+            subtitle(4, Some("hdmv_pgs_subtitle"), "eng"),
+            subtitle(8, None, "vie"),
+            subtitle(10, Some("ass"), "eng"),
+            subtitle(22, Some("ass"), "vie"),
+            subtitle(23, Some("srt"), "eng"),
+        ]
+    }
+
+    #[test]
+    fn reference_selection_preserves_input_ordinals_and_original_cache_indices() {
+        let mut streams = mixed_reference_streams();
+        // Stored DTOs need not retain ffprobe's array order.
+        streams.reverse();
+        let selected = reference_tracks(&streams, Some("vi"), 0);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|s| (s.index, s.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(22, 4), (10, 3)]
+        );
+        for stream in &mut streams {
+            if matches!(stream.type_, Some(api::MediaStreamType::Subtitle))
+                && !stream.is_external
+            {
+                stream.index += crate::services::dubmux::SUBTITLE_INDEX_OFFSET;
+            }
+        }
+        let selected = reference_tracks(
+            &streams,
+            Some("vie"),
+            crate::services::dubmux::SUBTITLE_INDEX_OFFSET,
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|s| (s.index, s.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(22, 4), (10, 3)]
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_reference_requests_indexed_ordinal_without_full_file_fallback() {
+        use std::sync::{Arc, Mutex};
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener
+            .local_addr()
+            .unwrap();
+        let router = axum::Router::new().fallback(axum::routing::post(
+            move |uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap,
+                  body: axum::body::Bytes| {
+                assert_eq!(
+                    headers
+                        .get("authorization")
+                        .unwrap(),
+                    "Bearer local-fixture-token"
+                );
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((
+                        uri.path()
+                            .to_owned(),
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                    ));
+                async { axum::http::StatusCode::TOO_MANY_REQUESTS }
+            },
+        ));
+        let worker = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .unwrap()
+        });
+        let data = tempfile::tempdir().unwrap();
+        let token = data
+            .path()
+            .join("token");
+        tokio::fs::write(&token, "local-fixture-token")
+            .await
+            .unwrap();
+        let (_server, guard) =
+            crate::integration_test::new_test_server_with_config(crate::Config {
+                database_url: Some("sqlite::memory:".into()),
+                data_dir: data
+                    .path()
+                    .to_path_buf(),
+                torrent_http_port: None,
+                torrent_peer_port: None,
+                disable_dht: true,
+                media_transfer_budget_url: Some(format!("http://{address}")),
+                media_transfer_budget_token_file: Some(token),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ctx = guard
+            .0
+            .clone();
+        let state = crate::AppState {
+            tasks: crate::tasks::TaskService::new(ctx.clone())
+                .await
+                .unwrap(),
+            ctx,
+        };
+        let source = db::Media {
+            id: Uuid::new_v4(),
+            kind: db::MediaKind::Stream,
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::http(
+                    "https://never-read.test/movie.mkv",
+                ),
+                service_id: Some("premiumize".into()),
+                size: Some(10_000_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let track =
+            reference_tracks(&mixed_reference_streams(), Some("vie"), 0).remove(0);
+        let budget = crate::services::media_budget::ReadBudget::for_media(
+            &state.ctx, &source, "full",
+        )
+        .await;
+        assert!(
+            reference_text(
+                &state,
+                "https://never-read.test/movie.mkv",
+                source.id,
+                &track,
+                true,
+                Some(budget)
+            )
+            .await
+            .is_none()
+        );
+        let requests = requests
+            .lock()
+            .unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a deferred indexed read must not reserve or read the whole file"
+        );
+        assert_eq!(requests[0].0, "/subtitles/indexed");
+        assert_eq!(requests[0].1["subtitle_ordinals"], serde_json::json!([4]));
+        assert_eq!(requests[0].1["video"]["provider"], "premiumize");
+        worker.abort();
+    }
+
     #[tokio::test]
     async fn mux_text_cache_is_read_only_guarded_and_shared_with_the_original() {
         use std::sync::{Arc, Mutex};
@@ -1068,7 +1257,8 @@ mod tests {
             .as_mut()
             .unwrap()
             .descriptor = crate::stream::StreamDescriptor::http(format!(
-            "https://mux.test/mux/dub/{}/file.ts?video=https%3A%2F%2Fnever-read.test%2Fmovie.mkv",
+            "https://mux.test/mux/{}/{}/file.ts?video=https%3A%2F%2Fnever-read.test%2Fmovie.mkv",
+            Uuid::new_v4().simple(),
             source
                 .id
                 .simple()
@@ -1246,8 +1436,11 @@ mod tests {
                 &state,
                 "https://unreachable.test/video.mkv",
                 identity,
-                23,
-                Some("srt"),
+                &ReferenceTrack {
+                    index: 23,
+                    ordinal: 0,
+                    codec: Some("srt".into())
+                },
                 false,
                 None
             )
@@ -1261,8 +1454,11 @@ mod tests {
                 &state,
                 "https://unreachable.test/video.mkv",
                 identity,
-                22,
-                Some("srt"),
+                &ReferenceTrack {
+                    index: 22,
+                    ordinal: 0,
+                    codec: Some("srt".into())
+                },
                 false,
                 None
             )
@@ -1303,7 +1499,8 @@ mod tests {
             .as_mut()
             .unwrap()
             .descriptor = crate::stream::StreamDescriptor::http(format!(
-            "https://mux.test/mux/dub/{}/file.ts?video=https%3A%2F%2Funreachable.test%2Fvideo.mkv",
+            "https://mux.test/mux/{}/{}/file.ts?video=https%3A%2F%2Funreachable.test%2Fvideo.mkv",
+            Uuid::new_v4().simple(),
             source
                 .id
                 .simple()
