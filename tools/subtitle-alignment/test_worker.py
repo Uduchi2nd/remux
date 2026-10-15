@@ -78,6 +78,33 @@ class ValidationTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError,'cue mapping'):
                         worker.Engine().align(source,source)
 
+    def test_raw_srt_literal_line_breaks_survive_output_serialization(self):
+        def propose(args, **kwargs):
+            source=pysubs2.load(args[2])
+            source.shift(ms=17000)
+            source.save(args[3],keep_ssa_tags=True)
+        with tempfile.TemporaryDirectory() as d, patch.object(worker,'ROOT',Path(d)), \
+             patch.object(worker.subprocess,'run',side_effect=propose):
+            source=cues().to_string('srt').replace('Distinct dialogue number 0',
+                r'\NDistinct dialogue number 0\N',1)
+            result=worker.Engine().align(source,source)
+            self.assertTrue(result['report']['accepted'])
+            self.assertIn(r'\NDistinct dialogue number 0\N',result['subtitle'])
+            self.assertEqual(worker.TIMING_LINE.sub('<TIMES>',source),
+                             worker.TIMING_LINE.sub('<TIMES>',result['subtitle']))
+            self.assertEqual([cue.text for cue in parse(source)],
+                             [cue.text for cue in parse(result['subtitle'])])
+
+    def test_webvtt_cue_ids_and_settings_survive_retiming(self):
+        source=('WEBVTT\n\nscene-caption\n'
+                '00:01.000 --> 00:02.000 align:start position:20%\n'
+                '<i>Original words</i>\n\n')
+        timed=pysubs2.SSAFile.from_string(source)
+        timed.shift(ms=17000)
+        result=worker.retime_original(source,timed)
+        self.assertEqual(result,source.replace('00:01.000 --> 00:02.000',
+                                              '00:00:18.000 --> 00:00:19.000'))
+
     def test_structural_checks_reject_corrupt_output(self):
         s=cues()
         for change in ['text','negative','duration','order']:

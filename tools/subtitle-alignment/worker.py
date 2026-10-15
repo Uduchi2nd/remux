@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import threading
@@ -15,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import pysubs2
 
-VERSION = "embedded-text-v6-formatting-safe-map"
+VERSION = "embedded-text-v7-original-wire-text"
 ROOT = Path(os.environ.get("ALIGN_RUNTIME", "/root/remux-alignment-runtime"))
 MAX_BYTES = 2_000_000
 MAX_CUES = 5000
@@ -38,6 +39,34 @@ def parse(text):
     if any(a.start > b.start for a, b in zip(subs, subs[1:])):
         raise ValueError("unordered cues")
     return subs
+
+
+TIMING_LINE = re.compile(
+    r'(?m)^([ \t]*)((?:\d+:)?\d{2}:\d{2}[.,]\d{1,3})'
+    r'([ \t]*-->[ \t]*)((?:\d+:)?\d{2}:\d{2}[.,]\d{1,3})([^\n]*)$')
+
+
+def retime_original(text, timed):
+    """Preserve SRT/WebVTT cue bodies and settings, including literal SSA tags."""
+    if len(TIMING_LINE.findall(text)) != len(timed):
+        # Native ASS and other formats still need their normal SRT conversion.
+        return timed.to_string('srt', keep_ssa_tags=True)
+
+    def clock(ms, separator):
+        seconds, milliseconds = divmod(ms, 1000)
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        return f'{hours:02}:{minutes:02}:{seconds:02}{separator}{milliseconds:03}'
+
+    cues = iter(timed)
+
+    def replace(match):
+        cue = next(cues)
+        start = clock(cue.start, '.' if '.' in match[2] else ',')
+        end = clock(cue.end, '.' if '.' in match[4] else ',')
+        return match[1] + start + match[3] + end + match[5]
+
+    return TIMING_LINE.sub(replace, text)
 
 
 class Encoder:
@@ -212,7 +241,7 @@ class Engine:
             report["timing_changed"] = any((a.start,a.end)!=(b.start,b.end) for a,b in zip(original,candidate))
             result={"version":VERSION,"key":key,"report":report}
             if report['accepted']:
-                result['subtitle']=candidate.to_string('srt', keep_ssa_tags=True)
+                result['subtitle']=retime_original(external, candidate)
             staging=cached.with_suffix('.tmp')
             staging.write_text(json.dumps(result));staging.replace(cached)
             # Bounded cache: keep at most 200 results and expire after 14 days.

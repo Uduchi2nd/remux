@@ -5,11 +5,17 @@ The dated investigations below describe the earlier immediate-original behavior.
 
 ## Cue mapping and SRT formatting — 2026-10-15
 
-Worker v6 accepts ALASS's harmless normalization of inline styling or whitespace
+Worker v7 accepts ALASS's harmless normalization of inline styling or whitespace
 when every cue still has the same visible dialogue in the same order. Cue count,
 words and punctuation must match. The output always copies only the proposed
 timestamps onto the untouched original cues, retaining their original styling
 and text. Missing/reordered cues or changed dialogue remain errors.
+
+SRT/WebVTT output replaces timestamp fields directly in the normalized original
+file. It retains cue bodies, identifiers, positioning settings and literal SSA
+line-break escapes, which a fresh SRT serialization can strip. This also keeps
+Remux's independent dialogue-preservation check satisfied. Native ASS input
+continues to use its normal conversion to SRT.
 
 This fixes a rejected Infinity Castle pair whose seven italic-formatting
 differences caused the online original to remain the fallback. It changes no
