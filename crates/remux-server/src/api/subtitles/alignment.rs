@@ -187,7 +187,7 @@ pub(super) fn alignment_skip_reason(language: Option<&str>) -> Option<&'static s
     None
 }
 
-fn source_identity(
+pub(crate) fn source_identity(
     source_id: Uuid,
     info: &crate::stream::StreamInfo,
     duration: Option<i64>,
@@ -314,6 +314,16 @@ pub(super) async fn cached_embedded_subtitle(
     item: Uuid,
     index: i64,
 ) -> Option<Bytes> {
+    cached_embedded_subtitle_before(state, source, item, index, None).await
+}
+
+pub(super) async fn cached_embedded_subtitle_before(
+    state: &AppState,
+    source: &db::Media,
+    item: Uuid,
+    index: i64,
+    network_deadline: Option<tokio::time::Instant>,
+) -> Option<Bytes> {
     let hq = if let Some(id) = crate::services::dubmux::hq_id_of(source) {
         db::Media::get_by_id(
             &state
@@ -384,12 +394,10 @@ pub(super) async fn cached_embedded_subtitle(
         reference_index,
     )
     .await;
-    let text = if let Some(text) = text {
-        text
-    } else if hq.is_some() {
+    let legacy_text = if text.is_none() && hq.is_some() {
         // Earlier background jobs keyed references by the synthetic dub row.
         // Reuse those only through that row's own guarded identity.
-        let identity = source_identity(
+        let legacy_identity = source_identity(
             source.id,
             source
                 .stream_info
@@ -404,17 +412,104 @@ pub(super) async fn cached_embedded_subtitle(
                 .ctx
                 .config
                 .data_dir,
-            identity,
+            legacy_identity,
             reference_index,
         )
-        .await?
+        .await
     } else {
-        return None;
+        None
+    };
+    let text = match text.or(legacy_text) {
+        Some(text) => text,
+        None => {
+            mux_cached_release_text(state, identity, reference_index, network_deadline)
+                .await?
+        }
     };
     super::quality::check(text.as_bytes(), requirements).ok()?;
     let bytes = Bytes::from(text);
     let _ = super::save_good_track(&state.ctx, &key, &bytes, false).await;
     Some(bytes)
+}
+
+/// Only GET the muxer's completed text cache. This endpoint never starts a
+/// preparation, resolves a video link or runs ffmpeg. Misses are short-lived.
+async fn mux_cached_release_text(
+    state: &AppState,
+    identity: Uuid,
+    index: i64,
+    network_deadline: Option<tokio::time::Instant>,
+) -> Option<String> {
+    if network_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    {
+        return None;
+    }
+    let base = state
+        .ctx
+        .config
+        .dubmux_subtitle_cache_url
+        .as_deref()?;
+    let miss_key = format!("release-text-miss:{identity}:{index}");
+    if state
+        .ctx
+        .store
+        .get::<bool>(&miss_key)
+        .is_some()
+    {
+        return None;
+    }
+    let fetch = async {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .ok()?;
+        let mut response = client
+            .get(format!(
+                "{}/subtitles/{identity}/{index}.srt",
+                base.trim_end_matches('/')
+            ))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
+        if response.status() != reqwest::StatusCode::OK
+            || response
+                .content_length()
+                .is_some_and(|n| n > MAX_SUBTITLE_BYTES as u64)
+        {
+            return None;
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .ok()?
+        {
+            if body.len() + chunk.len() > MAX_SUBTITLE_BYTES {
+                return None;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        String::from_utf8(body).ok()
+    };
+    let fetched = if let Some(deadline) = network_deadline {
+        tokio::time::timeout_at(deadline, fetch)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        fetch.await
+    };
+    if fetched.is_none() {
+        state
+            .ctx
+            .store
+            .save(miss_key, true, Duration::from_secs(60));
+    }
+    fetched
 }
 
 async fn reference_text(
@@ -862,6 +957,215 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn mux_text_cache_is_read_only_guarded_and_shared_with_the_original() {
+        use std::sync::{Arc, Mutex};
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener
+            .local_addr()
+            .unwrap();
+        let body = "1\n00:00:01,000 --> 00:00:02,000\nExact release dialogue\n";
+        let router = axum::Router::new().fallback(axum::routing::get(
+            move |uri: axum::http::Uri| {
+                let slow = uri
+                    .path()
+                    .ends_with("/99.srt");
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(
+                        uri.path()
+                            .to_string(),
+                    );
+                async move {
+                    if slow {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                    body
+                }
+            },
+        ));
+        let worker = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .unwrap()
+        });
+        let data = tempfile::tempdir().unwrap();
+        let (_server, guard) =
+            crate::integration_test::new_test_server_with_config(crate::Config {
+                database_url: Some("sqlite::memory:".into()),
+                data_dir: data
+                    .path()
+                    .to_path_buf(),
+                torrent_http_port: None,
+                torrent_peer_port: None,
+                disable_dht: true,
+                dubmux_subtitle_cache_url: Some(format!("http://{address}")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ctx = guard
+            .0
+            .clone();
+        assert!(
+            ctx.config
+                .dubmux_url
+                .is_none()
+        );
+        let state = crate::AppState {
+            tasks: crate::tasks::TaskService::new(ctx.clone())
+                .await
+                .unwrap(),
+            ctx,
+        };
+        let item = Uuid::new_v4();
+        let source = db::Media {
+            id: Uuid::new_v4(),
+            kind: db::MediaKind::Stream,
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::http(
+                    "https://never-read.test/movie.mkv",
+                ),
+                filename: Some("release.mkv".into()),
+                size: Some(12345),
+                ..Default::default()
+            }),
+            probe_data: Some(api::MediaSourceInfo {
+                run_time_ticks: Some(60 * 10_000_000),
+                media_streams: vec![api::MediaStream {
+                    index: 23,
+                    type_: Some(api::MediaStreamType::Subtitle),
+                    codec: Some("ass".into()),
+                    language: Some("vie".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        db::Media::upsert(
+            &state
+                .ctx
+                .db,
+            &[source.clone()],
+        )
+        .await
+        .unwrap();
+        let mut dub = source.clone();
+        dub.id = Uuid::new_v4();
+        dub.stream_info
+            .as_mut()
+            .unwrap()
+            .descriptor = crate::stream::StreamDescriptor::http(format!(
+            "https://mux.test/mux/dub/{}/file.ts?video=https%3A%2F%2Fnever-read.test%2Fmovie.mkv",
+            source
+                .id
+                .simple()
+        ));
+        dub.probe_data
+            .as_mut()
+            .unwrap()
+            .media_streams[0]
+            .index = 123;
+        assert!(
+            !source
+                .allows_subtitle_extraction(
+                    &state
+                        .ctx
+                        .db
+                )
+                .await
+        );
+        assert_eq!(
+            cached_embedded_subtitle(&state, &dub, item, 123)
+                .await
+                .unwrap()
+                .as_ref(),
+            body.as_bytes()
+        );
+        let identity = source_identity(
+            source.id,
+            source
+                .stream_info
+                .as_ref()
+                .unwrap(),
+            Some(60 * 10_000_000),
+        )
+        .unwrap();
+        assert_eq!(
+            *requests
+                .lock()
+                .unwrap(),
+            vec![format!("/subtitles/{identity}/23.srt")]
+        );
+        let expired = tokio::time::Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            cached_embedded_subtitle_before(&state, &source, item, 23, Some(expired))
+                .await
+                .unwrap()
+                .as_ref(),
+            body.as_bytes()
+        );
+        let start = tokio::time::Instant::now();
+        assert!(
+            mux_cached_release_text(
+                &state,
+                identity,
+                99,
+                Some(start + Duration::from_millis(50))
+            )
+            .await
+            .is_none()
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        worker.abort();
+        // Once fetched, original and dub share the same monthly text cache.
+        assert_eq!(
+            cached_embedded_subtitle(&state, &source, item, 23)
+                .await
+                .unwrap()
+                .as_ref(),
+            body.as_bytes()
+        );
+        let mut changed = source.clone();
+        changed
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(23456);
+        assert!(
+            cached_embedded_subtitle(&state, &changed, item, 23)
+                .await
+                .is_none()
+        );
+        let missing_identity = source_identity(
+            changed.id,
+            changed
+                .stream_info
+                .as_ref()
+                .unwrap(),
+            Some(60 * 10_000_000),
+        )
+        .unwrap();
+        assert!(
+            state
+                .ctx
+                .store
+                .get::<bool>(&format!("release-text-miss:{missing_identity}:23"))
+                .is_some()
+        );
+        assert!(
+            cached_embedded_subtitle(&state, &changed, item, 23)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn cached_release_text_survives_reference_eviction_but_not_a_changed_file() {
         let (_server, guard, _token) =
             crate::integration_test::authenticated_server().await;
@@ -1060,6 +1364,33 @@ mod tests {
                 .any(|s| s.index == 124)
         );
         assert_eq!(view.default_subtitle_stream_index, None);
+        super::super::present_dub_row_embedded_subtitles(
+            std::slice::from_mut(&mut view),
+            item,
+            "test-token",
+            &["vi".into()],
+        );
+        let presented = view
+            .media_streams
+            .iter()
+            .find(|s| s.index == 123)
+            .unwrap();
+        assert_eq!(
+            presented
+                .codec
+                .as_deref(),
+            Some("vtt")
+        );
+        assert!(presented.is_external);
+        assert_eq!(
+            dub.probe_data
+                .as_ref()
+                .unwrap()
+                .media_streams[0]
+                .codec
+                .as_deref(),
+            Some("ass")
+        );
         source
             .stream_info
             .as_mut()

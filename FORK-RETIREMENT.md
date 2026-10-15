@@ -364,3 +364,28 @@ now restores cached dub release tracks even when a device cannot embed their
 codec, and drops tracks that have neither cached text nor extraction permission.
 It clears a removed default subtitle index. Discovery and delivery therefore
 agree without starting remote video reads to fill a missing cache entry.
+
+Release preservation follow-up: a Vietnamese ASS stream really exists in the
+first Infinity Castle WeSLeY HQ release (track 22, synthetic dub track 122).
+Its guarded reference and native-text caches are absent; the existing raw HLS
+copy discarded subtitles with `-sn`. This is missing cached text, not evidence
+that the embedded Vietnamese track is broken. A complete online file is not
+proof of matching dialogue, translation or release timing.
+
+New raw-video copies losslessly capture the probed ASS/SSA/SRT tracks in the same
+ffmpeg input pass and convert only that small local subtitle container to SRT.
+A text-decoding failure does not discard or re-read the video. Completed checked
+copies publish bounded 30-day text files; the
+read-only muxer subtitle endpoint never launches work. Remux fetches only that
+small text through `dubmux_subtitle_cache_url`, reuses the existing guarded
+identity/track mapping and monthly good-track cache, and performs the full
+shared quality check. Cached release VTT suppresses the matching generic online
+variant with dedup enabled, even when the client cannot embed the original ASS.
+Forced/hearing-impaired variants remain distinct. No missing text is recovered
+by re-reading old videos, and a missing old first-dub track remains unavailable
+until a legitimate future mux pass captures it or an exact-release text copy is
+provided. Quota protections remain active; this does not enable preparation.
+Client-facing release tracks identify their delivered WebVTT codec accurately;
+the stored original ASS codec remains unchanged. Cache-only network lookups
+share one two-second metadata budget across tracks and versions, while local
+cached text remains usable after that budget expires.

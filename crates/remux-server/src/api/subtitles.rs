@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 mod alignment;
+pub(crate) use alignment::source_identity as release_subtitle_identity;
 pub(crate) mod gate;
 mod quality;
 
@@ -3141,6 +3142,9 @@ async fn retain_servable_dub_subtitles(
     device_id: &str,
     languages: &[String],
 ) {
+    // A cache outage must not add two seconds for every track/version.
+    // Local cached text is still checked after this network budget expires.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     for source in sources {
         if !crate::services::dubmux::is_mux_path(
             source
@@ -3193,16 +3197,16 @@ async fn retain_servable_dub_subtitles(
                     {
                         continue;
                     }
-                    if allow_extraction
-                        || alignment::cached_embedded_subtitle(
-                            state,
-                            &row,
-                            item,
-                            stream.index,
-                        )
-                        .await
-                        .is_some()
-                    {
+                    let cached = alignment::cached_embedded_subtitle_before(
+                        state,
+                        &row,
+                        item,
+                        stream.index,
+                        Some(deadline),
+                    )
+                    .await
+                    .is_some();
+                    if allow_extraction || cached {
                         available.insert(stream.index);
                         // A cached external copy is usable even when the device
                         // cannot embed ASS and remote extraction is disabled.
@@ -3214,6 +3218,17 @@ async fn retain_servable_dub_subtitles(
                             source
                                 .media_streams
                                 .push(stream.clone());
+                        }
+                        if cached {
+                            if let Some(track) = source
+                                .media_streams
+                                .iter_mut()
+                                .find(|s| s.index == stream.index)
+                            {
+                                track.supports_external_stream = true;
+                                track.delivery_method =
+                                    Some(api::SubtitleDeliveryMethod::External);
+                            }
                         }
                     }
                 }
@@ -3401,6 +3416,9 @@ pub(crate) fn present_dub_row_embedded_subtitles(
             stream.is_external = true;
             stream.supports_external_stream = true;
             stream.is_text_subtitle_stream = true;
+            // The client receives converted WebVTT, not the source ASS bytes.
+            // Keep the stored probe's codec unchanged for release extraction.
+            stream.codec = Some("vtt".into());
             stream.delivery_method = Some(api::SubtitleDeliveryMethod::External);
             stream.delivery_url = Some(format!(
                 "/Videos/{item_id}/{source_id}/Subtitles/{idx}/0/Stream.vtt?ApiKey={api_key}"
@@ -3503,9 +3521,6 @@ fn has_supported_embedded_subtitle(
     external: &crate::addons::SubtitleInfo,
     device_profile: Option<&api::DeviceProfile>,
 ) -> bool {
-    let Some(profile) = device_profile else {
-        return false;
-    };
     let external_language = crate::subtitle_selection::normalized_language(
         external
             .lang
@@ -3521,10 +3536,6 @@ fn has_supported_embedded_subtitle(
         .any(|stream| {
             if stream.type_ != Some(api::MediaStreamType::Subtitle)
                 || stream.is_external
-                || stream
-                    .delivery_method
-                    .as_ref()
-                    .is_some_and(|method| method != &api::SubtitleDeliveryMethod::Embed)
                 || stream.is_forced != external.is_forced
                 || stream.is_hearing_impaired != external.is_hi
                 || crate::subtitle_selection::normalized_language(
@@ -3535,6 +3546,24 @@ fn has_supported_embedded_subtitle(
             {
                 return false;
             }
+            // The exact release text has already been found in cache and is
+            // delivered as VTT. Its original ASS codec need not be embeddable.
+            if stream.supports_external_stream
+                && stream.delivery_method == Some(api::SubtitleDeliveryMethod::External)
+                && stream.index >= crate::services::dubmux::SUBTITLE_INDEX_OFFSET
+            {
+                return true;
+            }
+            if stream
+                .delivery_method
+                .as_ref()
+                .is_some_and(|method| method != &api::SubtitleDeliveryMethod::Embed)
+            {
+                return false;
+            }
+            let Some(profile) = device_profile else {
+                return false;
+            };
             let Some(codec) = stream
                 .codec
                 .as_deref()
@@ -3626,6 +3655,52 @@ pub(crate) fn drop_unsupported_embedded_subtitles_with_external_match(
 
 #[cfg(test)]
 mod label_tests {
+    #[test]
+    fn cached_release_vtt_wins_over_online_even_if_original_ass_cannot_embed() {
+        let source = super::api::MediaSourceInfo {
+            media_streams: vec![super::api::MediaStream {
+                index: 122,
+                type_: Some(super::api::MediaStreamType::Subtitle),
+                codec: Some("ass".into()),
+                language: Some("vie".into()),
+                supports_external_stream: true,
+                delivery_method: Some(super::api::SubtitleDeliveryMethod::External),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut online = crate::addons::SubtitleInfo {
+            id: "generic-online".into(),
+            url: None,
+            lang: Some("vi".into()),
+            is_forced: false,
+            is_hi: false,
+            filename: None,
+            from_trusted: None,
+            ai_translated: None,
+        };
+        assert!(super::has_supported_embedded_subtitle(
+            &source, &online, None
+        ));
+        online.is_forced = true;
+        assert!(!super::has_supported_embedded_subtitle(
+            &source, &online, None
+        ));
+        online.is_forced = false;
+        online.lang = Some("en".into());
+        assert!(!super::has_supported_embedded_subtitle(
+            &source, &online, None
+        ));
+        let mut unavailable = source;
+        unavailable.media_streams[0].supports_external_stream = false;
+        online.lang = Some("vi".into());
+        assert!(!super::has_supported_embedded_subtitle(
+            &unavailable,
+            &online,
+            None
+        ));
+    }
+
     #[test]
     fn external_labels_number_same_language_tracks() {
         let l = super::external_subtitle_labels(

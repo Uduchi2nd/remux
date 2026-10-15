@@ -25,9 +25,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dubmux  # noqa: E402
 import vnfile  # noqa: E402
 import align  # noqa: E402
+import release_subtitles  # noqa: E402
 
 DATA = Path(os.environ.get("DUBMUX_DATA", "/data"))
 AUDIO, MATCH, HLS = DATA / "audio", DATA / "match", DATA / "hls"
+SUBTITLES = DATA / "subtitles"
 for d in (AUDIO, MATCH, HLS):
     d.mkdir(parents=True, exist_ok=True)
 dubmux.CACHE = str(AUDIO)
@@ -301,6 +303,8 @@ def _raw_copy(hq_id, video_url, k, priority):
                    "-f", "hls", "-hls_time", "6", "-hls_playlist_type", "vod",
                    "-hls_flags", "temp_file+independent_segments",
                    "-hls_segment_filename", str(d / "seg%05d.ts"), str(d / "index.m3u8")]
+            subtitle_identity, subtitle_outputs = release_subtitles.outputs(MATCH, hq_id, d / "subtitles")
+            cmd += subtitle_outputs
             with open(d / "ffmpeg.log", "w") as log:
                 rc = subprocess.run(cmd, stdout=log, stderr=log).returncode
             if rc != 0 or not (d / "index.m3u8").exists():
@@ -335,6 +339,13 @@ def _raw_copy(hq_id, video_url, k, priority):
                 shutil.rmtree(d, ignore_errors=True)
                 raise CorruptSource(bad)
             (d / ".video_ok").write_text(str(int(time.time())))
+            # Text leaves the same demux pass as the video. Never re-download
+            # an existing subtitle-less raw cache just to fill these files.
+            try:
+                release_subtitles.finish(SUBTITLES, subtitle_identity, d / "subtitles")
+            except (OSError, ValueError) as e:
+                print(f"release subtitle cache failed: {type(e).__name__}", file=sys.stderr, flush=True)
+            shutil.rmtree(d / "subtitles", ignore_errors=True)
             (d / ".done").write_text(str(int(time.time())))
             _record_segtab(hq_id, d)
             return d
@@ -704,6 +715,7 @@ async def prepare(req: Request):
         _check_id(v)
     if not (dub.get("url") and video.get("url")):
         raise HTTPException(400, "dub.url and video.url required")
+    release_subtitles.register(MATCH, video)
     k = _key(dub["id"], video["id"])
     cached = _load_match(k)
     if cached:
@@ -750,6 +762,15 @@ async def prepare(req: Request):
     while job["status"] == "running" and time.time() < deadline:
         await asyncio.sleep(0.25)
     return job
+
+
+@app.api_route("/subtitles/{identity}/{index}.srt", methods=["GET", "HEAD"])
+def release_subtitle(identity: str, index: int):
+    # Cache-only endpoint: no resolver, prepare, mux or ffmpeg call.
+    path = release_subtitles.cached_path(SUBTITLES, identity, index)
+    if path is None:
+        raise HTTPException(404, "release subtitle not cached")
+    return FileResponse(path, media_type="application/x-subrip")
 
 
 @app.get("/status/{dub_id}/{video_id}")
@@ -1822,6 +1843,7 @@ def segment(dub_id: str, video_id: str, seg: str, request: Request):
 
 def _sweep():
     now = time.time()
+    release_subtitles.sweep(SUBTITLES)
     try:
         vnfile.sweep(HLS)
     except Exception as e:  # noqa: BLE001

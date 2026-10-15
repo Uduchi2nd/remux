@@ -650,6 +650,9 @@ pub struct Config {
     /// The same service as clients reach it, e.g. `https://dubmux.geniallark.box.ca`.
     #[serde(default)]
     pub dubmux_public_url: Option<String>,
+    /// Read-only text cache API. Does not enable mux preparation or prefetch.
+    #[serde(default)]
+    pub dubmux_subtitle_cache_url: Option<String>,
     /// How long a playback request waits for a still-running dub preparation
     /// before answering without the dub rows (default 10 s). Background stream
     /// refreshes never wait.
@@ -845,6 +848,7 @@ impl Default for Config {
             subtitle_alignment_gate_base_url: None,
             dubmux_url: None,
             dubmux_public_url: None,
+            dubmux_subtitle_cache_url: None,
             dubmux_prepare_wait_secs: default_dubmux_prepare_wait_secs(),
             dubmux_prefetch_episodes: default_dubmux_prefetch_episodes(),
             dubmux_premux_next: default_dubmux_premux_next(),

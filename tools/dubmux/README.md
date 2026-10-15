@@ -76,7 +76,20 @@ front of the source list for every accepted pair.
   external (`Path <lang>.vtt`) so VidHub/Infuse list them.
 
 ## Operations
-- Deploy: copy `dubmux.py server.py Containerfile run.sh` to seedbox
+- Release subtitle preservation: when Remux supplies a probed text-track plan,
+  the existing raw-video ffmpeg pass losslessly captures ASS/SSA/SRT tracks in
+  a local subtitle-only file. After the video passes its complete/decode checks,
+  that small local file is converted to SRT and published under
+  `subtitles/<guarded-release-id>/<original-track-index>.srt`. The text cache
+  keeps up to 512 files / 200 MiB for 30 days. Empty/oversized files are skipped;
+  a failed local text conversion does not discard or re-download the video.
+  Remux performs the full timeline/readability check before advertising them.
+  `GET /subtitles/<guarded-release-id>/<index>.srt` only reads that cache and
+  never starts preparation, resolves links or reads video. Missing subtitles
+  on old raw/mux files are not backfilled by re-downloading those files.
+  Remux's optional `DUBMUX_SUBTITLE_CACHE_URL` enables this read-only lookup
+  independently of `DUBMUX_URL`, so pausing new mux preparation stays effective.
+- Deploy: copy `dubmux.py server.py release_subtitles.py align.py vnfile.py Containerfile run.sh` to seedbox
   `~/dubmux/`, `podman build -t localhost/dubmux:latest -f Containerfile .`,
   `./run.sh`. Data in `~/dubmux/data/{audio,match,hls}`.
 - Debug: `GET /health`, `GET /jobs` (in-memory job states, errors),

@@ -310,13 +310,14 @@ async fn prepare(
     dub_url: &str,
     hq_id: &str,
     hq_url: &str,
+    subtitle_source: Option<&serde_json::Value>,
     wait: u64,
     priority: u32,
     cached_only: bool,
 ) -> anyhow::Result<PrepareReply> {
     let body = serde_json::json!({
         "dub": {"id": dub_id, "url": dub_url},
-        "video": {"id": hq_id, "url": hq_url},
+        "video": {"id": hq_id, "url": hq_url, "subtitle_source": subtitle_source},
         "wait": wait,
         "priority": priority,
         "cached_only": cached_only,
@@ -331,6 +332,44 @@ async fn prepare(
         .json::<PrepareReply>()
         .await?;
     Ok(reply)
+}
+
+/// The muxer writes these text tracks while reading the selected release for
+/// its ordinary video copy. The same guarded identity is used on retrieval.
+fn subtitle_source(hq: &db::Media) -> Option<serde_json::Value> {
+    let probe = hq
+        .probe_data
+        .as_ref()?;
+    let identity = crate::api::subtitles::release_subtitle_identity(
+        hq.id,
+        hq.stream_info
+            .as_ref()?,
+        probe.run_time_ticks,
+    )?;
+    let tracks: Vec<_> = probe
+        .media_streams
+        .iter()
+        .filter(|s| {
+            s.type_ == Some(MediaStreamType::Subtitle)
+                && !s.is_external
+                && matches!(
+                    s.codec
+                        .as_deref(),
+                    Some(
+                        "srt"
+                            | "subrip"
+                            | "ass"
+                            | "ssa"
+                            | "webvtt"
+                            | "mov_text"
+                            | "text"
+                    )
+                )
+        })
+        .map(|s| serde_json::json!({"index": s.index, "codec": s.codec}))
+        .collect();
+    (!tracks.is_empty())
+        .then(|| serde_json::json!({"identity": identity, "tracks": tracks}))
 }
 
 /// Sources sort by idx ascending. Rows whose video the muxer has decode-
@@ -613,14 +652,15 @@ pub(crate) async fn ensure_dub_rows(
                         .to_string(),
                     hq_id.clone(),
                     hq_url.to_string(),
+                    subtitle_source(hq),
                     pair_priority,
                     cached_only,
                 ));
             }
         }
         pre = futures::future::join_all(specs.iter().map(
-            |(dub_id, dub_url, hq_id, hq_url, pr, co)| {
-                prepare(&client, &cfg, dub_id, dub_url, hq_id, hq_url, 0, *pr, *co)
+            |(dub_id, dub_url, hq_id, hq_url, subtitles, pr, co)| {
+                prepare(&client, &cfg, dub_id, dub_url, hq_id, hq_url, subtitles.as_ref(), 0, *pr, *co)
             },
         ))
         .await
@@ -660,6 +700,7 @@ pub(crate) async fn ensure_dub_rows(
                         dub_url,
                         &hq_id,
                         hq_url,
+                        subtitle_source(hq).as_ref(),
                         wait,
                         pair_priority,
                         cached_only,
