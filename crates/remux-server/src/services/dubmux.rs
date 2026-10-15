@@ -954,7 +954,7 @@ pub(crate) fn minimal_probe(provider: &str) -> api::MediaSourceInfo {
 }
 
 /// The HQ source id a dub row was built on (the `/mux/<dub>/<hq>/` path).
-fn hq_id_of(row: &db::Media) -> Option<Uuid> {
+pub(crate) fn hq_id_of(row: &db::Media) -> Option<Uuid> {
     let url = http_url(row)?;
     let rest = url
         .split("/mux/")

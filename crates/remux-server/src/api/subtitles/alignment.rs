@@ -87,14 +87,14 @@ async fn load_persisted_alignment(
         .await
         .ok()?;
     let cached: PersistedAlignment = serde_json::from_slice(&bytes).ok()?;
-    if cached
-        .subtitle
-        .trim()
-        .is_empty()
-        || cached
+    if !super::gate::valid_subtitle(
+        cached
             .subtitle
-            .len()
-            > MAX_SUBTITLE_BYTES
+            .as_bytes(),
+    ) || cached
+        .subtitle
+        .len()
+        > MAX_SUBTITLE_BYTES
     {
         let _ = tokio::fs::remove_file(path).await;
         return None;
@@ -120,9 +120,7 @@ async fn persist_alignment(
     subtitle: &str,
     timing_changed: bool,
 ) -> anyhow::Result<()> {
-    if subtitle
-        .trim()
-        .is_empty()
+    if !super::gate::valid_subtitle(subtitle.as_bytes())
         || subtitle.len() > MAX_SUBTITLE_BYTES
     {
         anyhow::bail!("refusing to persist empty or oversized aligned subtitle");
@@ -281,12 +279,151 @@ async fn awaited_result(
     }
 }
 
+async fn load_reference_text(
+    data_dir: &std::path::Path,
+    source: Uuid,
+    index: i64,
+) -> Option<String> {
+    let path = data_dir
+        .join("subtitle-alignment-reference")
+        .join(format!("{source}_{index}.srt"));
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .ok()?;
+    if metadata.len() > MAX_SUBTITLE_BYTES as u64
+        || metadata
+            .modified()
+            .ok()?
+            .elapsed()
+            .unwrap_or_default()
+            > Duration::from_secs(7 * 86400)
+    {
+        return None;
+    }
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .ok()?;
+    super::gate::valid_subtitle(text.as_bytes()).then_some(text)
+}
+
+/// Reuse text already extracted by background alignment. This never starts an
+/// extraction or reads video, so it also works when remote extraction is off.
+pub(super) async fn cached_embedded_subtitle(
+    state: &AppState,
+    source: &db::Media,
+    item: Uuid,
+    index: i64,
+) -> Option<Bytes> {
+    let hq = if let Some(id) = crate::services::dubmux::hq_id_of(source) {
+        db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &id,
+        )
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    let release = hq
+        .as_ref()
+        .unwrap_or(source);
+    let reference_index = if crate::services::dubmux::hq_url_of(source).is_some() {
+        index - crate::services::dubmux::SUBTITLE_INDEX_OFFSET
+    } else {
+        index
+    };
+    let probe = release
+        .probe_data
+        .as_ref()?;
+    let stream = probe
+        .media_streams
+        .iter()
+        .find(|s| {
+            s.index == if hq.is_some() { reference_index } else { index }
+                && s.type_ == Some(api::MediaStreamType::Subtitle)
+                && !s.is_external
+                && text_codec(
+                    s.codec
+                        .as_deref(),
+                )
+        })?;
+    let identity = source_identity(
+        release.id,
+        release
+            .stream_info
+            .as_ref()?,
+        probe.run_time_ticks,
+    )?;
+    let requirements = super::quality::Requirements {
+        duration_ticks: probe.run_time_ticks,
+        forced: stream.is_forced,
+    };
+    let key = super::good_track_key(
+        "release",
+        item,
+        Some(release.id),
+        &format!("{identity}:{reference_index}"),
+        stream
+            .language
+            .as_deref(),
+        Some("srt"),
+    )?;
+    if let Some(track) = super::load_usable_track(&state.ctx, &key, requirements).await
+    {
+        return Some(track.bytes);
+    }
+    let text = load_reference_text(
+        &state
+            .ctx
+            .config
+            .data_dir,
+        identity,
+        reference_index,
+    )
+    .await;
+    let text = if let Some(text) = text {
+        text
+    } else if hq.is_some() {
+        // Earlier background jobs keyed references by the synthetic dub row.
+        // Reuse those only through that row's own guarded identity.
+        let identity = source_identity(
+            source.id,
+            source
+                .stream_info
+                .as_ref()?,
+            source
+                .probe_data
+                .as_ref()?
+                .run_time_ticks,
+        )?;
+        load_reference_text(
+            &state
+                .ctx
+                .config
+                .data_dir,
+            identity,
+            reference_index,
+        )
+        .await?
+    } else {
+        return None;
+    };
+    super::quality::check(text.as_bytes(), requirements).ok()?;
+    let bytes = Bytes::from(text);
+    let _ = super::save_good_track(&state.ctx, &key, &bytes, false).await;
+    Some(bytes)
+}
+
 async fn reference_text(
     state: &AppState,
     input: &str,
     source: Uuid,
     index: i64,
     codec: Option<&str>,
+    allow_extraction: bool,
 ) -> Option<String> {
     let dir = state
         .ctx
@@ -327,13 +464,22 @@ async fn reference_text(
             retained.push((modified, entry.path()));
         }
     }
-    if let Ok(text) = tokio::fs::read_to_string(&path).await {
-        if !text
-            .trim()
-            .is_empty()
-        {
-            return Some(text);
-        }
+    if let Some(text) = load_reference_text(
+        &state
+            .ctx
+            .config
+            .data_dir,
+        source,
+        index,
+    )
+    .await
+    {
+        return Some(text);
+    }
+    // Alignment must honor the subtitle route's extraction opt-in. Scanning
+    // an uncached remote movie can consume debrid fair-use quota.
+    if !allow_extraction {
+        return None;
     }
     retained.sort_by_key(|(modified, _)| *modified);
     let count = retained
@@ -369,6 +515,9 @@ async fn reference_text(
     let reference = tokio::fs::read_to_string(extracted)
         .await
         .ok()?;
+    if !super::gate::valid_subtitle(reference.as_bytes()) {
+        return None;
+    }
     let stage = tempfile::NamedTempFile::new_in(&dir)
         .ok()?
         .into_temp_path();
@@ -432,15 +581,31 @@ pub(super) async fn resolve(
     let key = cache_key(source_key, &original);
     if let Some((cached, ttl)) = load_persisted_alignment(&config.data_dir, &key).await
     {
-        let weight = match &cached {
-            Outcome::Ready(text, _) => text.len() as u32 + 256,
-            _ => 256,
-        };
-        state
-            .ctx
-            .store
-            .save_with_weight(key.clone(), cached.clone(), weight, ttl);
-        return result(&cached, original);
+        if let Outcome::Ready(text, _) = &cached
+            && (!super::quality::preserves_dialogue(&original, text.as_bytes())
+                || super::quality::check(
+                    text.as_bytes(),
+                    super::quality::Requirements {
+                        duration_ticks: probe.run_time_ticks,
+                        forced: true,
+                    },
+                )
+                .is_err())
+        {
+            if let Some(path) = persisted_result_path(&config.data_dir, &key) {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        } else {
+            let weight = match &cached {
+                Outcome::Ready(text, _) => text.len() as u32 + 256,
+                _ => 256,
+            };
+            state
+                .ctx
+                .store
+                .save_with_weight(key.clone(), cached.clone(), weight, ttl);
+            return result(&cached, original);
+        }
     }
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs(
@@ -537,6 +702,14 @@ pub(super) async fn resolve(
         })
         .collect();
     let external = external.to_owned();
+    let duration_ticks = probe.run_time_ticks;
+    let allow_reference_extraction = source
+        .allows_subtitle_extraction(
+            &state
+                .ctx
+                .db,
+        )
+        .await;
     state
         .ctx
         .store
@@ -565,9 +738,15 @@ pub(super) async fn resolve(
                 .ok()?;
             let mut rejected = false;
             for (index, codec) in references {
-                let Some(reference) =
-                    reference_text(&state, &input, source_key, index, codec.as_deref())
-                        .await
+                let Some(reference) = reference_text(
+                    &state,
+                    &input,
+                    source_key,
+                    index,
+                    codec.as_deref(),
+                    allow_reference_extraction,
+                )
+                .await
                 else {
                     continue;
                 };
@@ -607,9 +786,19 @@ pub(super) async fn resolve(
                     if let Some(text) = reply
                         .subtitle
                         .filter(|s| {
-                            !s.trim()
-                                .is_empty()
-                                && s.len() <= MAX_SUBTITLE_BYTES
+                            s.len() <= MAX_SUBTITLE_BYTES
+                                && super::quality::preserves_dialogue(
+                                    external.as_bytes(),
+                                    s.as_bytes(),
+                                )
+                                && super::quality::check(
+                                    s.as_bytes(),
+                                    super::quality::Requirements {
+                                        duration_ticks,
+                                        forced: true,
+                                    },
+                                )
+                                .is_ok()
                         })
                     {
                         return Some(Outcome::Ready(
@@ -671,6 +860,208 @@ pub(super) async fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cached_release_text_survives_reference_eviction_but_not_a_changed_file() {
+        let (_server, guard, _token) =
+            crate::integration_test::authenticated_server().await;
+        let ctx = guard
+            .0
+            .clone();
+        let state = crate::AppState {
+            tasks: crate::tasks::TaskService::new(ctx.clone())
+                .await
+                .unwrap(),
+            ctx,
+        };
+        let item = Uuid::new_v4();
+        let mut source = db::Media {
+            id: Uuid::new_v4(),
+            kind: db::MediaKind::Stream,
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::http(
+                    "https://unreachable.test/video.mkv",
+                ),
+                filename: Some("release.mkv".into()),
+                size: Some(12345),
+                ..Default::default()
+            }),
+            probe_data: Some(api::MediaSourceInfo {
+                run_time_ticks: Some(60 * 10_000_000),
+                media_streams: vec![api::MediaStream {
+                    index: 23,
+                    type_: Some(api::MediaStreamType::Subtitle),
+                    codec: Some("ass".into()),
+                    language: Some("vie".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let identity = source_identity(
+            source.id,
+            source
+                .stream_info
+                .as_ref()
+                .unwrap(),
+            Some(60 * 10_000_000),
+        )
+        .unwrap();
+        let dir = state
+            .ctx
+            .config
+            .data_dir
+            .join("subtitle-alignment-reference");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .unwrap();
+        let path = dir.join(format!("{identity}_23.srt"));
+        let text = b"1\n00:00:01,000 --> 00:00:02,000\nActual release text\n";
+        tokio::fs::write(&path, text)
+            .await
+            .unwrap();
+        assert!(
+            !source
+                .allows_subtitle_extraction(
+                    &state
+                        .ctx
+                        .db
+                )
+                .await
+        );
+        assert_eq!(
+            reference_text(
+                &state,
+                "https://unreachable.test/video.mkv",
+                identity,
+                23,
+                Some("srt"),
+                false
+            )
+            .await
+            .unwrap()
+            .as_bytes(),
+            text
+        );
+        assert!(
+            reference_text(
+                &state,
+                "https://unreachable.test/video.mkv",
+                identity,
+                22,
+                Some("srt"),
+                false
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(
+            cached_embedded_subtitle(&state, &source, item, 23)
+                .await
+                .unwrap()
+                .as_ref(),
+            text
+        );
+        tokio::fs::remove_file(&path)
+            .await
+            .unwrap();
+        assert!(
+            cached_embedded_subtitle(&state, &source, item, 23)
+                .await
+                .is_some()
+        );
+        assert!(
+            cached_embedded_subtitle(&state, &source, item, 22)
+                .await
+                .is_none()
+        );
+        db::Media::upsert(
+            &state
+                .ctx
+                .db,
+            &[source.clone()],
+        )
+        .await
+        .unwrap();
+        let mut dub = source.clone();
+        dub.id = Uuid::new_v4();
+        dub.stream_info
+            .as_mut()
+            .unwrap()
+            .descriptor = crate::stream::StreamDescriptor::http(format!(
+            "https://mux.test/mux/dub/{}/file.ts?video=https%3A%2F%2Funreachable.test%2Fvideo.mkv",
+            source
+                .id
+                .simple()
+        ));
+        dub.probe_data
+            .as_mut()
+            .unwrap()
+            .media_streams[0]
+            .index += crate::services::dubmux::SUBTITLE_INDEX_OFFSET;
+        assert_eq!(
+            cached_embedded_subtitle(&state, &dub, item, 123)
+                .await
+                .unwrap()
+                .as_ref(),
+            text
+        );
+        source
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(23456);
+        db::Media::upsert(
+            &state
+                .ctx
+                .db,
+            &[source.clone()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            cached_embedded_subtitle(&state, &source, item, 23)
+                .await
+                .is_none()
+        );
+        assert!(
+            cached_embedded_subtitle(&state, &dub, item, 123)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn discards_preexisting_alignment_with_no_readable_cues() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = cache_key(Uuid::new_v4(), b"original");
+        let path = persisted_result_path(dir.path(), &key).unwrap();
+        tokio::fs::create_dir_all(
+            path.parent()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let created_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = PersistedAlignment {
+            created_at_unix,
+            timing_changed: true,
+            subtitle: "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n<i> </i>\n".into(),
+        };
+        tokio::fs::write(&path, serde_json::to_vec(&record).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            load_persisted_alignment(dir.path(), &key)
+                .await
+                .is_none()
+        );
+        assert!(!path.exists());
+    }
     #[tokio::test]
     async fn first_request_waits_for_ready_instead_of_pending() {
         let start = tokio::time::Instant::now();

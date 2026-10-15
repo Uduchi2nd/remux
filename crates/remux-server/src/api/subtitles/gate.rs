@@ -59,8 +59,13 @@ pub(crate) fn prepare_in_background(
     let state = state.clone();
     let source = source.clone();
     tokio::spawn(async move {
-        let result = match PREPARE_LIMIT.acquire().await {
-            Ok(_permit) => ensure_ready(&state, &source, item, user, source_alias).await,
+        let result = match PREPARE_LIMIT
+            .acquire()
+            .await
+        {
+            Ok(_permit) => {
+                ensure_ready(&state, &source, item, user, source_alias).await
+            }
             Err(_) => Err(anyhow::anyhow!("subtitle preparation limit unavailable")),
         };
         if result.is_err() {
@@ -107,45 +112,7 @@ pub(super) fn known_invalid(
 }
 
 pub(super) fn valid_subtitle(bytes: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return false;
-    };
-    if text
-        .trim_start()
-        .starts_with(['{', '<'])
-    {
-        return false;
-    }
-    let parsed: serde_json::Value =
-        serde_json::from_str(&crate::conversions::srt_to_jellyfin_json(text))
-            .unwrap_or_default();
-    parsed["TrackEvents"]
-        .as_array()
-        .is_some_and(|events| {
-            events
-                .iter()
-                .any(|e| {
-                    e["Text"]
-                        .as_str()
-                        .is_some_and(|t| {
-                            !t.trim()
-                                .is_empty()
-                        })
-                        && e["StartPositionTicks"]
-                            .as_i64()
-                            .zip(e["EndPositionTicks"].as_i64())
-                            .is_some_and(|(a, b)| a >= 0 && b > a)
-                })
-        })
-        || text
-            .lines()
-            .any(|line| {
-                line.starts_with("Dialogue:")
-                    && line
-                        .split(',')
-                        .count()
-                        >= 10
-            })
+    super::quality::check(bytes, super::quality::Requirements::default()).is_ok()
 }
 
 fn has_reference(streams: &[api::MediaStream]) -> bool {
@@ -162,8 +129,7 @@ fn has_reference(streams: &[api::MediaStream]) -> bool {
         })
 }
 fn eligible(streams: &[api::MediaStream], language: Option<&str>) -> bool {
-    has_reference(streams)
-        && alignment::alignment_skip_reason(language).is_none()
+    has_reference(streams) && alignment::alignment_skip_reason(language).is_none()
 }
 
 pub(crate) fn advertise(
@@ -249,12 +215,7 @@ pub(crate) async fn ensure_ready(
         let subs = state
             .ctx
             .addons
-            .fetch_subtitles(
-                &mut media,
-                &state.ctx,
-                false,
-                user,
-            )
+            .fetch_subtitles(&mut media, &state.ctx, false, user)
             .await;
         let settings = db::Settings::get_config_or_default(
             &state
@@ -325,6 +286,17 @@ pub(crate) async fn ensure_ready(
                         Err(_) if known_invalid(&state.ctx, descriptor) => continue,
                         Err(error) => return Err(error),
                     };
+                if super::quality::check(
+                    &bytes,
+                    super::quality::Requirements {
+                        duration_ticks: probe.run_time_ticks,
+                        forced: sub.is_forced,
+                    },
+                )
+                .is_err()
+                {
+                    continue;
+                }
                 loop {
                     let response = super::aligned_external_response(
                         state,
@@ -337,6 +309,7 @@ pub(crate) async fn ensure_ready(
                         bytes.clone(),
                         sub.lang
                             .as_deref(),
+                        sub.is_forced,
                         "vtt",
                         false,
                     )
@@ -452,6 +425,7 @@ mod tests {
                 b"1\n00:00:01,000 --> 00:00:02,000\nOriginal text\n",
             ),
             Some("vie"),
+            false,
             "vtt",
             false,
         )

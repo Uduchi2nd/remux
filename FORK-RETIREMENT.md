@@ -304,3 +304,54 @@ Rows of pairs the muxer reports `file_ready` point at `{public}/mux/{dub}/{hq}/f
 ### Start-time patches (2026-09-29)
 - `d4383ad4` PlaybackInfo: addon subtitles prefetched in parallel; per-version redirect HEADs started in parallel with the first probe (were sequential, ~1 s each); dub-pair checks in parallel. Cold open 45 s → 11 s together with the vnphim/AIOStreams changes.
 - `49f6afaf` open prefetch (`services/open_prefetch.rs`): an item document fetched without MediaSources, or a show page, refreshes the (next) episode's stream list in the background (one at a time, 1 s gap, each item once per 10 min). Retire when upstream prefetches on item open.
+
+
+## External subtitle quality and cached release text (2026-10-15)
+
+Infinity Castle advertised a Vietnamese addon file with 1,321 cues ending at
+86:40 for a 155-minute film. Its title card identified the Tsuzumi Mansion story,
+and signs preceded earlier dialogue out of time order. HTTP 200 and a large file
+were insufficient evidence of a usable subtitle. A complete Vietnamese release
+reference (2,197 cues through the film's end) was already cached separately.
+
+The shared quality parser rejects missing visible dialogue, markup-only cues,
+invalid timestamps and mostly malformed/empty events. Full tracks on videos of
+at least ten minutes require 8–30 readable cues, four distinct texts, adequate
+visible text/screen time, and plausible timeline coverage. The 10th/90th percentile
+cue times must start before 40% of runtime, reach 60%, and span at least 40%.
+Forced tracks and short videos retain sparse subtitles; known-duration tracks
+with too many cues outside the video are rejected. These are conservative
+structural checks, not semantic title matching or a guarantee of audio sync.
+
+Discovery checks up to four candidates per language before applying the normal
+menu cap, so a rejected first result can be replaced by a good runner-up.
+Persisted raw/ready copies are rechecked against the video's runtime and invalid
+copies are removed on access. Alignment results must retain readable dialogue
+and the original cue text. SRT/WebVTT/ASS text delivery produces ordered real
+cues; empty conversion returns 404. Native extracted caches also require actual
+readable timed text rather than just a nonempty header.
+
+The embedded subtitle route can reuse an already extracted alignment reference
+without starting extraction, including when remote extraction is disabled.
+Successful release text is retained in the existing 30-day good-track cache,
+keyed by guarded release identity and original track index. The existing 200 MiB
+combined good-track/alignment budget and track limits remain unchanged. Cached
+release delivery reports `X-Remux-Subtitle-Alignment: embedded-cache`; it is not
+labelled as an automatically corrected addon subtitle. Existing two-second
+alignment waiting and direct video delivery are unchanged.
+
+Retire when upstream rejects these failure cases, tries good alternatives, and
+serves cached release text through item/PlaybackInfo subtitle routes without
+unnecessary remote extraction. Verify actual client rendering separately from
+HTTP/content checks. Never commit private subtitle fixtures or signed URLs.
+
+
+Premiumize quota follow-up: background reference extraction previously bypassed
+`Media::allows_subtitle_extraction`, even though the normal subtitle route
+refused extraction for the same source. A small reference SRT could therefore
+cost a full remote-movie read, multiplied by versions/reference tracks. Alignment
+now honors the same addon extraction opt-in and reuses cached text when the
+opt-in is off. Operators must not enable full-file debrid extraction just to
+obtain small subtitle files. Automatic alignment, stream refresh and new dub
+preparation were paused on Nimo while investigating the exhausted account;
+keep those protections until their transfer cost has been reviewed.
