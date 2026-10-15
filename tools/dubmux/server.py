@@ -27,6 +27,7 @@ import vnfile  # noqa: E402
 import align  # noqa: E402
 import release_subtitles  # noqa: E402
 import provider_budget  # noqa: E402
+import indexed_subtitles  # noqa: E402
 
 DATA = Path(os.environ.get("DUBMUX_DATA", "/data"))
 AUDIO, MATCH, HLS = DATA / "audio", DATA / "match", DATA / "hls"
@@ -89,7 +90,45 @@ def release_transfer(lease: str, request: Request):
 @app.get("/transfer-budget/status")
 def transfer_status(request: Request):
     _require_budget_auth(request)
-    return MEDIA_READS.ledger.status()
+    status = MEDIA_READS.ledger.status()
+    status["indexed_extraction"] = {"max_response_bytes": indexed_subtitles.MAX_BYTES,
+        "max_requests": indexed_subtitles.MAX_REQUESTS, "timeout_seconds": indexed_subtitles.TIMEOUT,
+        "max_artifact_bytes": indexed_subtitles.MAX_OUTPUT, "connections_per_source": 4}
+    return status
+
+
+@app.post("/subtitles/indexed")
+async def indexed_subtitle_input(request: Request):
+    """Authenticated, bounded extraction only. Cache GETs remain read-only."""
+    _require_budget_auth(request)
+    body = await request.json()
+    if not isinstance(body, dict) or not isinstance(body.get("video"), dict):
+        raise HTTPException(400, "invalid subtitle request")
+    video, ordinals = body["video"], body.get("subtitle_ordinals")
+    _check_id(video.get("id"))
+    if not isinstance(video.get("url"), str) or not video["url"].startswith(("https://", "http://")):
+        raise HTTPException(400, "HTTP source required")
+    if not isinstance(ordinals, list) or not 1 <= len(ordinals) <= 8 or any(type(n) is not int or not 0 <= n <= 1024 for n in ordinals):
+        raise HTTPException(400, "invalid subtitle selection")
+
+    def extract():
+        # A text request must not register the HQ for legacy full mux resumes.
+        registered = dict(video, id="index-" + hashlib.sha256(video["id"].encode()).hexdigest())
+        MEDIA_READS.register(registered)
+        source = MEDIA_READS.source(registered["id"], video["url"])
+        lease = MEDIA_READS.ledger.reserve(source["provider"], indexed_subtitles.MAX_BYTES, "indexed")
+        try:
+            reader = indexed_subtitles.RangeReader(video["url"], source["size"],
+                resolved=lambda url: MEDIA_READS.check_resolved(registered["id"], video["url"], url))
+            data = indexed_subtitles.extract(reader, ordinals)
+            return Response(data, media_type="video/x-matroska", headers={
+                "Cache-Control": "no-store", "X-Remux-Extraction-Bytes": str(reader.bytes_read),
+                "X-Remux-Extraction-Requests": str(reader.requests)})
+        except indexed_subtitles.Unavailable as error:
+            raise HTTPException(422, "indexed subtitle unavailable: " + str(error)) from None
+        finally:
+            MEDIA_READS.ledger.release(lease)
+    return await asyncio.to_thread(extract)
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}       # prepare jobs keyed dub__video
@@ -580,9 +619,14 @@ def _prepare_worker(dub, video, k):
                     _ensure_mux(k, dub["id"], result, video["url"])
                 return
         orig_url = video["url"]   # kept in the record: the release identity (file name)
-        budget_lease = MEDIA_READS.acquire(hq_id, orig_url)
-        video["url"] = dubmux.resolve_url(video["url"], background=job["priority"] > 9)
-        MEDIA_READS.check_resolved(hq_id, orig_url, video["url"])
+        raw = _raw_dir(hq_id)
+        local_audio = raw / "audio.mka"
+        cached_audio = (raw / ".done").exists() and local_audio.is_file()
+        if not cached_audio:
+            budget_lease = MEDIA_READS.acquire(hq_id, orig_url)
+            video["url"] = dubmux.resolve_url(video["url"], background=job["priority"] > 9)
+            MEDIA_READS.check_resolved(hq_id, orig_url, video["url"])
+        hq_audio_input = str(local_audio) if cached_audio else video["url"]
         job["video_url"] = video["url"]
         _raw_ref(hq_id, k)
         if job["priority"] <= 99 and not (_raw_dir(hq_id) / ".done").exists():
@@ -613,7 +657,7 @@ def _prepare_worker(dub, video, k):
         MATCH_GATE.acquire(k, job["priority"])
         slot_held = True
         job["stage"] = "prescreen"
-        vdur = dubmux.ffprobe_duration(video["url"])
+        vdur = dubmux.ffprobe_duration(str(raw / "index.m3u8") if cached_audio else video["url"])
         ddur = json.load(open(meta))["duration"]
         dubfile = str(AUDIO / f"{dub['id']}.m4a")
         result = {"dub": dub["id"], "video": video["id"], "video_duration": vdur,
@@ -622,7 +666,7 @@ def _prepare_worker(dub, video, k):
         # Pre-screen: 8 windows by byte range (~1 % of the file). Fewer than
         # 3 confident windows = a different edit or the wrong episode; stop
         # before reading the whole release.
-        pre = dubmux.prescreen(video["url"], dubfile, vdur, ddur, max_lag=max(75.0, abs(vdur - ddur) + 15.0))
+        pre = dubmux.prescreen(hq_audio_input, dubfile, vdur, ddur, max_lag=max(75.0, abs(vdur - ddur) + 15.0))
         conf = [(t, lag, r) for t, lag, r in pre if lag is not None and r >= 10.0]
         undecodable = sum(1 for _t, lag, _r in pre if lag is None)
         result["prescreen"] = {"windows": pre, "confident": len(conf), "undecodable": undecodable}
@@ -665,7 +709,7 @@ def _prepare_worker(dub, video, k):
                 reused = None
                 for cand in sorted(MATCH.glob(f"{dub['id']}__*.aligned.m4a")):
                     job["stage"] = "prescreen:aligned"
-                    pre2 = dubmux.prescreen(video["url"], str(cand), vdur, vdur, max_lag=5.0)
+                    pre2 = dubmux.prescreen(hq_audio_input, str(cand), vdur, vdur, max_lag=5.0)
                     c2 = [l for _t, l, r in pre2 if l is not None and r >= 10.0]
                     if len(c2) >= 5 and max(c2) - min(c2) <= 0.15 and abs(sorted(c2)[len(c2) // 2]) <= 0.2:
                         reused = cand

@@ -249,7 +249,7 @@ def envelope(x, win=80):
     return np.convolve(e, k, mode="same")
 
 
-def http_get(url, rng=None, timeout=60, tries=4):
+def http_get(url, rng=None, timeout=60, tries=4, max_bytes=None):
     hdr = {"User-Agent": UA}
     if rng:
         hdr["Range"] = f"bytes={rng[0]}-{rng[0] + rng[1] - 1}"
@@ -257,10 +257,20 @@ def http_get(url, rng=None, timeout=60, tries=4):
     for attempt in range(tries):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=timeout) as r:
-                data = r.read()
+                if rng:
+                    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", r.headers.get("Content-Range", ""))
+                    if r.status != 206 or not match or (int(match[1]), int(match[2])) != (rng[0], rng[0] + rng[1] - 1):
+                        raise PlaylistUnavailable("segment_range_not_supported")
+                if max_bytes is not None and int(r.headers.get("Content-Length", "0")) > max_bytes:
+                    raise PlaylistUnavailable("playlist_too_large")
+                data = r.read(rng[1]) if rng else r.read() if max_bytes is None else r.read(max_bytes + 1)
+                if max_bytes is not None and len(data) > max_bytes:
+                    raise PlaylistUnavailable("playlist_too_large")
             if rng and len(data) != rng[1]:
                 raise IOError(f"short range read {len(data)} != {rng[1]}")
             return data
+        except PlaylistUnavailable:
+            raise
         except Exception as e:  # noqa: BLE001
             last = e
             time.sleep(0.5 * (attempt + 1))
@@ -284,18 +294,76 @@ def _join(url, rel):
     return urljoin(url, rel)
 
 
+class PlaylistUnavailable(RuntimeError):
+    pass
+
+
+def _hls_attributes(text):
+    return {m.group(1): m.group(2) if m.group(2) is not None else m.group(3)
+            for m in re.finditer(r'([A-Z0-9-]+)=(?:"([^"]*)"|([^,]*))(?:,|$)', text)}
+
+
+def media_playlist(url, audio_only=False):
+    """Select a Vietnamese/default audio rendition when one is separate."""
+    seen = set()
+    for _ in range(4):
+        if url in seen:
+            raise PlaylistUnavailable("playlist_cycle")
+        seen.add(url)
+        text = http_get(url, timeout=10, tries=1, max_bytes=512 * 1024).decode("utf8", "strict")
+        if not text.lstrip("\ufeff\r\n ").startswith("#EXTM3U"):
+            raise PlaylistUnavailable("not_a_playlist")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        variants = []
+        renditions = []
+        for i, line in enumerate(lines):
+            if line.startswith("#EXT-X-MEDIA:"):
+                renditions.append(_hls_attributes(line.split(":", 1)[1]))
+            if line.startswith("#EXT-X-STREAM-INF:") and i + 1 < len(lines) and not lines[i + 1].startswith("#"):
+                variants.append((_hls_attributes(line.split(":", 1)[1]), lines[i + 1]))
+        if not variants:
+            return url, text
+        attrs, target = variants[0]
+        if audio_only:
+            group = attrs.get("AUDIO")
+            candidates = [r for r in renditions if r.get("TYPE") == "AUDIO" and group and r.get("GROUP-ID") == group]
+            if candidates:
+                def rank(r):
+                    vi = r.get("LANGUAGE", "").lower().split("-")[0] in ("vi", "vie", "vietnamese")
+                    return (not vi, r.get("DEFAULT") != "YES", r.get("AUTOSELECT") != "YES")
+                chosen = min(candidates, key=rank)
+                # An in-band default cannot be replaced by another language.
+                target = chosen.get("URI") or target
+            else:
+                for a, uri in variants:
+                    codecs = a.get("CODECS", "").lower().split(",")
+                    if not a.get("RESOLUTION") and not a.get("VIDEO") and codecs and all(
+                            c.strip().startswith(("mp4a", "ac-3", "ec-3", "opus", "flac", "alac")) for c in codecs):
+                        target = uri
+                        break
+        url = _join(url, target)
+    raise PlaylistUnavailable("playlist_depth")
+
+
 def parse_media_playlist(url):
-    """Follow a master to its first variant; return (variant_url, [(seg_url, byterange|None)])."""
-    text = http_get(url).decode("utf8", "replace")
-    if "#EXT-X-STREAM-INF" in text:
-        variant = next(l for l in text.splitlines() if l and not l.startswith("#"))
-        url = _join(url, variant)
-        text = http_get(url).decode("utf8", "replace")
-    segs, br = [], None
+    url, text = media_playlist(url, audio_only=True)
+    segs, br, previous_end = [], None, 0
     for line in text.splitlines():
+        if line.startswith("#EXT-X-KEY:") and _hls_attributes(line.split(":", 1)[1]).get("METHOD") != "NONE":
+            raise PlaylistUnavailable("encrypted_segments_require_a_decoder")
+        if line.startswith("#EXT-X-MAP:"):
+            attrs = _hls_attributes(line.split(":", 1)[1])
+            if not attrs.get("URI"):
+                raise PlaylistUnavailable("missing_initialization_segment")
+            init_range = None
+            if attrs.get("BYTERANGE"):
+                parts = attrs["BYTERANGE"].split("@")
+                init_range = (int(parts[1]) if len(parts) == 2 else 0, int(parts[0]))
+            segs.append((_join(url, attrs["URI"]), init_range))
         if line.startswith("#EXT-X-BYTERANGE:"):
-            n, o = line[17:].split("@")
-            br = (int(o), int(n))
+            parts = line[17:].split("@")
+            br = (int(parts[1]) if len(parts) == 2 else previous_end, int(parts[0]))
+            previous_end = br[0] + br[1]
         elif line and not line.startswith("#"):
             segs.append((_join(url, line), br))
             br = None
@@ -495,10 +563,17 @@ def cmd_extract(args):
     t0 = time.time()
     fetch = None
     args.url = dub_source(args.url)
-    src = args.url
-    if VN_EXTRACTOR and is_proxied_playlist(args.url):
+    source_url = args.url
+    try:
+        source_url, _ = media_playlist(args.url, audio_only=True)
+    except (OSError, ValueError, PlaylistUnavailable):
+        # The VN extractor can still reach a geo-blocked origin playlist.
+        # Once a separate audio URL is selected, keep using it on retries.
+        pass
+    src = source_url
+    if VN_EXTRACTOR and is_proxied_playlist(source_url):
         try:
-            fetch = vn_extract(args.name, args.url, out)
+            fetch = vn_extract(args.name, source_url, out)
             dur = ffprobe_duration(out)
             info = {"name": args.name, "source": args.url, "codec_in": "aac", "copied": True,
                     "duration": dur, "bytes": os.path.getsize(out), "created": int(time.time()),
@@ -511,7 +586,7 @@ def cmd_extract(args):
                   file=sys.stderr, flush=True)
     try:
         if args.parallel > 1:
-            ts_path, ts_bytes, fetch_s = parallel_fetch_ts(args.url, args.parallel)
+            ts_path, ts_bytes, fetch_s = parallel_fetch_ts(source_url, args.parallel)
             fetch = {"segments_bytes": ts_bytes, "fetch_seconds": round(fetch_s, 1),
                      "workers": args.parallel}
             src = ts_path
@@ -530,7 +605,7 @@ def cmd_extract(args):
              "-movflags", "+faststart", "-f", "ipod", out + ".part"])
         os.replace(out + ".part", out)
     finally:
-        if src != args.url and os.path.exists(src):
+        if src not in (args.url, source_url) and os.path.exists(src):
             os.unlink(src)
         if os.path.exists(out + ".part"):
             os.unlink(out + ".part")

@@ -78,6 +78,15 @@ class ProviderBudgetTest(unittest.TestCase):
         self.assertEqual(self.ledger.status(1000)['providers']['premiumize']['active'],1)
         self.assertEqual(self.ledger.status(1000)['providers']['torbox']['active'],0)
 
+    def test_indexed_reads_reserve_the_byte_ceiling_and_share_full_start_pacing(self):
+        token=self.ledger.reserve('premiumize',100,'indexed',now=1000)
+        self.ledger.release(token)
+        self.assertEqual(self.ledger.status(1000)['providers']['premiumize']['reserved_bytes'],100)
+        with self.assertRaisesRegex(Limited,'start_rate'):
+            self.ledger.reserve('premiumize',100,'full',now=1001)
+        self.ledger.reserve('premiumize',100,'full',now=1021)
+        self.assertEqual(self.ledger.status(1021)['providers']['premiumize']['reserved_bytes'],210)
+
     def test_probe_reservations_share_the_daily_ledger(self):
         limits={'premiumize':Policy(300*1024*1024,1,3600,60),'torbox':self.policies['torbox']}
         ledger=Ledger(self.root/'probe.sqlite',limits)

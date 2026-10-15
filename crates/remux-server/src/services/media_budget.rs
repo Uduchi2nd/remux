@@ -70,6 +70,7 @@ pub(crate) struct ReadBudget {
     pub provider: Provider,
     bytes: u64,
     kind: &'static str,
+    source_id: Uuid,
 }
 
 impl ReadBudget {
@@ -114,7 +115,46 @@ impl ReadBudget {
                     0
                 }),
             kind,
+            source_id: media.id,
         }
+    }
+
+    pub fn indexed_only(&self) -> bool {
+        self.provider != Provider::Other
+    }
+
+    /// Paid text extraction gets a bounded subtitle-only artifact. No full-file
+    /// fallback: a missing index, ignored Range or service failure is deferred.
+    pub async fn indexed_subtitles(
+        &self,
+        url: &str,
+        ordinals: Vec<u32>,
+    ) -> anyhow::Result<Vec<u8>> {
+        const MAX_ARTIFACT: usize = 16 * 1024 * 1024;
+        let result = async {
+            let endpoint = self.endpoint.as_deref().ok_or_else(|| anyhow::anyhow!("not configured"))?;
+            let token = tokio::fs::read_to_string(self.token_file.as_ref().ok_or_else(|| anyhow::anyhow!("missing token"))?).await?;
+            let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(2)).timeout(Duration::from_secs(315)).build()?;
+            let mut response = client.post(format!("{}/subtitles/indexed", endpoint.trim_end_matches('/')))
+                .bearer_auth(token.trim()).json(&serde_json::json!({
+                    "video":{"id":self.source_id.simple().to_string(),"url":url,"provider":self.provider,"size":self.bytes},
+                    "subtitle_ordinals":ordinals})).send().await?;
+            anyhow::ensure!(response.status() == reqwest::StatusCode::OK, "deferred");
+            anyhow::ensure!(response.content_length().unwrap_or(0) <= MAX_ARTIFACT as u64, "artifact too large");
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                anyhow::ensure!(chunk.len() <= MAX_ARTIFACT - body.len(), "artifact too large");
+                body.extend_from_slice(&chunk);
+            }
+            anyhow::ensure!(body.starts_with(&[0x1a,0x45,0xdf,0xa3]), "invalid artifact");
+            Ok(body)
+        }.await;
+        result.map_err(|_: anyhow::Error| {
+            anyhow::anyhow!(
+                "media transfer budget indexed subtitle extraction deferred"
+            )
+        })
     }
 
     pub async fn acquire(&self) -> anyhow::Result<Permit> {
@@ -277,6 +317,7 @@ mod tests {
             provider: Provider::Premiumize,
             bytes: 1000,
             kind: "full",
+            source_id: Uuid::nil(),
         };
         let permit = budget
             .acquire()
@@ -314,6 +355,24 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            budget
+                .indexed_subtitles("https://fixture.invalid/video", vec![1])
+                .await
+                .is_err()
+        );
+        let events = events
+            .lock()
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            4,
+            "indexed denial must not fall back to a full reservation"
+        );
+        assert_eq!(events[3].0, "/subtitles/indexed");
+        assert_eq!(events[3].1["subtitle_ordinals"], serde_json::json!([1]));
+        assert_eq!(events[3].1["video"]["provider"], "premiumize");
+        assert_eq!(events[3].1["video"]["size"], 1000);
         server.abort();
     }
     #[test]

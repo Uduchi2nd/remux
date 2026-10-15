@@ -10,7 +10,7 @@ The initial policy is deliberately tighter for Premiumize:
 
 | Policy | Premiumize | TorBox |
 |---|---:|---:|
-| Daily estimated reservation budget (decimal GB) | 10 | 200 |
+| Daily estimated reservation budget (decimal GB) | 10 | 80 |
 | Concurrent admitted jobs | 1 | 3 |
 | Minimum gap between full jobs | 3,600 seconds | 10 seconds |
 | Minimum gap between background probes | 60 seconds | 5 seconds |
@@ -25,7 +25,9 @@ placeholder circuit breaker remains an additional protection.
 
 This is admission control with **estimated reservations**, not an exact network
 byte meter or a guaranteed cap on the provider account's bandwidth/points.
-A full job reserves 110% of the known whole-file size. A probe reserves the
+A full job reserves 110% of the known whole-file size. An indexed subtitle
+job reserves its fixed 64 MiB body-read ceiling, sharing full-job start pacing.
+It does not reserve the entire release size. A probe reserves the
 smaller of the known file size and 128 MiB (128 MiB if size is unknown). A
 full-file read without a valid size is denied. The extra 10% allows for normal
 metadata and seek overhead; unusual demuxer reads can exceed an estimate.
@@ -60,7 +62,7 @@ DUBMUX_PREMIUMIZE_DAILY_GB=10
 DUBMUX_PREMIUMIZE_CONCURRENCY=1
 DUBMUX_PREMIUMIZE_START_GAP_S=3600
 DUBMUX_PREMIUMIZE_PROBE_GAP_S=60
-DUBMUX_TORBOX_DAILY_GB=200
+DUBMUX_TORBOX_DAILY_GB=80
 DUBMUX_TORBOX_CONCURRENCY=3
 DUBMUX_TORBOX_START_GAP_S=10
 DUBMUX_TORBOX_PROBE_GAP_S=5
@@ -116,3 +118,53 @@ compose configuration and the previous image/binary. Deploy the muxer first,
 then the Remux secret mount and binary using the existing stop/swap deployment
 helper. Preserve the data directory and all automatic-work pauses. Rolling
 back an image/binary must not remove the ledger or resume automation.
+
+
+## Reduce extraction traffic
+
+Paid remote **text** subtitle cache misses use authenticated `POST
+/subtitles/indexed` on the same private service configured by
+`MEDIA_TRANSFER_BUDGET_URL`. The request has `video: {id,url,provider,size}` and
+`subtitle_ordinals` (the original `0:s:N` ordinals). The service reads bounded
+HTTP ranges using Matroska SeekHead/Cues and returns a small Matroska artifact
+containing the original metadata and selected native subtitle packets. Remux
+runs its existing FFmpeg conversion on that local artifact, retaining native
+ASS and plain text in their separate caches. Original timestamps and the
+existing quality checks remain. Concurrent requests share one extraction per
+requested track; other languages do not join a job that omits their packets.
+
+Limits per job: 64 MiB of response body data read (including overfetch), 6,000
+HTTP requests including redirects, four connections, 20 request starts/second,
+300-second deadline and 16 MiB artifact. Redirect bodies are closed without
+being drained. A server ignoring Range is rejected before its body is read;
+changed size/ETag, invalid offsets, absent/inadequate indexes, unsupported text
+codecs and limits cause deferral, never a sequential paid-video fallback.
+Stats in `X-Remux-Extraction-Bytes/Requests` describe this reader's response
+bodies, not TCP/TLS/header overhead or other provider account activity.
+`GET /transfer-budget/status` reports the indexed limits too.
+Indexed source registration is separate from full mux registration, so a text
+request cannot make an old unfinished mux eligible for automatic full reads.
+
+The index is advisory: Matroska recommends indexing every subtitle frame but
+does not guarantee it. Missing position/duration information is refused, and
+Remux's normal quality checks reject stubs/invalid results; these checks cannot
+prove that an otherwise well-formed index lists every subtitle in a release.
+PGS/image subtitles and recognized unpaid sources retain their existing opt-in
+extraction path; the bounded indexed path is for paid text subtitles. No new
+extraction permission is granted, and all automatic-work pauses stay in place.
+
+Dub matching uses a completed raw cache's local audio and local duration probe,
+without resolving/reading the HQ URL or reserving another paid transfer. HLS
+dub extraction selects a separate Vietnamese/default audio rendition (or an
+audio-only variant) when available, preserving the original master identity for
+cache reuse. Group selection, quoted attributes, initialization fragments and
+byte ranges are respected. An in-band default is not replaced with an unrelated
+language merely to avoid video. The selected audio URL is also passed to the VN
+extractor; retries keep that URL. Mixed audio/video sources still require their
+mixed segments when no usable audio-only rendition exists.
+
+Verify with synthetic media and `--network=none` candidate containers. The
+indexed fixture compares SRT and native ASS output against a full local scan;
+`verify_cached_audio.py` checks the cached audio clock and asserts no paid URL
+resolution/reservation during matching. Production smoke tests read only health,
+aggregate policy and pre-existing subtitle caches.

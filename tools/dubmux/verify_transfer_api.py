@@ -77,6 +77,26 @@ with tempfile.TemporaryDirectory() as directory:
         assert request("/transfer-budget/reserve", {"bytes": 0}, True)[0] == 429
         assert request("/transfer-budget/reserve", {"bytes": 100, "kind": "invalid"}, True)[0] == 400
 
+        from test_indexed_subtitles import fixture, source
+        media=fixture()
+        video={"id":uuid.uuid4().hex,"provider":"premiumize","size":len(media)}
+        with source(media) as (url,upstream):
+            video["url"]=url
+            payload={"video":video,"subtitle_ordinals":[1]}
+            assert request("/subtitles/indexed",payload)[0]==401
+            assert request("/subtitles/indexed",{"video":video,"subtitle_ordinals":[-1]},True)[0]==400
+            assert request("/subtitles/indexed",payload,True)[0]==429
+            assert upstream.requests==0, "budget rejection must precede source access"
+            video["provider"]="other"
+            status,artifact,headers=request("/subtitles/indexed",payload,True)
+            assert status==200 and artifact.startswith(b'\x1a\x45\xdf\xa3')
+            assert int(headers["X-Remux-Extraction-Bytes"])<len(media)//20
+        with source(media,"ignore") as (url,_):
+            video["url"]=url
+            assert request("/subtitles/indexed",payload,True)[0]==422
+        registered=list((Path(directory)/"provider-sources").glob("*.json"))
+        assert registered and all(p.name.startswith("index-") for p in registered), "text extraction authorized a full mux source"
+
         pm = value("/transfer-budget/reserve", {"provider": "premiumize", "bytes": 100})["lease"]
         assert pm == str(uuid.UUID(pm))
         status, data, headers = request("/transfer-budget/reserve", {"provider": "premiumize", "bytes": 100}, True)
@@ -111,7 +131,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert value("/transfer-budget/status")["providers"] == before
         assert request("/transfer-budget/reserve", {"provider": "premiumize", "bytes": 1}, True)[0] == 429
         assert value("/jobs") == {}
-        print(json.dumps({"http_checks": 22, "persistent_budget": True,
+        print(json.dumps({"http_checks": 28, "persistent_budget": True,
                           "media_jobs_started": 0, "external_network": "disabled"}))
     finally:
         stop(process)

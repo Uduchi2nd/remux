@@ -718,26 +718,66 @@ async fn extract_subtitles_to_cache(
         .await
         .map_err(|e| anyhow!("failed to create subtitle cache dir: {e}"))?;
 
+    let remote = url::Url::parse(input_url)
+        .is_ok_and(|u| matches!(u.scheme(), "http" | "https"));
+    let mut indexed_input = None;
+    let mut _budget_permit = None;
+    if remote {
+        let budget = read_budget.ok_or_else(|| {
+            anyhow!("media transfer budget missing for remote extraction")
+        })?;
+        if budget.indexed_only() {
+            let ordinals: std::collections::BTreeSet<u32> = streams
+                .iter()
+                .map(|s| {
+                    s.map_spec
+                        .strip_prefix("0:s:")
+                        .and_then(|s| {
+                            s.parse()
+                                .ok()
+                        })
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "media transfer budget unsupported subtitle mapping"
+                            )
+                        })
+                })
+                .collect::<anyhow::Result<_>>()?;
+            let data = budget
+                .indexed_subtitles(
+                    input_url,
+                    ordinals
+                        .into_iter()
+                        .collect(),
+                )
+                .await?;
+            let file = tempfile::NamedTempFile::new()?;
+            tokio::fs::write(file.path(), data).await?;
+            indexed_input = Some(file);
+        } else {
+            _budget_permit = Some(
+                budget
+                    .acquire()
+                    .await?,
+            );
+        }
+    }
+    let local_input = indexed_input
+        .as_ref()
+        .map(|f| {
+            f.path()
+                .to_string_lossy()
+                .into_owned()
+        });
     let (args, cache_paths) = build_subtitle_extraction_args(
         data_dir,
-        input_url,
+        local_input
+            .as_deref()
+            .unwrap_or(input_url),
         item_id,
         media_source_id,
         streams,
     )?;
-    let _budget_permit =
-        if input_url.starts_with("http://") || input_url.starts_with("https://") {
-            Some(
-                read_budget
-                    .ok_or_else(|| {
-                        anyhow!("media transfer budget missing for remote extraction")
-                    })?
-                    .acquire()
-                    .await?,
-            )
-        } else {
-            None
-        };
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.hide_console();
     cmd.kill_on_drop(true);
@@ -886,12 +926,20 @@ async fn ensure_subtitle_cached(
         // the whole batch, losing every good track with it. Batch only known
         // text codecs; an unknown-codec track is extracted on its own, and only
         // when it's the one requested.
-        let solo = (!probe
-            .media_streams
-            .iter()
-            .any(|s| {
-                s.index == stream_index && !s.is_external && is_known_text_codec(s)
-            }))
+        // Indexed reads fetch only this track (native ASS and plain text share
+        // the pass). Other languages must not join a job that omits their data.
+        let indexed = url::Url::parse(input_url)
+            .is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+            && read_budget
+                .as_ref()
+                .is_none_or(|b| b.indexed_only());
+        let solo = (indexed
+            || !probe
+                .media_streams
+                .iter()
+                .any(|s| {
+                    s.index == stream_index && !s.is_external && is_known_text_codec(s)
+                }))
         .then_some(stream_index);
         let key = (item_id, media_source_id, solo);
         let shared = {

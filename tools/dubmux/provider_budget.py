@@ -39,7 +39,7 @@ def policies_from_env():
                       float(os.environ.get(prefix + "_START_GAP_S", gap)),
                       float(os.environ.get(prefix + "_PROBE_GAP_S", probe)))
     return {"premiumize": policy("DUBMUX_PREMIUMIZE", "10", "1", "3600", "60"),
-            "torbox": policy("DUBMUX_TORBOX", "200", "3", "10", "5")}
+            "torbox": policy("DUBMUX_TORBOX", "80", "3", "10", "5")}
 
 
 def provider(value):
@@ -74,13 +74,15 @@ class Ledger:
         service = provider(service)
         if service == "other":
             return None
-        if kind not in ("full", "probe"):
+        if kind not in ("full", "probe", "indexed"):
             raise ValueError("invalid read kind")
         if type(size) is not int or size <= 0:
             raise Limited("unknown_file_size", 3600)
         # Probe allowance is an estimate. Full jobs reserve the whole release
         # plus 10% for metadata/seeks. This is not a hard network byte meter.
-        cost = min(size, 128 * 1024 * 1024) if kind == "probe" else (size * 11 + 9) // 10
+        cost = (min(size, 128 * 1024 * 1024) if kind == "probe" else
+                size if kind == "indexed" else (size * 11 + 9) // 10)
+        clock = "probe" if kind == "probe" else "full"
         now = time.time() if now is None else now
         day = int(now // 86400)
         policy = self.policies[service]
@@ -92,7 +94,7 @@ class Ledger:
             used = c.execute("SELECT reserved FROM usage WHERE day=? AND provider=?", (day, service)).fetchone()
             used = used[0] if used else 0
             active = c.execute("SELECT COUNT(*) FROM leases WHERE provider=?", (service,)).fetchone()[0]
-            next_start = c.execute("SELECT next FROM starts WHERE provider=? AND kind=?", (service, kind)).fetchone()
+            next_start = c.execute("SELECT next FROM starts WHERE provider=? AND kind=?", (service, clock)).fetchone()
             if cost > policy.daily_bytes - used:
                 raise Limited("daily_reservation_budget", (day + 1) * 86400 - now)
             if active >= policy.concurrency:
@@ -108,7 +110,7 @@ class Ledger:
             c.execute("INSERT INTO leases VALUES(?,?,?)", (token, service, now + 2 * 3600))
             gap = policy.probe_gap if kind == "probe" else policy.full_gap
             c.execute("INSERT INTO starts VALUES(?,?,?) ON CONFLICT(provider,kind) DO UPDATE SET next=excluded.next",
-                      (service, kind, now + gap))
+                      (service, clock, now + gap))
             c.commit()
             return token
         except Exception:

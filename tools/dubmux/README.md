@@ -76,6 +76,10 @@ front of the source list for every accepted pair.
   external (`Path <lang>.vtt`) so VidHub/Infuse list them.
 
 ## Operations
+- Extraction traffic: completed raw audio is reused for matching. Separate HLS
+  audio renditions are preferred when present. Paid text subtitle cache misses
+  use a bounded indexed MKV reader; unsupported indexes defer without a full
+  video scan. See [TRANSFER-LIMITS.md](TRANSFER-LIMITS.md) for limits and scope.
 - Paid media admission: [TRANSFER-LIMITS.md](TRANSFER-LIMITS.md) describes the
   shared persistent Premiumize/TorBox daily reservation budgets, concurrency,
   start pacing and private authentication. Uncached preparation now requires
@@ -94,7 +98,7 @@ front of the source list for every accepted pair.
   on old raw/mux files are not backfilled by re-downloading those files.
   Remux's optional `DUBMUX_SUBTITLE_CACHE_URL` enables this read-only lookup
   independently of `DUBMUX_URL`, so pausing new mux preparation stays effective.
-- Deploy: copy `dubmux.py server.py provider_budget.py release_subtitles.py align.py vnfile.py Containerfile run.sh` to seedbox
+- Deploy: copy `dubmux.py server.py provider_budget.py indexed_subtitles.py release_subtitles.py align.py vnfile.py Containerfile run.sh` to seedbox
   `~/dubmux/`, `podman build -t localhost/dubmux:latest -f Containerfile .`,
   `./run.sh`. Data in `~/dubmux/data/{audio,match,hls}`.
 - Debug: `GET /health`, `GET /jobs` (in-memory job states, errors),
