@@ -355,3 +355,12 @@ opt-in is off. Operators must not enable full-file debrid extraction just to
 obtain small subtitle files. Automatic alignment, stream refresh and new dub
 preparation were paused on Nimo while investigating the exhausted account;
 keep those protections until their transfer cost has been reviewed.
+
+
+Cached-release discovery follow-up: the first Infinity Castle dub advertised a
+Vietnamese release track without a matching guarded cache entry; the second dub
+and TorBox remux served complete ordered cached VTT. The shared metadata injector
+now restores cached dub release tracks even when a device cannot embed their
+codec, and drops tracks that have neither cached text nor extraction permission.
+It clears a removed default subtitle index. Discovery and delivery therefore
+agree without starting remote video reads to fill a missing cache entry.

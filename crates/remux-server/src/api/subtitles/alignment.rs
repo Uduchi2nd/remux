@@ -1007,6 +1007,59 @@ mod tests {
                 .as_ref(),
             text
         );
+        let mut unavailable = dub
+            .probe_data
+            .as_ref()
+            .unwrap()
+            .media_streams[0]
+            .clone();
+        unavailable.index = 124;
+        unavailable.language = Some("eng".into());
+        dub.probe_data
+            .as_mut()
+            .unwrap()
+            .media_streams
+            .push(unavailable);
+        db::Media::upsert(
+            &state
+                .ctx
+                .db,
+            &[dub.clone()],
+        )
+        .await
+        .unwrap();
+        let mut view = api::MediaSourceInfo::from(dub.clone());
+        view.id = dub.id;
+        view.path = dub
+            .stream_info
+            .as_ref()
+            .unwrap()
+            .descriptor
+            .as_http_url()
+            .map(str::to_owned);
+        view.media_streams
+            .clear();
+        view.default_subtitle_stream_index = Some(124);
+        super::super::retain_servable_dub_subtitles(
+            &state,
+            std::slice::from_mut(&mut view),
+            item,
+            "test-player",
+            &["vi".into(), "en".into()],
+        )
+        .await;
+        assert!(
+            view.media_streams
+                .iter()
+                .any(|s| s.index == 123)
+        );
+        assert!(
+            !view
+                .media_streams
+                .iter()
+                .any(|s| s.index == 124)
+        );
+        assert_eq!(view.default_subtitle_stream_index, None);
         source
             .stream_info
             .as_mut()

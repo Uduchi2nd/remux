@@ -3132,8 +3132,118 @@ pub(crate) enum EmptySubtitleGatePolicy {
     AllSources,
 }
 
-/// Validate addon tracks and inject the surviving tracks through the same
-/// source-specific filtering, labeling, and cache-backed sync restoration path.
+/// Keep dub release tracks that can be served, including cached text that the
+/// device cannot embed. A probe entry alone does not make extraction possible.
+async fn retain_servable_dub_subtitles(
+    state: &AppState,
+    sources: &mut [api::MediaSourceInfo],
+    item: Uuid,
+    device_id: &str,
+    languages: &[String],
+) {
+    for source in sources {
+        if !crate::services::dubmux::is_mux_path(
+            source
+                .path
+                .as_deref(),
+        ) {
+            continue;
+        }
+        let actual = resolve_subtitle_source(&state.ctx, device_id, item, source.id);
+        let row = db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &actual,
+        )
+        .await
+        .ok()
+        .flatten();
+        let mut available = std::collections::HashSet::new();
+        if let Some(row) = row.filter(|row| row.kind == db::MediaKind::Stream) {
+            let allow_extraction = row
+                .allows_subtitle_extraction(
+                    &state
+                        .ctx
+                        .db,
+                )
+                .await;
+            if let Some(probe) = &row.probe_data {
+                for stream in &probe.media_streams {
+                    if stream.type_ != Some(api::MediaStreamType::Subtitle)
+                        || stream.index < crate::services::dubmux::SUBTITLE_INDEX_OFFSET
+                        || stream.is_external
+                        || !alignment::text_codec(
+                            stream
+                                .codec
+                                .as_deref(),
+                        )
+                        || (!languages.is_empty()
+                            && !stream
+                                .language
+                                .as_deref()
+                                .and_then(lang_to_two_letter)
+                                .is_some_and(|language| {
+                                    languages
+                                        .iter()
+                                        .any(|wanted| {
+                                            wanted.eq_ignore_ascii_case(&language)
+                                        })
+                                }))
+                    {
+                        continue;
+                    }
+                    if allow_extraction
+                        || alignment::cached_embedded_subtitle(
+                            state,
+                            &row,
+                            item,
+                            stream.index,
+                        )
+                        .await
+                        .is_some()
+                    {
+                        available.insert(stream.index);
+                        // A cached external copy is usable even when the device
+                        // cannot embed ASS and remote extraction is disabled.
+                        if !source
+                            .media_streams
+                            .iter()
+                            .any(|s| s.index == stream.index)
+                        {
+                            source
+                                .media_streams
+                                .push(stream.clone());
+                        }
+                    }
+                }
+            }
+        }
+        source
+            .media_streams
+            .retain(|stream| {
+                stream.type_ != Some(api::MediaStreamType::Subtitle)
+                    || stream.is_external
+                    || stream.index < crate::services::dubmux::SUBTITLE_INDEX_OFFSET
+                    || available.contains(&stream.index)
+            });
+        if source
+            .default_subtitle_stream_index
+            .is_some_and(|index| {
+                index >= 0
+                    && !source
+                        .media_streams
+                        .iter()
+                        .any(|stream| stream.index == index)
+            })
+        {
+            source.default_subtitle_stream_index = None;
+        }
+    }
+}
+
+/// Validate addon tracks and inject the surviving tracks through the shared
+/// filtering, labeling, and cache-backed sync restoration path.
 pub(crate) async fn inject_prefetched_external_subtitles(
     state: &AppState,
     media_sources: &mut [api::MediaSourceInfo],
@@ -3147,6 +3257,8 @@ pub(crate) async fn inject_prefetched_external_subtitles(
     release_ready_first_redirect: bool,
     empty_gate_policy: EmptySubtitleGatePolicy,
 ) {
+    retain_servable_dub_subtitles(state, media_sources, item_id, device_id, sub_langs)
+        .await;
     let subs = validate_external_subtitles_for_advertising(
         state,
         item_id,
