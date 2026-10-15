@@ -3,6 +3,19 @@
 Current delivery behavior is documented in README.md and SYNCHRONOUS-DELIVERY.md.
 The dated investigations below describe the earlier immediate-original behavior.
 
+## Cue mapping and SRT formatting — 2026-10-15
+
+Worker v6 accepts ALASS's harmless normalization of inline styling or whitespace
+when every cue still has the same visible dialogue in the same order. Cue count,
+words and punctuation must match. The output always copies only the proposed
+timestamps onto the untouched original cues, retaining their original styling
+and text. Missing/reordered cues or changed dialogue remain errors.
+
+This fixes a rejected Infinity Castle pair whose seven italic-formatting
+differences caused the online original to remain the fallback. It changes no
+timing algorithm, provider budget, request wait, or model setting, and adds no
+title-specific offset. The worker result-cache version changes with this fix.
+
 User requested the fast timing path without multilingual-model validation. Production Engine no longer constructs Encoder, loads ONNX/tokenizer, or calls semantic/exact-language validation. Those helpers remain available only for historical offline comparisons. Model files may remain installed but are unused. Version and result-cache namespace changed so old rejected/accepted results cannot hide the new behavior.
 
 ## Eligibility in remux

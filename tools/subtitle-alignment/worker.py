@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import pysubs2
 
-VERSION = "embedded-text-v5-change-label"
+VERSION = "embedded-text-v6-formatting-safe-map"
 ROOT = Path(os.environ.get("ALIGN_RUNTIME", "/root/remux-alignment-runtime"))
 MAX_BYTES = 2_000_000
 MAX_CUES = 5000
@@ -196,9 +196,13 @@ class Engine:
                                check=True,timeout=20,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 candidate=pysubs2.load(str(p/'result.srt'))
                 # ALASS supplies timestamps; the original supplies all dialogue.
-                # Validate its serialized cue mapping before copying any times.
+                # ALASS can normalize inline styling/whitespace in its SRT
+                # output. Require the same visible dialogue in the same cue
+                # order, then copy ONLY timestamps onto the untouched original.
                 serialized=pysubs2.load(str(p/'external.srt'))
-                if len(candidate)!=len(original) or any(a.text!=b.text for a,b in zip(serialized,candidate)):
+                if len(candidate)!=len(original) or any(
+                        ' '.join(a.plaintext.split()) != ' '.join(b.plaintext.split())
+                        for a,b in zip(serialized,candidate)):
                     raise ValueError('alignment changed cue mapping')
                 timed=copy.deepcopy(original)
                 for cue, proposed in zip(timed,candidate):

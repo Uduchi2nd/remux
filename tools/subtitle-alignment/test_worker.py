@@ -43,6 +43,41 @@ class ValidationTests(unittest.TestCase):
             s=cues().to_string('srt');result=worker.Engine().align(s,s)
             self.assertFalse(result['report']['timing_changed'])
 
+    def test_alass_formatting_normalization_keeps_original_dialogue_and_styles(self):
+        def propose(args, **kwargs):
+            source=pysubs2.load(args[2])
+            self.assertIn(' {\\i0}', source[12].text)
+            source[12].text=source[12].text.replace(' {\\i0}', '{\\i0}')
+            source.shift(ms=17000)
+            source.save(args[3], keep_ssa_tags=True)
+        with tempfile.TemporaryDirectory() as d, patch.object(worker,'ROOT',Path(d)), \
+             patch.object(worker.subprocess,'run',side_effect=propose), \
+             patch.object(worker,'Encoder',side_effect=AssertionError('model called')):
+            source=cues()
+            source[12].text=r'{\i1}Distinct dialogue number 12 {\i0}'
+            result=worker.Engine().align(source.to_string('srt',keep_ssa_tags=True), source.to_string('srt'))
+            self.assertTrue(result['report']['accepted'])
+            self.assertTrue(result['report']['timing_changed'])
+            aligned=parse(result['subtitle'])
+            self.assertEqual([cue.text for cue in aligned],[cue.text for cue in source])
+            self.assertEqual(aligned[12].start, source[12].start+17000)
+
+    def test_alass_dialogue_changes_and_missing_cues_still_reject(self):
+        for change in ['word','punctuation','missing','order']:
+            with self.subTest(change=change):
+                def propose(args, **kwargs):
+                    source=pysubs2.load(args[2])
+                    if change=='word': source[12].text='Different dialogue number 12'
+                    if change=='punctuation': source[12].text+='!'
+                    if change=='missing': del source[12]
+                    if change=='order': source[12].text,source[13].text=source[13].text,source[12].text
+                    source.save(args[3],keep_ssa_tags=True)
+                with tempfile.TemporaryDirectory() as d, patch.object(worker,'ROOT',Path(d)), \
+                     patch.object(worker.subprocess,'run',side_effect=propose):
+                    source=cues().to_string('srt')
+                    with self.assertRaisesRegex(ValueError,'cue mapping'):
+                        worker.Engine().align(source,source)
+
     def test_structural_checks_reject_corrupt_output(self):
         s=cues()
         for change in ['text','negative','duration','order']:
