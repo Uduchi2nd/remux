@@ -1907,7 +1907,7 @@ def _parse_range(h, total):
     return a, min(b, total - 1)
 
 
-def _serve_slots(request, offs, slots, total, get_path, label, etag=None):
+def _serve_slots(request, offs, slots, total, get_path, label, etag=None, before_body=None):
     """Serve a virtual file made of fixed-size slots (segment bytes, then
     MPEG-TS null packets) with HTTP range support. get_path(i) produces or
     returns segment i (raises HTTPException/any on failure)."""
@@ -1930,6 +1930,8 @@ def _serve_slots(request, offs, slots, total, get_path, label, etag=None):
     status = 206 if rng else 200
     if request.method == "HEAD":
         return Response(status_code=status, headers=headers, media_type="video/mp2t")
+    if before_body is not None:
+        before_body()
     first = bisect.bisect_right(offs, a) - 1
     try:
         first_path = get_path(first)
@@ -2038,9 +2040,9 @@ def seekable_file(dub_id: str, video_id: str, request: Request):
     video_url = request.query_params.get("video") or m.get("video_url")
     if not video_url:
         raise HTTPException(400, "video url required (query ?video=)")
-    _open_session(k, dub_id, m, video_url)
     return _serve_slots(request, offs, slots, total,
-                        lambda i: _ensure_segment(k, dub_id, i), f"file {k}", etag)
+                        lambda i: _ensure_segment(k, dub_id, i), f"file {k}", etag,
+                        before_body=lambda: _open_session(k, dub_id, m, video_url))
 
 
 @app.api_route("/mux/{dub_id}/{video_id}/{seg}", methods=["GET", "HEAD"])

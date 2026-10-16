@@ -135,6 +135,13 @@ class SeekableFileTests(unittest.TestCase):
         self.assertEqual(result["file_size"], server._file_layout(self.key, "dub")[2])
         self.assertGreater(result["file_size"], 752)
 
+    def test_unsatisfiable_range_does_not_open_a_mux_session(self):
+        with patch.object(server, "_load_match", return_value={"verdict": "accept", "video_url": "https://offline.invalid"}), \
+             patch.object(server, "_file_layout", return_value=([0, 376], [376, 940], 1316)), \
+             patch.object(server, "_open_session", side_effect=AssertionError("invalid range started a mux")):
+            response = server.seekable_file("dub", "hq", request(range="bytes=1316-"))
+        self.assertEqual(response.status_code, 416)
+
 
 if __name__ == "__main__":
     unittest.main()
