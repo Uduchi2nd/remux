@@ -1759,12 +1759,7 @@ pub(crate) fn inject_sidecar_subtitles(
     source: &mut api::MediaSourceInfo,
     subtitles: Vec<crate::addons::SubtitleInfo>,
 ) -> Vec<SidecarSubtitleRoute> {
-    let next_idx = source
-        .media_streams
-        .iter()
-        .map(|stream| stream.index)
-        .max()
-        .map_or(0, |index| index + 1);
+    let next_idx = source.next_external_stream_index();
 
     subtitles
         .into_iter()
@@ -2113,7 +2108,8 @@ async fn subtitles_stream_inner(
             let next_idx = next_external_subtitle_index(
                 embedded_indices
                     .iter()
-                    .copied(),
+                    .copied()
+                    .chain(resolved_probe.native_stream_index_max),
                 sidecar_routes
                     .as_deref()
                     .into_iter()
@@ -2596,6 +2592,7 @@ pub(crate) fn filter_playback_embedded_subtitles(
     subtitle_mode: remux_sdks::remux::EmbeddedSubtitleHandling,
     dedup: SubtitleDedupSettings,
 ) {
+    source.reserve_native_stream_indices();
     source
         .media_streams
         .retain(|stream| {
@@ -2978,12 +2975,7 @@ fn append_external_subtitles_inner(
         if !has_real_probe_data(source) {
             continue;
         }
-        let next_idx = source
-            .media_streams
-            .iter()
-            .map(|s| s.index)
-            .max()
-            .map_or(0, |m| m + 1);
+        let next_idx = source.next_external_stream_index();
         if let Some(ctx) = ctx {
             remember_external_base(ctx, item_id, source.id, next_idx);
         }
@@ -4833,7 +4825,7 @@ mod tests {
     }
 
     #[test]
-    fn external_subtitle_resolution_uses_the_filtered_probe_view() {
+    fn external_subtitle_resolution_keeps_native_indices_after_filtering() {
         let mut probe = source_with_subtitles(vec![
             api::MediaStream {
                 index: 0,
@@ -4873,8 +4865,8 @@ mod tests {
         let profile = no_embed_profile();
 
         // This mirrors the route's reconstruction for a remote source: the
-        // unsupported embedded track is absent from PlaybackInfo, so the
-        // online track starts immediately after the video and two audio tracks.
+        // unsupported embedded track is absent from PlaybackInfo, but remains
+        // physically in the file. It still reserves its original index.
         filter_playback_embedded_subtitles(
             &mut probe,
             std::slice::from_ref(&external),
@@ -4892,10 +4884,11 @@ mod tests {
             next_external_subtitle_index(
                 embedded_indices
                     .iter()
-                    .copied(),
+                    .copied()
+                    .chain(probe.native_stream_index_max),
                 []
             ),
-            3
+            111
         );
         assert!(!embedded_indices.contains(&110));
 
@@ -4912,9 +4905,152 @@ mod tests {
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].id, "online-vie");
         assert_eq!(
-            external_subtitle_candidate_index(3, 3, None, scored.len()),
+            external_subtitle_candidate_index(111, 111, None, scored.len()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn item_and_playback_external_tracks_cannot_reuse_hidden_english_indices() {
+        for item_detail in [true, false] {
+            let mut source = source_with_subtitles(vec![
+                api::MediaStream {
+                    index: 0,
+                    type_: Some(api::MediaStreamType::Video),
+                    ..Default::default()
+                },
+                api::MediaStream {
+                    index: 3,
+                    type_: Some(api::MediaStreamType::Audio),
+                    ..Default::default()
+                },
+                api::MediaStream {
+                    index: 4,
+                    type_: Some(api::MediaStreamType::Subtitle),
+                    codec: Some("ass".into()),
+                    language: Some("eng".into()),
+                    ..Default::default()
+                },
+                api::MediaStream {
+                    index: 5,
+                    type_: Some(api::MediaStreamType::Subtitle),
+                    codec: Some("ass".into()),
+                    language: Some("eng".into()),
+                    ..Default::default()
+                },
+                api::MediaStream {
+                    index: 23,
+                    type_: Some(api::MediaStreamType::Subtitle),
+                    codec: Some("ass".into()),
+                    language: Some("vie".into()),
+                    ..Default::default()
+                },
+            ]);
+            source.remux = Some(api::MediaSourceRemuxInfo {
+                source: Some(api::ProbeOrigin::Ffprobe),
+                ..Default::default()
+            });
+            let subtitles: Vec<_> = ["eng", "vie"]
+                .into_iter()
+                .map(|language| crate::addons::SubtitleInfo {
+                    id: format!("online-{language}"),
+                    url: Some(crate::stream::StreamDescriptor::http(format!(
+                        "https://offline.invalid/{language}.srt"
+                    ))),
+                    lang: Some(language.into()),
+                    is_forced: false,
+                    is_hi: false,
+                    filename: None,
+                    from_trusted: None,
+                    ai_translated: None,
+                })
+                .collect();
+            if item_detail {
+                source.reserve_native_stream_indices();
+                source
+                    .media_streams
+                    .retain(|stream| {
+                        stream.type_ != Some(api::MediaStreamType::Subtitle)
+                    });
+            } else {
+                filter_playback_embedded_subtitles(
+                    &mut source,
+                    &subtitles,
+                    Some(&no_embed_profile()),
+                    false,
+                    remux_sdks::remux::EmbeddedSubtitleHandling::Burn,
+                    DEDUP_ON,
+                );
+            }
+            let id = Uuid::new_v4();
+            append_external_subtitles(
+                std::slice::from_mut(&mut source),
+                &subtitles,
+                &["en".into(), "vi".into()],
+                Some(&no_embed_profile()),
+                id,
+                "fixture-token",
+                DEDUP_ON,
+            );
+            let tracks: Vec<_> = source
+                .media_streams
+                .iter()
+                .filter(|stream| stream.is_external)
+                .collect();
+            assert_eq!(tracks.len(), 2, "item_detail={item_detail}");
+            assert_eq!(tracks[0].index, 24);
+            assert_eq!(tracks[1].index, 25);
+            assert_eq!(
+                tracks[1]
+                    .language
+                    .as_deref(),
+                Some("vie")
+            );
+            assert!(
+                tracks[1]
+                    .delivery_url
+                    .as_ref()
+                    .unwrap()
+                    .contains("/Subtitles/25/")
+            );
+        }
+    }
+
+    #[test]
+    fn sidecars_reserve_hidden_native_tracks_before_addon_tracks() {
+        let mut source = source_with_subtitles(vec![
+            api::MediaStream {
+                index: 0,
+                type_: Some(api::MediaStreamType::Video),
+                ..Default::default()
+            },
+            api::MediaStream {
+                index: 23,
+                type_: Some(api::MediaStreamType::Subtitle),
+                ..Default::default()
+            },
+        ]);
+        source.reserve_native_stream_indices();
+        source
+            .media_streams
+            .retain(|stream| stream.type_ != Some(api::MediaStreamType::Subtitle));
+        let routes = inject_sidecar_subtitles(
+            &mut source,
+            vec![crate::addons::SubtitleInfo {
+                id: "sidecar-vie".into(),
+                url: Some(crate::stream::StreamDescriptor::http(
+                    "https://offline.invalid/vie.srt",
+                )),
+                lang: Some("vie".into()),
+                is_forced: false,
+                is_hi: false,
+                filename: None,
+                from_trusted: None,
+                ai_translated: None,
+            }],
+        );
+        assert_eq!(routes[0].index, 24);
+        assert_eq!(source.next_external_stream_index(), 25);
     }
 
     fn source_with_subtitles(streams: Vec<api::MediaStream>) -> api::MediaSourceInfo {

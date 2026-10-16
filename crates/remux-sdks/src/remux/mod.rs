@@ -2635,6 +2635,10 @@ pub struct MediaSourceInfo {
     //pub media_attachments: Option<Vec<MediaAttachment>>,
     #[default(vec![])]
     pub media_streams: Vec<MediaStream>,
+    /// Request-local reservation for tracks still physically in the file even
+    /// after they are removed from the client-facing subtitle list.
+    #[serde(skip)]
+    pub native_stream_index_max: Option<i64>,
     pub name: Option<String>,
     pub open_token: Option<String>,
     pub path: Option<String>,
@@ -3072,6 +3076,25 @@ pub struct MediaSourceRemuxInfo {
 }
 
 impl MediaSourceInfo {
+    pub fn reserve_native_stream_indices(&mut self) {
+        self.native_stream_index_max = self
+            .media_streams
+            .iter()
+            .filter(|stream| !stream.is_external)
+            .map(|stream| stream.index)
+            .chain(self.native_stream_index_max)
+            .max();
+    }
+
+    pub fn next_external_stream_index(&self) -> i64 {
+        self.media_streams
+            .iter()
+            .map(|stream| stream.index)
+            .chain(self.native_stream_index_max)
+            .max()
+            .map_or(0, |index| index + 1)
+    }
+
     /// True when this source's facts are a filename guess, not a completed
     /// probe. Callers deciding whether to skip a real probe/RemuxDB lookup
     /// must check this — `video_stream().is_some()` alone is not enough.
@@ -7667,6 +7690,31 @@ mod tests {
     fn format_size_rule_falls_back_to_mib() {
         let v = 500 * 1024 * 1024;
         assert_eq!(format_size_rule(NumericOp::Gt, v), "> 500.00 MiB");
+    }
+
+    #[test]
+    fn native_index_reservation_is_internal_and_survives_repeated_filtering() {
+        let mut source = MediaSourceInfo {
+            media_streams: vec![MediaStream {
+                index: 23,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        source.reserve_native_stream_indices();
+        source
+            .media_streams
+            .clear();
+        source.reserve_native_stream_indices();
+        assert_eq!(source.next_external_stream_index(), 24);
+        let value = serde_json::to_value(&source).unwrap();
+        assert!(
+            value
+                .get("NativeStreamIndexMax")
+                .is_none()
+        );
+        let decoded: MediaSourceInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.native_stream_index_max, None);
     }
 
     fn source_with_subs() -> MediaSourceInfo {

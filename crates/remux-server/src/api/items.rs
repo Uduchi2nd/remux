@@ -2175,6 +2175,10 @@ async fn item_for_user(
     {
         if let Some(ref mut sources) = base_item.media_sources {
             for source in sources.iter_mut() {
+                // The file still contains these tracks. Reserve their indexes
+                // before filtering, or an online Vietnamese subtitle can reuse
+                // an embedded English index in a direct-play client.
+                source.reserve_native_stream_indices();
                 source
                     .media_streams
                     .retain(|s| s.type_ != Some(api::MediaStreamType::Subtitle));

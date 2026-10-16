@@ -16,6 +16,26 @@ Local implementation is in progress: stream-list job queue and seven-day aligned
 
 Keep changes server-side. Retire the remux fork when stock upstream demonstrates equivalent behavior with the same VNPHIM deployment. A clean rebase, an empty cherry-pick, or a conflict is not proof of compatibility.
 
+## External subtitle indices after native-track filtering (2026-10-16)
+
+An external subtitle must retain a separate index from every track physically
+present in a direct-play file. Infinity Castle's second stream advertised its
+Vietnamese online subtitle at index 5, which was also an embedded English ASS
+track in the original MKV. The served online file contained Vietnamese; client
+selection could still resolve the colliding native index.
+
+Reserve the original native index maximum before filtering item-detail and
+PlaybackInfo subtitle lists. Sidecars, addon subtitles, and delivery fallback
+all allocate after that reservation. The reservation is request-local and is
+excluded from JSON; source identities, cached subtitle bodies, timing, and
+delivery architecture are unchanged. Regression controls cover the original
+English-at-5/Vietnamese-at-23 layout, both metadata paths, sidecar allocation,
+and preservation of the reservation through repeated filtering.
+
+Retire this patch when upstream preserves the native index range through both
+metadata paths and direct-play clients select the intended external language
+with the same MKV, including hidden embedded tracks and added sidecars.
+
 ## What currently belongs in remux
 
 | Change | Purpose | Retirement evidence |
