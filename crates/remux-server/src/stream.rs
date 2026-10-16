@@ -348,10 +348,14 @@ const CONFIRMED_MISSING_TTL: std::time::Duration =
 // every version's redirect chain — for Torrentio versions one Torrentio
 // request each, which helped trip its per-IP limit. Debrid CDN links stay
 // valid for hours; 20 min keeps repeated opens off the resolvers.
-const OTHER_HEAD_RESULT_TTL: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+const OTHER_HEAD_RESULT_TTL: std::time::Duration =
+    std::time::Duration::from_secs(20 * 60);
 static STREAM_HEAD_CACHE: std::sync::LazyLock<
     std::sync::Mutex<
-        std::collections::HashMap<(Uuid, u64), (std::time::Instant, bool, Option<String>)>,
+        std::collections::HashMap<
+            (Uuid, u64),
+            (std::time::Instant, bool, Option<String>),
+        >,
     >,
 > = std::sync::LazyLock::new(
     || std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -413,14 +417,25 @@ async fn check_http_stream(id: Uuid, info: &StreamInfo) -> HttpHeadResult {
             .then(|| {
                 request_headers
                     .is_empty()
-                    .then(|| safe_redirect_target(url, response.url().as_str()))
+                    .then(|| {
+                        safe_redirect_target(
+                            url,
+                            response
+                                .url()
+                                .as_str(),
+                        )
+                    })
                     .flatten()
             })
             .flatten();
         // A resolver's rate-limit/error clip (AIOStreams /static/429.mp4,
         // Torrentio /videos/limits_exceeded_v2.mp4) is never the release:
         // do not hand it out, and ask again soon.
-        let placeholder = is_placeholder_url(response.url().as_str());
+        let placeholder = is_placeholder_url(
+            response
+                .url()
+                .as_str(),
+        );
         let redirected_url = if placeholder { None } else { redirected_url };
         let ttl = if missing {
             CONFIRMED_MISSING_TTL
@@ -458,7 +473,9 @@ fn safe_redirect_target(original_url: &str, redirected_url: &str) -> Option<Stri
 /// Timeouts, auth failures, rate limits, and server errors remain eligible for
 /// playback because they may be transient or client-specific.
 pub async fn stream_is_confirmed_missing(id: Uuid, info: &StreamInfo) -> bool {
-    check_http_stream(id, info).await.confirmed_missing
+    check_http_stream(id, info)
+        .await
+        .confirmed_missing
 }
 
 /// Return a safe final URL after an HTTP redirect, if a successful HEAD probe
@@ -476,12 +493,16 @@ pub(crate) fn is_placeholder_url(url: &str) -> bool {
         .host_str()
         .unwrap_or("")
         .to_ascii_lowercase();
-    (host == "torrentio.strem.fun" && path.starts_with("/videos/") && path.ends_with(".mp4"))
+    (host == "torrentio.strem.fun"
+        && path.starts_with("/videos/")
+        && path.ends_with(".mp4"))
         || (path.starts_with("/static/") && path.ends_with(".mp4"))
 }
 
 pub async fn redirected_client_url(id: Uuid, info: &StreamInfo) -> Option<String> {
-    check_http_stream(id, info).await.redirected_url
+    check_http_stream(id, info)
+        .await
+        .redirected_url
 }
 
 /// Remove confirmed-gone HTTP streams from the default source ordering, but
@@ -599,21 +620,27 @@ mod confirmed_missing_tests {
             .as_deref(),
             Some("https://cdn.example/signed-file"),
         );
-        assert!(safe_redirect_target(
-            "https://addon.example/stream",
-            "https://addon.example/stream",
-        )
-        .is_none());
-        assert!(safe_redirect_target(
-            "https://addon.example/stream",
-            "http://127.0.0.1:8080/private",
-        )
-        .is_none());
-        assert!(safe_redirect_target(
-            "https://addon.example/stream",
-            "file:///private/file",
-        )
-        .is_none());
+        assert!(
+            safe_redirect_target(
+                "https://addon.example/stream",
+                "https://addon.example/stream",
+            )
+            .is_none()
+        );
+        assert!(
+            safe_redirect_target(
+                "https://addon.example/stream",
+                "http://127.0.0.1:8080/private",
+            )
+            .is_none()
+        );
+        assert!(
+            safe_redirect_target(
+                "https://addon.example/stream",
+                "file:///private/file",
+            )
+            .is_none()
+        );
     }
 }
 

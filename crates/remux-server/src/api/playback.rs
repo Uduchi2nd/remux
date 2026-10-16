@@ -2,9 +2,8 @@ use anyhow::anyhow;
 use axum::Json;
 
 use super::subtitles::{
-    SidecarSubtitleRoute, SubtitleDedupSettings,
-    filter_external_subtitles_for_source, filter_playback_embedded_subtitles,
-    inject_sidecar_subtitles, provider_filename,
+    SidecarSubtitleRoute, SubtitleDedupSettings, filter_external_subtitles_for_source,
+    filter_playback_embedded_subtitles, inject_sidecar_subtitles, provider_filename,
     save_sidecar_subtitle_routes,
 };
 use axum::{
@@ -327,7 +326,13 @@ async fn items_playbackinfo_inner(
             .user
             .id;
         tokio::spawn(async move {
-            if let Ok(Some(mut m)) = db::Media::get_by_id(&st.ctx.db, &id).await {
+            if let Ok(Some(mut m)) = db::Media::get_by_id(
+                &st.ctx
+                    .db,
+                &id,
+            )
+            .await
+            {
                 st.ctx
                     .addons
                     .fetch_subtitles(&mut m, &st.ctx, false, Some(uid))
@@ -878,7 +883,9 @@ async fn items_playbackinfo_inner(
             .device
             .access_token
             .expose(),
-        &session.device.id,
+        &session
+            .device
+            .id,
         subtitle_dedup,
         true,
         super::subtitles::EmptySubtitleGatePolicy::ProbedSources,
@@ -963,9 +970,7 @@ async fn items_playbackinfo_inner(
             &mut paired,
             ranking,
             |(_, extras)| extras.source_order_band,
-            |(source, extras)| {
-                (source.clone(), extras.allow_subtitle_extraction)
-            },
+            |(source, extras)| (source.clone(), extras.allow_subtitle_extraction),
         );
         for (source, extras) in paired {
             media_sources.push(source);
@@ -993,7 +998,9 @@ async fn items_playbackinfo_inner(
         })
     {
         crate::api::subtitles::prefetch_embedded_subtitles(
-            state.ctx.clone(),
+            state
+                .ctx
+                .clone(),
             prefetch.input_url,
             prefetch.probe,
             id,
@@ -1046,7 +1053,9 @@ async fn items_playbackinfo_inner(
         if source.id != delivery_source_id {
             super::subtitles::copy_external_subtitle_routes(
                 &state.ctx,
-                &session.device.id,
+                &session
+                    .device
+                    .id,
                 id,
                 delivery_source_id,
                 source.id,
@@ -1587,7 +1596,9 @@ async fn videos_stream_inner(
         );
         return Ok(no_streams_response().into_response());
     };
-    let descriptor = si.descriptor.clone();
+    let descriptor = si
+        .descriptor
+        .clone();
     let encoding_opts = crate::db::Settings::get_encoding_config(
         &state
             .ctx

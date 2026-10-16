@@ -1111,6 +1111,7 @@ fn restore_cached_row(
     {
         probe.size = Some(size);
     }
+    apply_mux_file_metadata(&mut row);
     Some(row)
 }
 
@@ -1166,16 +1167,60 @@ fn richer_probe(
     }
 }
 
-pub(crate) fn fill_row_probe(row: &mut db::Media) -> bool {
-    if is_dubmux_row(row)
-        && row
-            .probe_data
-            .is_none()
-    {
-        row.probe_data = Some(minimal_probe(&row_provider_pub(row)));
-        return true;
+/// The mux file has its own byte layout; an HQ probe only supplies tracks.
+/// Keep this representation when replacing those tracks or reading an older
+/// persisted probe that a carry-over refresh rebuilt from the original MKV.
+fn apply_mux_file_metadata(row: &mut db::Media) -> bool {
+    let Some(info) = row
+        .stream_info
+        .as_ref()
+    else {
+        return false;
+    };
+    let StreamDescriptor::Http { url, .. } = &info.descriptor else {
+        return false;
+    };
+    let is_file = url::Url::parse(url)
+        .ok()
+        .is_some_and(|url| {
+            url.path()
+                .ends_with("/file.ts")
+                && url
+                    .path()
+                    .contains("/mux/")
+        });
+    if !is_dubmux_row(row) || !is_file {
+        return false;
     }
-    false
+    let size = info
+        .size
+        .filter(|size| *size > 0);
+    let Some(probe) = row
+        .probe_data
+        .as_mut()
+    else {
+        return false;
+    };
+    let changed = probe.container != Some(VideoContainer::Ts)
+        || size.is_some_and(|size| probe.size != Some(size));
+    probe.container = Some(VideoContainer::Ts);
+    if let Some(size) = size {
+        probe.size = Some(size);
+    }
+    changed
+}
+
+pub(crate) fn fill_row_probe(row: &mut db::Media) -> bool {
+    if !is_dubmux_row(row) {
+        return false;
+    }
+    let filled = row
+        .probe_data
+        .is_none();
+    if filled {
+        row.probe_data = Some(minimal_probe(&row_provider_pub(row)));
+    }
+    apply_mux_file_metadata(row) || filled
 }
 
 pub(crate) fn minimal_probe(provider: &str) -> api::MediaSourceInfo {
@@ -1261,6 +1306,7 @@ fn carried_rows(
                 }
             }
         }
+        apply_mux_file_metadata(&mut row);
         out.push(row);
     }
     out
@@ -1643,6 +1689,120 @@ mod tests {
             guess
                 .media_streams
                 .len()
+        );
+    }
+
+    #[test]
+    fn carried_file_rows_refresh_tracks_without_reverting_to_release_size() {
+        let mut hq = http_media("https://cdn.invalid/current.mkv", "Movie.mkv");
+        hq.id = Uuid::new_v4();
+        let mut native = minimal_probe("original");
+        native.container = Some(VideoContainer::Mkv);
+        native.size = Some(8_492_310_456);
+        native
+            .media_streams
+            .push(MediaStream {
+                type_: Some(MediaStreamType::Subtitle),
+                index: 23,
+                codec: Some("subrip".into()),
+                language: Some("vie".into()),
+                ..Default::default()
+            });
+        hq.probe_data = Some(native);
+        let mut row = http_media(
+            &format!(
+                "https://mux.invalid/mux/{}/{}/file.ts?video=old",
+                Uuid::new_v4(),
+                hq.id
+            ),
+            "Movie.VNDub-hotphim.ts",
+        );
+        row.stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(9_870_466_992);
+        let mut original = minimal_probe("hotphim");
+        original.container = Some(VideoContainer::Ts);
+        original.size = Some(9_870_466_992);
+        row.probe_data = Some(original);
+        let rows = carried_rows(&[&row], &[&hq], &[], chrono::Utc::now().naive_utc());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, row.id);
+        let probe = rows[0]
+            .probe_data
+            .as_ref()
+            .unwrap();
+        assert_eq!(probe.size, Some(9_870_466_992));
+        assert_eq!(probe.container, Some(VideoContainer::Ts));
+        assert!(
+            probe
+                .media_streams
+                .iter()
+                .any(|track| track.type_ == Some(MediaStreamType::Subtitle)
+                    && track.index == SUBTITLE_INDEX_OFFSET + 23)
+        );
+        assert_eq!(
+            hq_url_of(&rows[0]).as_deref(),
+            Some("https://cdn.invalid/current.mkv")
+        );
+    }
+
+    #[test]
+    fn persisted_release_probe_on_mux_file_is_repaired_once() {
+        let mut row = http_media(
+            "https://mux.invalid/mux/dub/hq/file.ts?video=private",
+            "Movie.VNDub-hotphim.ts",
+        );
+        row.stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(9_870_466_992);
+        let mut wrong = minimal_probe("hotphim");
+        wrong.size = Some(8_492_310_456);
+        row.probe_data = Some(wrong);
+        assert!(fill_row_probe(&mut row));
+        assert_eq!(
+            row.probe_data
+                .as_ref()
+                .unwrap()
+                .size,
+            Some(9_870_466_992)
+        );
+        assert_eq!(
+            row.probe_data
+                .as_ref()
+                .unwrap()
+                .container,
+            Some(VideoContainer::Ts)
+        );
+        assert!(!fill_row_probe(&mut row));
+    }
+
+    #[test]
+    fn hls_rows_do_not_claim_the_seekable_file_representation() {
+        let mut row = http_media(
+            "https://mux.invalid/mux/dub/hq/master.m3u8?video=private",
+            "Movie.VNDub-hotphim.m3u8",
+        );
+        row.stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(9_870_466_992);
+        row.probe_data = Some(minimal_probe("hotphim"));
+        assert!(!fill_row_probe(&mut row));
+        assert_eq!(
+            row.probe_data
+                .as_ref()
+                .unwrap()
+                .size,
+            None
+        );
+        assert_eq!(
+            row.probe_data
+                .as_ref()
+                .unwrap()
+                .container,
+            Some(VideoContainer::Other("hls".into()))
         );
     }
 

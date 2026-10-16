@@ -2290,7 +2290,11 @@ pub struct ResumeThresholds {
 /// doesn't land in Continue Watching. The minimum can be either a percentage
 /// of runtime (Jellyfin's `MinResumePct`) or, when `min_seconds > 0`, a fixed
 /// number of seconds independent of runtime.
-pub fn resume_verdict(position_seconds: i64, runtime: i64, t: ResumeThresholds) -> (bool, bool) {
+pub fn resume_verdict(
+    position_seconds: i64,
+    runtime: i64,
+    t: ResumeThresholds,
+) -> (bool, bool) {
     if runtime <= 0 {
         return (false, false);
     }
@@ -2309,7 +2313,12 @@ mod resume_threshold_tests {
     use super::*;
 
     fn pct_only() -> ResumeThresholds {
-        ResumeThresholds { min_pct: 5, max_pct: 90, min_duration: 90, min_seconds: 0 }
+        ResumeThresholds {
+            min_pct: 5,
+            max_pct: 90,
+            min_duration: 90,
+            min_seconds: 0,
+        }
     }
 
     #[test]
@@ -2322,7 +2331,10 @@ mod resume_threshold_tests {
 
     #[test]
     fn absolute_minimum_replaces_percentage_rule() {
-        let t = ResumeThresholds { min_seconds: 60, ..pct_only() };
+        let t = ResumeThresholds {
+            min_seconds: 60,
+            ..pct_only()
+        };
         // Same 3-minute session into the movie now qualifies.
         assert_eq!(resume_verdict(176, 6720, t), (false, false));
         assert_eq!(resume_verdict(59, 6720, t), (false, true));

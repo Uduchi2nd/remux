@@ -81,7 +81,11 @@ pub(crate) fn prefetch_on_open(ctx: &AppContext, media: &db::Media, user: Uuid) 
 
 /// The episode the viewer most likely plays next: the one in progress, else
 /// the one after the last finished, else the first regular episode.
-async fn next_episode(ctx: &AppContext, series_id: Uuid, user: Uuid) -> Option<db::Media> {
+async fn next_episode(
+    ctx: &AppContext,
+    series_id: Uuid,
+    user: Uuid,
+) -> Option<db::Media> {
     let last: Option<(Uuid, i64, i64, i64)> = sqlx::query_as(
         "SELECT m.id, COALESCE(m.parent_idx, 0), COALESCE(m.idx, 0), COALESCE(s.play_count, 0) \
          FROM user_media_state s JOIN media m ON m.id = s.media_id \
