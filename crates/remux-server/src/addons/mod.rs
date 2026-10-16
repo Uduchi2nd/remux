@@ -3262,6 +3262,18 @@ fn match_probe_version<'a>(
         })
 }
 
+pub(crate) fn stream_list_is_fresh(
+    ctx: &AppContext,
+    refreshed: Option<chrono::NaiveDateTime>,
+) -> bool {
+    let ttl = ctx
+        .config
+        .stream_list_cache_ttl_secs
+        .clamp(60, 60 * 60) as i64;
+    refreshed
+        .is_some_and(|at| (chrono::Utc::now().naive_utc() - at).num_seconds() < ttl)
+}
+
 impl AddonService {
     #[tracing::instrument(skip_all, fields(title = %media.title, kind = %media.kind))]
     pub async fn refresh_streams(
@@ -3293,18 +3305,10 @@ impl AddonService {
         user_id: Option<Uuid>,
         force: bool,
     ) -> Result<()> {
-        let streams_ttl_secs = ctx
-            .config
-            .stream_list_cache_ttl_secs
-            .clamp(60, 60 * 60) as i64;
         static STREAM_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
 
         // Fast path: TTL not expired — skip the lock entirely.
-        let is_fresh = |refreshed: Option<chrono::NaiveDateTime>| {
-            refreshed.is_some_and(|r| {
-                (chrono::Utc::now().naive_utc() - r).num_seconds() < streams_ttl_secs
-            })
-        };
+        let is_fresh = |refreshed| stream_list_is_fresh(ctx, refreshed);
         if !force && is_fresh(media.streams_refreshed_at) {
             return Ok(());
         }

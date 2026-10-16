@@ -13,15 +13,20 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn cold_item_autoplay_alias_only_advertises_ready_cached_dub_text() {
-    cached_dub_item_after_refresh(false).await;
+    cached_dub_item_after_refresh(false, false).await;
 }
 
 #[tokio::test]
 async fn cold_item_restores_completed_dub_with_preparation_enabled() {
-    cached_dub_item_after_refresh(true).await;
+    cached_dub_item_after_refresh(true, false).await;
 }
 
-async fn cached_dub_item_after_refresh(preparation_enabled: bool) {
+#[tokio::test]
+async fn expired_item_returns_saved_streams_while_slow_provider_refreshes() {
+    cached_dub_item_after_refresh(true, true).await;
+}
+
+async fn cached_dub_item_after_refresh(preparation_enabled: bool, expired_list: bool) {
     let provider = httpmock::MockServer::start_async().await;
     provider
         .mock_async(|when, then| {
@@ -68,6 +73,14 @@ async fn cached_dub_item_after_refresh(preparation_enabled: bool) {
             then.status(503);
         })
         .await;
+    let refresh = provider
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path_matches(regex::Regex::new(r"^/stream/movie/.+\.json$").unwrap());
+            then.status(503)
+                .delay(std::time::Duration::from_secs(3));
+        })
+        .await;
     let data = tempfile::tempdir().unwrap();
     let (app, ctx) = init_app_with_ctx(Config {
         data_dir: data
@@ -110,6 +123,11 @@ async fn cached_dub_item_after_refresh(preparation_enabled: bool) {
     let auth =
         HeaderValue::from_str(&format!("{auth_base}, Token=\"{token}\"")).unwrap();
     let now = Utc::now().naive_utc();
+    let list_refreshed = if expired_list {
+        now - chrono::Duration::hours(1)
+    } else {
+        now
+    };
     let created: serde_json::Value = server.post("/addons").add_header(AUTHORIZATION, auth.clone())
         .json(&json!({"name":"cached-subtitle-fixture", "resources":["stream"],
             "preset":{"kind":"stremio","config":{"manifest_url":provider.url("/manifest.json")}}}))
@@ -221,7 +239,7 @@ async fn cached_dub_item_after_refresh(preparation_enabled: bool) {
     // Media::save does not write the stream-refresh timestamp. Keep the stored
     // stream list fresh so this test never asks a provider for replacement rows.
     sqlx::query("UPDATE media SET streams_refreshed_at=? WHERE id=?")
-        .bind(now)
+        .bind(list_refreshed)
         .bind(movie.id)
         .execute(&ctx.db)
         .await
@@ -240,15 +258,26 @@ async fn cached_dub_item_after_refresh(preparation_enabled: bool) {
     // The provider refresh has replaced its list. Only a completed-cache
     // lookup can bring this older synthetic row back, in either job mode.
     sqlx::query("UPDATE media SET updated_at=? WHERE id=?")
-        .bind(now - chrono::Duration::days(1))
+        .bind(if expired_list {
+            list_refreshed + chrono::Duration::seconds(1)
+        } else {
+            now - chrono::Duration::days(1)
+        })
         .bind(row.id)
         .execute(&ctx.db)
         .await
         .unwrap();
+    let started = std::time::Instant::now();
     let response = server
         .get(&format!("/items/{}", movie.id))
         .add_header(AUTHORIZATION, auth.clone())
         .await;
+    if expired_list {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a saved stream list must not wait for the three-second provider"
+        );
+    }
     let body: serde_json::Value = response.json();
     let streams = body["MediaSources"][0]["MediaStreams"]
         .as_array()
@@ -349,6 +378,32 @@ async fn cached_dub_item_after_refresh(preparation_enabled: bool) {
         0,
         "cache restoration must not prepare media"
     );
+    if expired_list {
+        for _ in 0..20 {
+            if refresh
+                .hits_async()
+                .await
+                > 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            refresh
+                .hits_async()
+                .await,
+            1,
+            "the delayed provider must still refresh once in the background"
+        );
+    } else {
+        assert_eq!(
+            refresh
+                .hits_async()
+                .await,
+            0
+        );
+    }
     ctx.shutdown()
         .await;
 }

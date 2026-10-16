@@ -1795,29 +1795,55 @@ async fn item_for_user(
                 ),
             );
         }
-        state
-            .ctx
-            .addons
-            .refresh_streams(
-                &mut media,
+        // An expired list must not turn a cached detail page into a provider
+        // request. Keep showing the saved candidates while the existing
+        // throttled prefetch worker refreshes them and prepares new dub rows.
+        let cached_refresh =
+            matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
+                && !crate::addons::stream_list_is_fresh(
+                    &state.ctx,
+                    media.streams_refreshed_at,
+                )
+                && !media
+                    .clone()
+                    .streams(
+                        &state
+                            .ctx
+                            .db,
+                    )
+                    .await?
+                    .is_empty();
+        if cached_refresh {
+            crate::services::open_prefetch::prefetch_on_open(
                 &state.ctx,
-                Some(
-                    session
-                        .user
-                        .id,
-                ),
-            )
-            .await
-            .log_err("failed to refresh sources");
-        // PATCH (uduchi2nd): opening the detail page starts dub preparation
-        // (see services::dubmux::prepare_on_open); background, throttled.
-        crate::services::dubmux::prepare_on_open(
-            &state.ctx,
-            &media,
-            session
-                .user
-                .id,
-        );
+                &media,
+                session
+                    .user
+                    .id,
+            );
+        } else {
+            state
+                .ctx
+                .addons
+                .refresh_streams(
+                    &mut media,
+                    &state.ctx,
+                    Some(
+                        session
+                            .user
+                            .id,
+                    ),
+                )
+                .await
+                .log_err("failed to refresh sources");
+            crate::services::dubmux::prepare_on_open(
+                &state.ctx,
+                &media,
+                session
+                    .user
+                    .id,
+            );
+        }
     }
     let refreshed_at = detail_started.elapsed();
 

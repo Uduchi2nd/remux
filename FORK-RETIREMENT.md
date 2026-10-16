@@ -474,3 +474,13 @@ cover stale restoration, unchanged reads and changed metadata in both automatic
 preparation modes; filesystem tests exercise expiry and count/byte eviction.
 Retire when upstream preserves these behaviors without read-side write or
 filesystem-scan amplification.
+
+Expired-list follow-up: a saved movie/episode stream list is returned while the
+existing throttled open-prefetch worker refreshes it; only items without saved
+candidates await initial discovery. Prefetch shares the normal freshness check,
+does not consume its retry slot for an already fresh list, and cannot throttle
+longer than a configured short list TTL. A delayed-provider public HTTP control
+checks immediate cached Item delivery and one background refresh. Transient
+external-subtitle fetch failures back off for30seconds instead of retrying a
+broken provider on every Item; retained valid text wins before this check, and
+the existing longer rejection of empty/corrupt text remains unchanged.

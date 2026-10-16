@@ -24,14 +24,17 @@ const GAP: Duration = Duration::from_secs(1);
 static SEEN: Mutex<Option<HashMap<Uuid, Instant>>> = Mutex::new(None);
 static ONE_AT_A_TIME: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
-fn first_time(id: Uuid) -> bool {
+fn first_time(id: Uuid, cooldown: Duration) -> bool {
     let Ok(mut guard) = SEEN.lock() else {
         return false;
     };
     let map = guard.get_or_insert_with(Default::default);
     let now = Instant::now();
     map.retain(|_, t| now.duration_since(*t) < PER_ITEM);
-    if map.contains_key(&id) {
+    if map
+        .get(&id)
+        .is_some_and(|last| now.duration_since(*last) < cooldown)
+    {
         return false;
     }
     map.insert(id, now);
@@ -40,11 +43,26 @@ fn first_time(id: Uuid) -> bool {
 
 /// Called when an item document is served; returns at once.
 pub(crate) fn prefetch_on_open(ctx: &AppContext, media: &db::Media, user: Uuid) {
+    let cooldown = PER_ITEM.min(Duration::from_secs(
+        ctx.config
+            .stream_list_cache_ttl_secs
+            .clamp(60, 60 * 60),
+    ));
     if !matches!(
         media.kind,
         db::MediaKind::Movie | db::MediaKind::Episode | db::MediaKind::Series
-    ) || !first_time(media.id)
+    ) {
+        return;
+    }
+    if media.kind != db::MediaKind::Series
+        && crate::addons::stream_list_is_fresh(ctx, media.streams_refreshed_at)
     {
+        // A no-op stream refresh must not use the stale-list retry slot, but
+        // opening a fresh page still starts the existing throttled dub job.
+        crate::services::dubmux::prepare_on_open(ctx, media, user);
+        return;
+    }
+    if !first_time(media.id, cooldown) {
         return;
     }
     let ctx = ctx.clone();
@@ -52,7 +70,7 @@ pub(crate) fn prefetch_on_open(ctx: &AppContext, media: &db::Media, user: Uuid) 
     tokio::spawn(async move {
         let target = if media.kind == db::MediaKind::Series {
             match next_episode(&ctx, media.id, user).await {
-                Some(ep) if first_time(ep.id) => ep,
+                Some(ep) if first_time(ep.id, cooldown) => ep,
                 _ => return,
             }
         } else {

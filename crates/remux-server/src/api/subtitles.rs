@@ -1184,6 +1184,23 @@ async fn fetch_external_subtitle_bytes(
             "upstream subtitle was recently rejected as invalid"
         ));
     }
+    let result = fetch_external_subtitle_uncached(state, descriptor).await;
+    // A transient 5xx/timeout must not be retried for every source and every
+    // repeated Item document. Valid retained text is checked before this path;
+    // permanent invalid bodies keep their existing longer rejection period.
+    if result.is_err() && !gate::known_invalid(&state.ctx, descriptor) {
+        state
+            .ctx
+            .store
+            .save(gate::invalid_key(descriptor), true, Duration::from_secs(30));
+    }
+    result
+}
+
+async fn fetch_external_subtitle_uncached(
+    state: &AppState,
+    descriptor: &crate::stream::StreamDescriptor,
+) -> anyhow::Result<axum::body::Bytes> {
     let resp = match descriptor {
         crate::stream::StreamDescriptor::Opendal { addon_id, .. } => {
             let addon = state
@@ -1243,7 +1260,7 @@ async fn fetch_external_subtitle_bytes(
         .ctx
         .store
         .save(
-            cache_key,
+            gate::raw_key(descriptor),
             bytes.clone(),
             std::time::Duration::from_secs(1800),
         );
@@ -6543,6 +6560,87 @@ mod advertised_external_route_tests {
 #[cfg(test)]
 mod persistence_write_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transient_fetch_failure_backs_off_and_recovers_without_hiding_cached_text()
+    {
+        let (_server, guard, _token) =
+            crate::integration_test::authenticated_server().await;
+        let ctx = guard
+            .0
+            .clone();
+        let state = crate::AppState {
+            tasks: crate::tasks::TaskService::new(ctx.clone())
+                .await
+                .unwrap(),
+            ctx,
+        };
+        let provider = httpmock::MockServer::start_async().await;
+        let failure = provider
+            .mock_async(|when, then| {
+                when.path("/track.srt");
+                then.status(502);
+            })
+            .await;
+        let descriptor =
+            crate::stream::StreamDescriptor::http(provider.url("/track.srt"));
+        assert!(
+            fetch_external_subtitle_bytes(&state, &descriptor)
+                .await
+                .is_err()
+        );
+        assert!(
+            fetch_external_subtitle_bytes(&state, &descriptor)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            failure
+                .hits_async()
+                .await,
+            1
+        );
+        failure
+            .delete_async()
+            .await;
+        let recovery = provider
+            .mock_async(|when, then| {
+                when.path("/track.srt");
+                then.status(200)
+                    .body("1\n00:00:01,000 --> 00:00:02,000\nXin chao\n\n");
+            })
+            .await;
+        // Simulate the short backoff expiring and the upstream recovering.
+        state
+            .ctx
+            .store
+            .delete(gate::invalid_key(&descriptor));
+        assert!(
+            fetch_external_subtitle_bytes(&state, &descriptor)
+                .await
+                .is_ok()
+        );
+        state
+            .ctx
+            .store
+            .save(
+                gate::invalid_key(&descriptor),
+                true,
+                Duration::from_secs(30),
+            );
+        assert!(
+            fetch_external_subtitle_bytes(&state, &descriptor)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            recovery
+                .hits_async()
+                .await,
+            1,
+            "validated raw text must be reused even during provider backoff"
+        );
+    }
 
     #[test]
     fn batched_pruning_enforces_retention_counts_and_combined_bytes() {
