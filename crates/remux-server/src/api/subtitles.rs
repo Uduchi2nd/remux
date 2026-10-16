@@ -76,7 +76,10 @@ fn good_track_key(
         "source": source_id,
         "track": subtitle_id,
         "language": language.map(str::trim).map(str::to_ascii_lowercase),
-        "format": format.map(str::to_ascii_lowercase),
+        "format": format.map(|format| {
+            api::SubtitleCodec::from_codec_name(&format.to_ascii_lowercase())
+                .to_string()
+        }),
     });
     identity.sort_all_objects();
     Some(format!(
@@ -1530,6 +1533,10 @@ struct ExternalSubtitleRoute {
     subtitle: crate::addons::SubtitleInfo,
 }
 
+// Item and PlaybackInfo requests may publish tracks concurrently. Keep their
+// short, synchronous route updates together so an index cannot change language.
+static EXTERNAL_SUBTITLE_ROUTES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn external_subtitle_routes_key(
     device_id: &str,
     item_id: Uuid,
@@ -1545,12 +1552,95 @@ fn save_external_subtitle_routes(
     media_source_id: Uuid,
     routes: Vec<ExternalSubtitleRoute>,
 ) {
+    update_external_subtitle_routes(
+        ctx,
+        device_id,
+        item_id,
+        media_source_id,
+        |saved| {
+            for route in routes {
+                if let Some(previous) = saved
+                    .iter_mut()
+                    .find(|r| r.index == route.index)
+                {
+                    *previous = route;
+                } else {
+                    saved.push(route);
+                }
+            }
+        },
+    );
+}
+
+fn update_external_subtitle_routes<T>(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    media_source_id: Uuid,
+    update: impl FnOnce(&mut Vec<ExternalSubtitleRoute>) -> T,
+) -> T {
+    let _guard = EXTERNAL_SUBTITLE_ROUTES_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut routes =
+        load_external_subtitle_routes(ctx, device_id, item_id, media_source_id)
+            .as_deref()
+            .cloned()
+            .unwrap_or_default();
+    let result = update(&mut routes);
     ctx.store
         .save(
             external_subtitle_routes_key(device_id, item_id, media_source_id),
             routes,
             std::time::Duration::from_secs(6 * 60 * 60),
         );
+    result
+}
+
+fn assign_external_subtitle_routes(
+    previous: &mut Vec<ExternalSubtitleRoute>,
+    subtitles: &[&crate::addons::SubtitleInfo],
+    first_index: i64,
+) -> Vec<ExternalSubtitleRoute> {
+    let mut next_index = first_index;
+    subtitles
+        .iter()
+        .map(|subtitle| {
+            // Dedup can hide a track once its release subtitle becomes cached. Its
+            // published URL must remain usable, and another language must not take
+            // over its index. Refresh the descriptor when the same track reappears.
+            if let Some(route) = previous
+                .iter_mut()
+                .find(|route| {
+                    route.index >= first_index
+                        && route
+                            .subtitle
+                            .id
+                            == subtitle.id
+                        && route
+                            .subtitle
+                            .lang
+                            == subtitle.lang
+                })
+            {
+                route.subtitle = (*subtitle).clone();
+                return route.clone();
+            }
+            while previous
+                .iter()
+                .any(|route| route.index == next_index)
+            {
+                next_index += 1;
+            }
+            let route = ExternalSubtitleRoute {
+                index: next_index,
+                subtitle: (*subtitle).clone(),
+            };
+            previous.push(route.clone());
+            next_index += 1;
+            route
+        })
+        .collect()
 }
 
 fn load_external_subtitle_routes(
@@ -1734,17 +1824,15 @@ fn external_subtitle_request_base(
     previous_base.filter(|base| *base >= 0 && *base <= stream_index)
 }
 
-/// A request using an older advertised base already names a track PlaybackInfo
-/// showed to this client. The current source probe can contain an embedded
-/// same-language track that was absent from that advertised layout, so keep
-/// the language cap but do not deduplicate the explicitly selected external
-/// track against that newer probe state.
+/// A selected external index already names a track shown to this client. A
+/// release subtitle can become usable after advertisement without changing the
+/// index base. Keep the language cap and quality validation, but do not apply
+/// current menu dedup to delivery of a previously advertised external track.
 fn external_subtitle_resolution_dedup(
     dedup: SubtitleDedupSettings,
     selected_base: Option<i64>,
-    current_base: i64,
 ) -> SubtitleDedupSettings {
-    if selected_base.is_some_and(|base| base != current_base) {
+    if selected_base.is_some() {
         SubtitleDedupSettings {
             enabled: false,
             max_external_per_language_when_disabled: dedup.max_external_per_language()
@@ -2135,7 +2223,7 @@ async fn subtitles_stream_inner(
             let request_base = selected_base.unwrap_or(next_idx);
             let external = selected_base.is_some();
             let resolution_dedup =
-                external_subtitle_resolution_dedup(dedup, selected_base, next_idx);
+                external_subtitle_resolution_dedup(dedup, selected_base);
             // PATCH (uduchi2nd, 2026-09-29): clients can retain an index from
             // an earlier, pre-probe layout. Resolve with that base when the
             // current filtered PlaybackInfo no longer reserves the index.
@@ -2987,17 +3075,17 @@ fn append_external_subtitles_inner(
             device_profile,
             dedup,
         );
-        if let Some(ctx) = ctx {
-            let routes = scored
-                .iter()
-                .enumerate()
-                .map(|(offset, subtitle)| ExternalSubtitleRoute {
-                    index: next_idx + offset as i64,
-                    subtitle: (*subtitle).clone(),
-                })
-                .collect();
-            save_external_subtitle_routes(ctx, device_id, item_id, source.id, routes);
-        }
+        let routes = if let Some(ctx) = ctx {
+            update_external_subtitle_routes(
+                ctx,
+                device_id,
+                item_id,
+                source.id,
+                |saved| assign_external_subtitle_routes(saved, &scored, next_idx),
+            )
+        } else {
+            assign_external_subtitle_routes(&mut Vec::new(), &scored, next_idx)
+        };
         let labels = external_subtitle_labels(
             scored
                 .iter()
@@ -3010,13 +3098,17 @@ fn append_external_subtitles_inner(
             && source
                 .default_subtitle_stream_index
                 .is_none();
-        for (i, sub) in scored
+        for (i, route) in routes
             .into_iter()
             .enumerate()
         {
+            let sub = &route.subtitle;
             let mut stream = crate::conversions::subtitle_to_media_stream(sub);
-            let idx = next_idx + i as i64;
+            let idx = route.index;
             stream.index = idx;
+            // DeliveryUrl and Path always describe converted WebVTT, regardless
+            // of the provider's original subtitle format.
+            stream.codec = Some(api::SubtitleCodec::WebVtt.to_string());
             stream.delivery_url = Some(format!(
                 "/Videos/{item_id}/{source_id}/Subtitles/{idx}/0/Stream.vtt?ApiKey={api_key}",
                 source_id = source.id,
@@ -3048,7 +3140,7 @@ fn append_external_subtitles_inner(
             }
             if wants_default && i == 0 {
                 stream.is_default = Some(true);
-                source.default_subtitle_stream_index = Some(next_idx);
+                source.default_subtitle_stream_index = Some(idx);
             }
             let stream_position = source
                 .media_streams
@@ -3152,9 +3244,15 @@ pub(super) async fn validate_external_subtitles_for_advertising(
             async move {
                 let mut cached = None;
                 for sub in &tracks {
-                    let requirements = quality::Requirements { forced: sub.is_forced, ..requirements };
-                    if let Some(key) = good_track_key("raw", item_id, None, &sub.id, sub.lang.as_deref(), None) {
-                        if let Some(track) = load_usable_track(&state.ctx, &key, requirements).await {
+                    let requirements = quality::Requirements {
+                        forced: sub.is_forced,
+                        ..requirements
+                    };
+                    if let Some(key) =
+                        good_track_key("raw", item_id, None, &sub.id, sub.lang.as_deref(), None)
+                    {
+                        if let Some(track) = load_usable_track(&state.ctx, &key, requirements).await
+                        {
                             cached = Some(track.bytes);
                             break;
                         }
@@ -3163,19 +3261,27 @@ pub(super) async fn validate_external_subtitles_for_advertising(
                 let bytes = match cached {
                     Some(bytes) => bytes,
                     None => match tokio::time::timeout(
-                        Duration::from_secs(6), fetch_external_subtitle_bytes(&state, &descriptor),
-                    ).await {
+                        Duration::from_secs(6),
+                        fetch_external_subtitle_bytes(&state, &descriptor),
+                    )
+                    .await
+                    {
                         Ok(Ok(bytes)) => bytes,
                         _ => return,
                     },
                 };
                 for sub in tracks {
-                    let requirements = quality::Requirements { forced: sub.is_forced, ..requirements };
+                    let requirements = quality::Requirements {
+                        forced: sub.is_forced,
+                        ..requirements
+                    };
                     if let Err(problem) = quality::check(&bytes, requirements) {
                         warn!(%item_id, ?problem, "external subtitle not suitable for this video");
                         continue;
                     }
-                    if let Some(key) = good_track_key("raw", item_id, None, &sub.id, sub.lang.as_deref(), None) {
+                    if let Some(key) =
+                        good_track_key("raw", item_id, None, &sub.id, sub.lang.as_deref(), None)
+                    {
                         let _ = save_good_track(&state.ctx, &key, &bytes, false).await;
                     }
                 }
@@ -4327,7 +4433,7 @@ mod tests {
         );
 
         let resolution_dedup =
-            external_subtitle_resolution_dedup(DEDUP_ON, selected_base, current_base);
+            external_subtitle_resolution_dedup(DEDUP_ON, selected_base);
         assert!(!resolution_dedup.enabled);
         assert_eq!(resolution_dedup.max_external_per_language_when_disabled, 1);
         let scored = filter_external_subtitles_for_source(
@@ -4355,6 +4461,172 @@ mod tests {
         assert_eq!(
             external_subtitle_request_base(3, 4, &retained_embedded, Some(0)),
             None
+        );
+    }
+
+    #[test]
+    fn newly_cached_release_does_not_hide_an_explicit_external_request() {
+        let embedded = [123]
+            .into_iter()
+            .collect();
+        let selected = external_subtitle_request_base(125, 124, &embedded, None);
+        assert_eq!(selected, Some(124));
+        let delivery = external_subtitle_resolution_dedup(DEDUP_ON, selected);
+        assert!(!delivery.enabled);
+        assert_eq!(delivery.max_external_per_language(), 1);
+        assert!(external_subtitle_resolution_dedup(DEDUP_ON, None).enabled);
+    }
+
+    #[test]
+    fn subtitle_format_aliases_share_the_existing_canonical_cache_key() {
+        let item = Uuid::new_v4();
+        let source = Some(Uuid::new_v4());
+        let key = |format| {
+            good_track_key(
+                "ready",
+                item,
+                source,
+                "online-vie",
+                Some("vie"),
+                Some(format),
+            )
+        };
+        for (canonical, alias) in [("vtt", "webvtt"), ("srt", "subrip"), ("ass", "SSA")]
+        {
+            assert_eq!(key(canonical), key(alias));
+        }
+        assert_ne!(key("vtt"), key("srt"));
+    }
+
+    #[tokio::test]
+    async fn online_indexes_survive_hidden_and_reordered_tracks_in_metadata() {
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let item = Uuid::new_v4();
+        let mut source = source_with_subtitles(vec![api::MediaStream {
+            index: 0,
+            type_: Some(api::MediaStreamType::Video),
+            ..Default::default()
+        }]);
+        source.native_stream_index_max = Some(123);
+        source.remux = Some(api::MediaSourceRemuxInfo {
+            source: Some(api::ProbeOrigin::Ffprobe),
+            ..Default::default()
+        });
+        let subtitles: Vec<_> = ["eng", "vie", "jpn"]
+            .into_iter()
+            .map(|language| crate::addons::SubtitleInfo {
+                id: format!("online-{language}"),
+                url: Some(crate::stream::StreamDescriptor::http(format!(
+                    "https://offline.invalid/{language}.srt"
+                ))),
+                lang: Some(language.into()),
+                is_forced: false,
+                is_hi: false,
+                filename: None,
+                from_trusted: None,
+                ai_translated: None,
+            })
+            .collect();
+        let advertise = |subtitles: &[crate::addons::SubtitleInfo]| {
+            let mut fresh = source.clone();
+            append_external_subtitles_inner(
+                Some(ctx),
+                "player-a",
+                std::slice::from_mut(&mut fresh),
+                subtitles,
+                &["en".into(), "vi".into(), "ja".into()],
+                Some(&no_embed_profile()),
+                item,
+                "fixture-token",
+                DEDUP_ON,
+                false,
+            );
+            fresh
+        };
+
+        let first = advertise(&subtitles[..2]);
+        let external: Vec<_> = first
+            .media_streams
+            .iter()
+            .filter(|s| s.is_external)
+            .collect();
+        assert_eq!(
+            external
+                .iter()
+                .map(|s| s.index)
+                .collect::<Vec<_>>(),
+            [124, 125]
+        );
+        for stream in external {
+            assert_eq!(
+                stream
+                    .codec
+                    .as_deref(),
+                Some("vtt")
+            );
+            assert!(
+                stream
+                    .path
+                    .as_deref()
+                    .unwrap()
+                    .ends_with(".vtt")
+            );
+            assert!(
+                stream
+                    .delivery_url
+                    .as_deref()
+                    .unwrap()
+                    .contains("/Stream.vtt?")
+            );
+        }
+
+        // Native release text becomes ready, hiding both online menu entries.
+        assert_eq!(
+            advertise(&[])
+                .media_streams
+                .len(),
+            1
+        );
+        let saved =
+            load_external_subtitle_routes(ctx, "player-a", item, source.id).unwrap();
+        assert_eq!(
+            external_subtitle_route_for_index(&saved, 124)
+                .unwrap()
+                .subtitle
+                .id,
+            "online-eng"
+        );
+        assert_eq!(
+            external_subtitle_route_for_index(&saved, 125)
+                .unwrap()
+                .subtitle
+                .id,
+            "online-vie"
+        );
+
+        // When only Vietnamese reappears, it keeps 125 and remains the default.
+        let vietnamese_only = advertise(&subtitles[1..2]);
+        assert_eq!(vietnamese_only.media_streams[1].index, 125);
+        assert_eq!(vietnamese_only.default_subtitle_stream_index, Some(125));
+        let with_new_language = advertise(&subtitles[1..]);
+        assert_eq!(with_new_language.media_streams[1].index, 125);
+        assert_eq!(with_new_language.media_streams[2].index, 126);
+        copy_external_subtitle_routes(ctx, "player-a", item, source.id, item);
+        let alias = load_external_subtitle_routes(ctx, "player-a", item, item).unwrap();
+        assert_eq!(
+            external_subtitle_route_for_index(&alias, 124)
+                .unwrap()
+                .subtitle
+                .id,
+            "online-eng"
+        );
+        assert_eq!(
+            external_subtitle_route_for_index(&alias, 125)
+                .unwrap()
+                .subtitle
+                .id,
+            "online-vie"
         );
     }
 
@@ -5568,6 +5840,10 @@ mod advertised_external_route_tests {
             ],
         );
 
+        // A later item/PlaybackInfo response may advertise no online tracks
+        // after cached native subtitles become available. Keep the old URLs.
+        save_external_subtitle_routes(&ctx, "player-a", item, source, Vec::new());
+
         let routes =
             load_external_subtitle_routes(&ctx, "player-a", item, source).unwrap();
         let route = external_subtitle_route_for_index(routes.as_slice(), 3).unwrap();
@@ -5651,7 +5927,7 @@ mod advertised_external_route_tests {
             source,
             neighboring_route.index,
             &neighboring_route.subtitle,
-            "vtt",
+            "webvtt",
             false,
         )
         .await
@@ -5663,5 +5939,17 @@ mod advertised_external_route_tests {
                 .unwrap(),
             http::HeaderValue::from_static("aligned")
         );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Type")
+                .unwrap(),
+            "text/vtt; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 2_000_000)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Xin chao"));
     }
 }

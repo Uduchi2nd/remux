@@ -36,6 +36,27 @@ Retire this patch when upstream preserves the native index range through both
 metadata paths and direct-play clients select the intended external language
 with the same MKV, including hidden embedded tracks and added sidecars.
 
+## Previously advertised online subtitle routes (2026-10-16)
+
+When cached release subtitles become usable, menu dedup can remove their online
+alternatives. Keep previously published online routes for the existing device /
+item / source route-cache lifetime instead of replacing them with an empty list.
+Reuse each track's assigned index when the visible set changes, including the
+default index, and serialize concurrent Item / PlaybackInfo route updates.
+Delivery fallback keeps quality checks and language caps but does not apply a
+new menu's embedded-track dedup to an explicitly requested external subtitle.
+
+Canonicalize output format aliases in the good-track cache key: `webvtt` and
+`vtt` must load the same saved alignment. Online tracks advertise the converted
+delivery codec `vtt`, matching their Path and DeliveryUrl. Provider originals
+and sidecar codec detection remain separate.
+
+Regression controls cover empty refreshes, a remaining language retaining its
+index/default, a new language avoiding old indexes, autoplay alias copies, and
+`.webvtt` delivery reusing a cached aligned `.vtt` body. Retire when upstream
+keeps already published subtitle URLs playable across these metadata changes
+and physical clients display the intended track.
+
 ## What currently belongs in remux
 
 | Change | Purpose | Retirement evidence |
