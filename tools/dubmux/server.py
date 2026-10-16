@@ -20,6 +20,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dubmux  # noqa: E402
@@ -817,6 +818,17 @@ def _prepare_worker(dub, video, k):
         job["finished"] = time.time()
 
 
+def _playback_result(k, result):
+    """Report the current file entity, including a completed layout repair."""
+    result = dict(result)
+    if result.get("verdict") == "accept":
+        result["video_check"] = _video_check(k)
+        lay = _file_layout(k, k.split("__", 1)[0])
+        result["file_ready"] = lay is not None
+        result["file_size"] = lay[2] if lay else None
+    return result
+
+
 @app.post("/prepare")
 async def prepare(req: Request):
     body = await req.json()
@@ -831,13 +843,8 @@ async def prepare(req: Request):
     k = _key(dub["id"], video["id"])
     cached = _load_match(k)
     if cached:
-        if cached["verdict"] == "accept":
-            cached["video_check"] = _video_check(k)
-            lay = _file_layout(k, k.split("__", 1)[0])
-            cached["file_ready"] = lay is not None
-            cached["file_size"] = lay[2] if lay else None
         return {"status": "ready" if cached["verdict"] == "accept" else "rejected",
-                "stage": "done", "result": cached, "cached": True}
+                "stage": "done", "result": _playback_result(k, cached), "cached": True}
     _require_budget_auth(req)
     # Lower = sooner. remux sends 0 for the episode being played, ~100+ for
     # the on-play walk (next episodes first; a pair's rank within its
@@ -892,15 +899,13 @@ def status(dub_id: str, video_id: str):
     k = _key(_check_id(dub_id), _check_id(video_id))
     cached = _load_match(k)
     if k in _jobs:
-        return _jobs[k]
+        job = dict(_jobs[k])
+        if job.get("status") == "ready":
+            job["result"] = _playback_result(k, job.get("result") or {})
+        return job
     if cached:
-        if cached["verdict"] == "accept":
-            cached["video_check"] = _video_check(k)
-            lay = _file_layout(k, k.split("__", 1)[0])
-            cached["file_ready"] = lay is not None
-            cached["file_size"] = lay[2] if lay else None
         return {"status": "ready" if cached["verdict"] == "accept" else "rejected",
-                "stage": "done", "result": cached, "cached": True}
+                "stage": "done", "result": _playback_result(k, cached), "cached": True}
     return {"status": "unknown"}
 
 
@@ -1229,7 +1234,8 @@ def _jit_cmd(k, src, remote, dubfile, lag, tab, start_seg, d):
             "-metadata:s:a:0", "language=vie", "-metadata:s:a:0", "title=Tiếng Việt (Thuyết Minh)",
             "-disposition:a:0", "default", "-muxdelay", "0", "-muxpreload", "0",
             *(["-output_ts_offset", f"{delta:.6f}"] if delta else []),
-            "-f", "segment", "-segment_format", "mpegts", "-segment_times", times,
+            "-f", "segment", "-segment_format", "mpegts",
+            "-segment_format_options", "mpegts_flags=+initial_discontinuity", "-segment_times", times,
             "-segment_time_delta", "0.001", "-segment_start_number", str(start_seg - lead),
             "-reset_timestamps", "0",
             "-segment_list", str(d / "live.m3u8"), "-segment_list_type", "m3u8",
@@ -1394,6 +1400,8 @@ def _jit_start(k, video_url, dub_id, lag, tab, start_seg=0, end_seg=None):
             print(f"mux {k} FAILED sync self-check: {report}", file=sys.stderr, flush=True)
             (d / ".done").unlink(missing_ok=True)
             (d / ".failed").write_text("sync")
+        else:
+            _file_layout(k, dub_id)
         _sweep()
     threading.Thread(target=runner, daemon=True).start()
 
@@ -1789,11 +1797,13 @@ def _ensure_segment(k, dub_id, n):
 # Infuse and VidHub then stream, seek AND download a dub row like any file.
 # Slot = the release's own segment + 3x the dub audio's bytes + 32 KB
 # (measured: +1.4..2.3x over ~2,900 segments — TS wraps each small AAC frame
-# in its own PES), or a finished session's exact segment + 16 KB. The layout
-# is computed once and SAVED: a file's size never changes under a player.
+# in its own PES), or a finished session's exact segment sizes. The layout
+# is saved and stays stable when it fits. An undersized legacy estimate is
+# repaired from a completed session; ETag/If-Range identifies the new entity.
 TS_NULL = b"\x47\x1f\xff\x10" + b"\xff" * 184
 FILE_DUB_FACTOR = 3.0
 FILE_SLOT_MARGIN = 32768
+_file_locks: dict[str, threading.Lock] = {}
 
 
 def _file_layout_path(k):
@@ -1802,30 +1812,60 @@ def _file_layout_path(k):
 
 def _file_layout(k, dub_id, create=True):
     """(offsets, slots, total) of the pair's virtual file, or None when its
-    segment sizes are not known yet (then the playlist is used)."""
+    segment sizes are not known yet (then the playlist is used).
+
+    Keep a valid layout stable. A completed session proves the actual sizes:
+    repair an undersized estimate before serving it, never truncate media to
+    fit. In particular, TS demuxing splits TrueHD packets into small frames;
+    remuxing them needs more PES/TS overhead than the original raw segments.
+    Cache-only browsing (create=False) must remain read-only.
+    """
+    if not create:
+        return _file_layout_locked(k, dub_id, create=False)
+    with _lock:
+        lock = _file_locks.setdefault(k, threading.Lock())
+    with lock:
+        return _file_layout_locked(k, dub_id)
+
+
+def _file_layout_locked(k, dub_id, create=True):
     p = _file_layout_path(k)
+    slots = None
     try:
-        lay = json.load(open(p))
+        lay = json.loads(p.read_text())
         slots = lay["slots"]
+        if not slots or any(type(x) is not int or x <= 0 or x % 188 for x in slots):
+            slots = None
     except Exception:  # noqa: BLE001
-        if not create:
-            return None
+        pass
+    if not create and slots is None:
+        return None
+    d = _session_dir(k)
+    sizes = None
+    src = None
+    if create and (d / ".done").exists() and _session_consistent(d):
+        names = [line.strip() for line in (d / "index.m3u8").read_text().splitlines()
+                 if line.strip() and not line.startswith("#")]
+        if all(re.fullmatch(r"seg[0-9]+\.ts", name) for name in names):
+            actual = [(d / name).stat().st_size for name in names]
+            if all(x > 0 and x % 188 == 0 for x in actual):
+                if slots is None or len(slots) != len(actual) or any(a > s for a, s in zip(actual, slots)):
+                    sizes = actual
+                    src = "session-exact"
+    if slots is None and sizes is None:
         hq = hq_id_of(k)
         tab = _segtab(hq)
         if tab is None:
             return None
         starts, durs, _origin = tab
         n = len(durs)
-        d = _session_dir(k)
-        sizes = None
-        src = None
         segs = [d / f"seg{i:05d}.ts" for i in range(n)]
         if (d / ".done").exists() and all(x.exists() for x in segs):
-            sizes = [x.stat().st_size + 16384 for x in segs]
-            src = "session"
+            sizes = [x.stat().st_size for x in segs]
+            src = "session-exact"
         else:
             try:
-                raw_sizes = json.load(open(_segtab_path(hq))).get("sizes")
+                raw_sizes = json.loads(_segtab_path(hq).read_text()).get("sizes")
             except Exception:  # noqa: BLE001
                 raw_sizes = None
             if raw_sizes and len(raw_sizes) == n:
@@ -1842,8 +1882,11 @@ def _file_layout(k, dub_id, create=True):
                 src = "raw"
         if sizes is None:
             return None
+    if sizes is not None:
         slots = [(x + 187) // 188 * 188 for x in sizes]
-        json.dump({"slots": slots, "from": src, "created": int(time.time())}, open(p, "w"))
+        stage = p.with_name(p.name + f".{threading.get_ident()}.tmp")
+        stage.write_text(json.dumps({"slots": slots, "from": src, "created": int(time.time())}))
+        os.replace(stage, p)
     offs, t = [], 0
     for sl in slots:
         offs.append(t)
@@ -1864,17 +1907,24 @@ def _parse_range(h, total):
     return a, min(b, total - 1)
 
 
-def _serve_slots(request, offs, slots, total, get_path, label):
+def _serve_slots(request, offs, slots, total, get_path, label, etag=None):
     """Serve a virtual file made of fixed-size slots (segment bytes, then
     MPEG-TS null packets) with HTTP range support. get_path(i) produces or
     returns segment i (raises HTTPException/any on failure)."""
     import bisect
-    rng = _parse_range(request.headers.get("range", ""), total)
+    # A repaired layout is a different HTTP representation. Do not combine a
+    # player's old cached byte ranges with the new offsets (RFC If-Range).
+    range_header = request.headers.get("range", "")
+    if etag and request.headers.get("if-range", etag) != etag:
+        range_header = ""
+    rng = _parse_range(range_header, total)
     if rng and (rng[0] >= total or rng[0] > rng[1]):
         return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
     a, b = rng if rng else (0, total - 1)
     headers = {"Accept-Ranges": "bytes", "Content-Length": str(b - a + 1),
-               "Cache-Control": "private, max-age=3600"}
+               "Cache-Control": "private, no-cache"}
+    if etag:
+        headers["ETag"] = etag
     if rng:
         headers["Content-Range"] = f"bytes {a}-{b}/{total}"
     status = 206 if rng else 200
@@ -1888,6 +1938,16 @@ def _serve_slots(request, offs, slots, total, get_path, label):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(503, f"segment unavailable: {str(e)[:120]}", headers={"Retry-After": "5"})
 
+    def check_size(path, i):
+        size = path.stat().st_size
+        if size > slots[i]:
+            print(f"{label}: refusing segment {i} ({size} B) larger than its slot ({slots[i]} B)",
+                  file=sys.stderr, flush=True)
+            raise HTTPException(503, "virtual file layout is not ready", headers={"Retry-After": "5"})
+        return size
+
+    check_size(first_path, first)
+
     def body():
         pos, i, path = a, first, first_path
         while pos <= b and i < len(slots):
@@ -1898,10 +1958,9 @@ def _serve_slots(request, offs, slots, total, get_path, label):
                     print(f"{label}: segment {i} failed mid-response: {str(e)[:160]}",
                           file=sys.stderr, flush=True)
                     return
-            size = path.stat().st_size
-            if size > slots[i]:
-                print(f"{label}: segment {i} ({size} B) overflows its slot ({slots[i]} B)",
-                      file=sys.stderr, flush=True)
+            # A later overflow must abort the response, so a download cannot
+            # report success with missing video/audio packets.
+            size = check_size(path, i)
             lo = pos - offs[i]
             hi = min(b - offs[i], slots[i] - 1)
             if lo < size:
@@ -1910,7 +1969,7 @@ def _serve_slots(request, offs, slots, total, get_path, label):
                     f.seek(lo)
                     left = end - lo + 1
                     while left > 0:
-                        chunk = f.read(min(1 << 20, left))
+                        chunk = f.read(min(64 * 1024, left))
                         if not chunk:
                             break
                         left -= len(chunk)
@@ -1924,7 +1983,22 @@ def _serve_slots(request, offs, slots, total, get_path, label):
             pos = offs[i] + hi + 1
             i += 1
             path = None
-    return StreamingResponse(body(), status_code=status, headers=headers, media_type="video/mp2t")
+    async def connected_body():
+        # Some ASGI/server combinations keep consuming a synchronous response
+        # generator after the peer closes. A seek abandons its open-ended
+        # range; stop before reading another chunk or producing another segment.
+        iterator = body()
+        end = object()
+        try:
+            while not await request.is_disconnected():
+                chunk = await run_in_threadpool(next, iterator, end)
+                if chunk is end:
+                    break
+                yield chunk
+        finally:
+            iterator.close()
+
+    return StreamingResponse(connected_body(), status_code=status, headers=headers, media_type="video/mp2t")
 
 
 @app.api_route("/vn/{fid}/file.ts", methods=["GET", "HEAD"])
@@ -1958,65 +2032,15 @@ def seekable_file(dub_id: str, video_id: str, request: Request):
     if lay is None:
         raise HTTPException(404, "not available as a file yet (use master.m3u8)")
     offs, slots, total = lay
-    rng = _parse_range(request.headers.get("range", ""), total)
-    if rng and (rng[0] >= total or rng[0] > rng[1]):
-        return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
-    a, b = rng if rng else (0, total - 1)
-    headers = {"Accept-Ranges": "bytes", "Content-Length": str(b - a + 1),
-               "Cache-Control": "private, max-age=3600"}
-    if rng:
-        headers["Content-Range"] = f"bytes {a}-{b}/{total}"
-    status = 206 if rng else 200
+    etag = '"slots-' + hashlib.sha256(json.dumps(slots, separators=(",", ":")).encode()).hexdigest() + '"'
     if request.method == "HEAD":
-        return Response(status_code=status, headers=headers, media_type="video/mp2t")
+        return _serve_slots(request, offs, slots, total, None, f"file {k}", etag)
     video_url = request.query_params.get("video") or m.get("video_url")
     if not video_url:
         raise HTTPException(400, "video url required (query ?video=)")
     _open_session(k, dub_id, m, video_url)
-    # first segment of the range is produced BEFORE the response starts, so
-    # a producer failure is a proper HTTP error rather than a cut body
-    import bisect
-    first = bisect.bisect_right(offs, a) - 1
-    first_path = _ensure_segment(k, dub_id, first)
-
-    def body():
-        pos = a
-        i = first
-        path = first_path
-        while pos <= b and i < len(slots):
-            if path is None:
-                try:
-                    path = _ensure_segment(k, dub_id, i)
-                except HTTPException:
-                    return          # client retries the remaining range
-            size = path.stat().st_size
-            if size > slots[i]:
-                print(f"file {k}: segment {i} ({size} B) overflows its slot ({slots[i]} B)",
-                      file=sys.stderr, flush=True)
-            lo = pos - offs[i]
-            hi = min(b - offs[i], slots[i] - 1)
-            if lo < size:
-                with open(path, "rb") as f:
-                    f.seek(lo)
-                    left = min(hi, size - 1) - lo + 1
-                    while left > 0:
-                        chunk = f.read(min(1 << 20, left))
-                        if not chunk:
-                            break
-                        left -= len(chunk)
-                        yield chunk
-                lo = min(hi, size - 1) + 1 if size - 1 >= lo else lo
-            if lo <= hi:
-                # null packets from the slot's padding; the slot and the
-                # segment are both multiples of 188, so this stays aligned
-                pad = hi - max(lo, size) + 1
-                start_in_pkt = (max(lo, size)) % 188
-                buf = (TS_NULL * ((pad + start_in_pkt) // 188 + 2))[start_in_pkt:start_in_pkt + pad]
-                yield buf
-            pos = offs[i] + hi + 1
-            i += 1
-            path = None
-    return StreamingResponse(body(), status_code=status, headers=headers, media_type="video/mp2t")
+    return _serve_slots(request, offs, slots, total,
+                        lambda i: _ensure_segment(k, dub_id, i), f"file {k}", etag)
 
 
 @app.api_route("/mux/{dub_id}/{video_id}/{seg}", methods=["GET", "HEAD"])

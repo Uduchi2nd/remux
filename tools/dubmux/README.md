@@ -417,10 +417,15 @@ Slot sizes: the release's own segment size (recorded in the segment table
 from the raw copy, `sizes`) + 3x the dub audio bytes for that duration +
 32 KB — measured over ~2,900 segments the dub adds 1.4–2.3x its audio bytes
 (TS wraps each small AAC frame in its own PES); or, when a finished session
-exists, its exact segment size + 16 KB (padding < 1 %). The layout is saved
-(`match/file-<pair>.json`) the first time and never changes, so a player
-never sees the size move. A segment that would overflow its slot is logged
-("overflows its slot") and truncated at the slot end.
+exists, its exact segment sizes, with no padding. The layout is saved in
+`match/file-<pair>.json` and stays stable while its slots fit the media.
+Completed sessions repair an undersized legacy estimate atomically before
+serving or advertising their size. A segment must never be truncated to fit:
+an overflow fails before the response starts, or aborts an already-started
+response so a download cannot report success with missing video/audio.
+The file carries a layout ETag, `If-Range` support, and `private, no-cache`;
+reopen playback after a legacy layout repair to discard old cached ranges.
+Cache-only browsing still never repairs or writes layouts.
 remux: `/prepare` and `/status` report `file_ready`; rows of such pairs get
 the `file.ts` URL and container `ts`, others keep `master.m3u8` (pairs made
 before segment sizes were recorded, until their first session finishes).
@@ -429,6 +434,17 @@ Browser/AVPlayer clients cannot play a raw TS file — not supported by design
 Verified: Early Spring E01 (session layout) 808 MB, ffprobe 2615 s with vie +
 chi tracks, 1 MB range 0.9 s, seek to 20:00 decodes; Kung Fu Hustle (raw
 layout) 8.1 GB, 5976 s, no overflow.
+
+2026-10-15 follow-up: the Infinity Castle iVy TrueHD release produced more
+PES/TS overhead on the second mux pass than the raw-size estimate allowed.
+1,476 of 1,533 slots overflowed, silently losing 665,438,784 bytes. The
+uncut cached Japanese TrueHD and E-AC-3 5.1 tracks both contained audio;
+the truncated delivery introduced hundreds of TrueHD decoder errors.
+New segment muxes mark initial TS discontinuities, since their continuity
+counters restart per segment. Virtual-file streaming also checks client
+disconnects explicitly before every bounded read, so abandoned seek ranges
+cannot keep consuming the cache or requesting later JIT segments. VN files
+and dubbed files use the same guarded range-serving implementation.
 
 ## vnphim playlists as seekable files (`/vn/<id>/file.ts`, 2026-09-28)
 User request: expose vnphim's HLS streams the same way as the dub file —
