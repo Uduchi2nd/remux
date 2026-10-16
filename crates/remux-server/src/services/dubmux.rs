@@ -107,16 +107,71 @@ pub(crate) fn merge_dub_rows(
     {
         streams.retain(|row| !is_dubmux_row(row));
     }
-    let mut merged: Vec<_> = added
-        .into_iter()
-        .filter(|row| {
-            !streams
-                .iter()
-                .any(|existing| existing.id == row.id)
-        })
+    // Checked rows carry the current file size/probe/order even if their
+    // persistence is still queued behind a library write. Do not let the old
+    // database snapshot replace that freshly validated metadata.
+    let checked: std::collections::HashSet<_> = added
+        .iter()
+        .map(|row| row.id)
         .collect();
+    streams.retain(|row| !checked.contains(&row.id));
+    let mut merged = added;
     merged.extend(streams);
     merged
+}
+
+static CACHED_ROW_WRITES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<Uuid>>,
+> = std::sync::LazyLock::new(Default::default);
+
+struct CachedRowWriteGuard(Uuid);
+
+impl CachedRowWriteGuard {
+    fn try_new(item: Uuid) -> Option<Self> {
+        let mut pending = CACHED_ROW_WRITES
+            .lock()
+            .ok()?;
+        if pending.insert(item) {
+            Some(Self(item))
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for CachedRowWriteGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = CACHED_ROW_WRITES.lock() {
+            pending.remove(&self.0);
+        }
+    }
+}
+
+fn persist_cached_rows(
+    db: &sqlx::SqlitePool,
+    item: Uuid,
+    rows: Vec<db::Media>,
+) -> bool {
+    if rows.is_empty() {
+        return false;
+    }
+    let Some(guard) = CachedRowWriteGuard::try_new(item) else {
+        return false;
+    };
+    let db = db.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        let started = std::time::Instant::now();
+        match db::Media::upsert(&db, &rows).await {
+            Ok(()) => tracing::info!(target: "remux_server::item_detail", %item,
+                write_ms=started.elapsed().as_millis(), written=rows.len(),
+                "completed dub cache persisted in background"),
+            Err(error) => {
+                warn!(%item, "cached dub row background save failed: {error:#}")
+            }
+        }
+    });
+    true
 }
 
 fn is_hq_candidate(stream: &db::Media) -> bool {
@@ -1074,15 +1129,10 @@ pub(crate) async fn restore_cached_dub_rows(
         })
         .cloned()
         .collect();
-    let write_started = std::time::Instant::now();
-    if !dirty.is_empty()
-        && let Err(error) = db::Media::upsert(&ctx.db, &dirty).await
-    {
-        warn!(item = %media.id, "cached dub row restore failed: {error:#}");
-        return vec![];
-    }
+    let dirty_rows = dirty.len();
+    let write_queued = persist_cached_rows(&ctx.db, media.id, dirty);
     tracing::info!(target:"remux_server::item_detail", item=%media.id,
-        lookup_ms, write_ms=write_started.elapsed().as_millis(), written=dirty.len(),
+        lookup_ms, dirty_rows, write_queued,
         visible=rows.len(), "completed dub cache checked");
 
     rows
@@ -1458,6 +1508,103 @@ pub(crate) async fn start_mux(url: &str, item: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn checked_rows_remain_usable_while_database_persistence_waits() {
+        let (_server, guard, _token) =
+            crate::integration_test::authenticated_server().await;
+        let ctx = guard
+            .0
+            .clone();
+        let mut old = http_media(
+            "https://mux.invalid/mux/a/b/file.ts",
+            "Movie.VNDub-hotphim.ts",
+        );
+        old.id = Uuid::new_v4();
+        old.kind = db::MediaKind::Stream;
+        old.title = "[+VN dub] queued cache row".into();
+        old.created_at = chrono::Utc::now().naive_utc();
+        old.stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(10000);
+        old.save(&ctx.db)
+            .await
+            .unwrap();
+        let mut checked = old.clone();
+        checked
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(12000);
+        let mut held = Vec::new();
+        for _ in 0..ctx
+            .db
+            .options()
+            .get_max_connections()
+        {
+            held.push(
+                ctx.db
+                    .acquire()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let item = Uuid::new_v4();
+        assert!(persist_cached_rows(&ctx.db, item, vec![checked.clone()]));
+        assert!(
+            !persist_cached_rows(&ctx.db, item, vec![checked.clone()]),
+            "repeated reads must coalesce behind one pending write"
+        );
+        tokio::task::yield_now().await;
+        let stored: String =
+            sqlx::query_scalar("SELECT stream_info FROM media WHERE id=?")
+                .bind(old.id)
+                .fetch_one(&mut *held[0])
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::stream::StreamInfo>(&stored)
+                .unwrap()
+                .size,
+            Some(10000)
+        );
+        let config = crate::Config {
+            dubmux_url: Some("http://mux.invalid".into()),
+            ..Default::default()
+        };
+        let visible = merge_dub_rows(&config, vec![old.clone()], vec![checked]);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(
+            visible[0]
+                .stream_info
+                .as_ref()
+                .unwrap()
+                .size,
+            Some(12000),
+            "current checked metadata must win before persistence can finish"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let row = db::Media::get_by_id(&ctx.db, &old.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if row
+                    .stream_info
+                    .unwrap()
+                    .size
+                    == Some(12000)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the queued row must eventually be persisted");
+    }
 
     #[test]
     fn cached_playback_config_does_not_enable_preparation() {

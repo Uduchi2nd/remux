@@ -484,3 +484,11 @@ checks immediate cached Item delivery and one background refresh. Transient
 external-subtitle fetch failures back off for30seconds instead of retrying a
 broken provider on every Item; retained valid text wins before this check, and
 the existing longer rejection of empty/corrupt text remains unchanged.
+
+Write-queue follow-up: a live provider refresh exposed a17.6s wait in the global
+database write gate when a completed dub row actually needed restoration.
+Checked rows now return immediately and save in one coalesced background task
+per item. Fresh checked metadata takes precedence over the stored snapshot,
+including before that save commits; errors leave the checked current response
+usable and the next lookup can retry persistence. A database-pool exhaustion
+test verifies immediate merge/current size, coalescing and eventual saving.

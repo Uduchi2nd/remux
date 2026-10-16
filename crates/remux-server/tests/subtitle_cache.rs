@@ -26,6 +26,27 @@ async fn expired_item_returns_saved_streams_while_slow_provider_refreshes() {
     cached_dub_item_after_refresh(true, true).await;
 }
 
+async fn wait_for_saved_row(
+    db: &sqlx::SqlitePool,
+    id: Uuid,
+    matches: impl Fn(&db::Media) -> bool,
+) -> db::Media {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let row = db::Media::get_by_id(db, &id)
+                .await
+                .unwrap()
+                .unwrap();
+            if matches(&row) {
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("checked cache metadata must be saved in the background")
+}
+
 async fn cached_dub_item_after_refresh(preparation_enabled: bool, expired_list: bool) {
     let provider = httpmock::MockServer::start_async().await;
     provider
@@ -302,10 +323,8 @@ async fn cached_dub_item_after_refresh(preparation_enabled: bool, expired_list: 
             .any(|s| s["Index"] == 124),
         "uncached mux text must stay hidden: {summary:?}"
     );
-    let restored = db::Media::get_by_id(&ctx.db, &row.id)
-        .await
-        .unwrap()
-        .unwrap();
+    let restored =
+        wait_for_saved_row(&ctx.db, row.id, |row| row.updated_at >= now).await;
     assert!(
         restored.updated_at >= now,
         "a stale completed row must be restored"
@@ -344,10 +363,12 @@ async fn cached_dub_item_after_refresh(preparation_enabled: bool, expired_list: 
         .await;
     let changed_body: serde_json::Value = changed.json();
     assert_eq!(changed_body["MediaSources"][0]["Size"], 12000);
-    let updated = db::Media::get_by_id(&ctx.db, &row.id)
-        .await
-        .unwrap()
-        .unwrap();
+    let updated = wait_for_saved_row(&ctx.db, row.id, |row| {
+        row.stream_info
+            .as_ref()
+            .is_some_and(|info| info.size == Some(12000))
+    })
+    .await;
     assert_eq!(
         updated
             .stream_info
