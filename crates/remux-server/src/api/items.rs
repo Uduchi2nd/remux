@@ -2386,7 +2386,10 @@ async fn item_for_user(
             .sources
             .as_ref(),
     ) {
-        for msi in msis.iter_mut() {
+        for (source_index, msi) in msis
+            .iter_mut()
+            .enumerate()
+        {
             let path_uuid = msi
                 .path
                 .as_deref()
@@ -2409,8 +2412,34 @@ async fn item_for_user(
                         rows.iter()
                             .find(|r| r.id == pu)
                     })
+                })
+                .or_else(|| {
+                    // db_media_to_item gives the first source the movie/episode
+                    // autoplay ID. Pin it before checking cached release text;
+                    // item-only clients need this before PlaybackInfo runs.
+                    (source_index == 0 && msi.id == id)
+                        .then(|| rows.first())
+                        .flatten()
                 });
             let Some(row) = row else { continue };
+            super::subtitles::save_subtitle_source(
+                &state.ctx,
+                &session
+                    .device
+                    .id,
+                id,
+                msi.id,
+                row.id,
+            );
+            super::subtitles::copy_external_subtitle_routes(
+                &state.ctx,
+                &session
+                    .device
+                    .id,
+                id,
+                row.id,
+                msi.id,
+            );
             let Some(si) = row
                 .stream_info
                 .as_ref()

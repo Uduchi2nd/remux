@@ -57,6 +57,29 @@ index/default, a new language avoiding old indexes, autoplay alias copies, and
 keeps already published subtitle URLs playable across these metadata changes
 and physical clients display the intended track.
 
+Cold-process follow-up: keep the published route catalogue on disk for30days,
+scoped to device/item/source and guarded by the current release identity.
+Catalogue files join the existing200MiB total budget, with at most512 catalogue
+files independently of the512 good bodies and512 alignment files. Old entries
+can reappear in metadata only when a locally validated raw or ready body remains;
+this fallback does not fetch historical provider URLs or reset body retention.
+The shared atomic private-file writer is used for bodies and catalogues.
+
+Register item-detail autoplay/group aliases before checking cached dub text.
+Previously only PlaybackInfo registered them, so a cold Item-only request looked
+up the Movie as though it were its first stream and dropped valid release text.
+Regression controls exercise Item-first delivery without PlaybackInfo, catalogue
+restoration with no provider results/raw text, expiry, and rejection when the
+release identity changes. The actual provider can return a502/empty placeholder
+while good cached release/previously aligned subtitles remain usable.
+
+Synthetic TS releases advertise native text only after a validated cached body
+exists. Extraction permission is not readiness: a provider limit can defer the
+first extraction. Automatic preparation retains its existing budget; metadata
+must not offer that pending track as a playable subtitle. The cold Item control
+uses an HTTP-redirect addon and verifies that an allowed but uncached track is
+absent while its cached neighbour is advertised and delivered.
+
 ## What currently belongs in remux
 
 | Change | Purpose | Retirement evidence |

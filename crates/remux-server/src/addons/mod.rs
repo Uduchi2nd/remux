@@ -822,7 +822,7 @@ pub trait SearchAddon: Send + Sync {
     ) -> Result<Option<Vec<db::Media>>>;
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SubtitleInfo {
     pub id: String,
     pub url: Option<crate::stream::StreamDescriptor>,

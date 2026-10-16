@@ -37,6 +37,7 @@ static PERSISTED_SUBTITLE_CACHE_PRUNE_LOCK: tokio::sync::Mutex<()> =
 enum PersistedSubtitleCacheKind {
     GoodTrack,
     Alignment,
+    Routes,
 }
 
 struct PersistedSubtitleCacheFile {
@@ -211,6 +212,22 @@ async fn save_good_track(
         key,
     )
     .ok_or_else(|| anyhow!("invalid good subtitle cache key"))?;
+    let saved_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let record = PersistedGoodTrack {
+        saved_at_unix,
+        auto_synced,
+        text: String::from_utf8(bytes.to_vec())?,
+    };
+    save_subtitle_cache_file(ctx, &path, &serde_json::to_vec(&record)?).await
+}
+
+async fn save_subtitle_cache_file(
+    ctx: &crate::AppContext,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
     let dir = path
         .parent()
         .expect("subtitle cache path has parent");
@@ -220,16 +237,8 @@ async fn save_good_track(
         use std::os::unix::fs::PermissionsExt as _;
         tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
     }
-    let saved_at_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-    let record = PersistedGoodTrack {
-        saved_at_unix,
-        auto_synced,
-        text: String::from_utf8(bytes.to_vec())?,
-    };
-    let staging = dir.join(format!(".{}.{}.tmp", Uuid::new_v4(), saved_at_unix));
-    tokio::fs::write(&staging, serde_json::to_vec(&record)?).await?;
+    let staging = dir.join(format!(".{}.tmp", Uuid::new_v4()));
+    tokio::fs::write(&staging, bytes).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -259,6 +268,7 @@ pub(super) async fn prune_persisted_subtitle_caches(data_dir: &std::path::Path) 
             "subtitle-alignment-results",
             PersistedSubtitleCacheKind::Alignment,
         ),
+        ("subtitle-routes", PersistedSubtitleCacheKind::Routes),
     ] {
         let Ok(mut entries) = tokio::fs::read_dir(data_dir.join(directory)).await
         else {
@@ -332,6 +342,10 @@ fn select_cache_files_to_prune(
         .iter()
         .filter(|file| file.kind == PersistedSubtitleCacheKind::Alignment)
         .count();
+    let mut route_count = files
+        .iter()
+        .filter(|file| file.kind == PersistedSubtitleCacheKind::Routes)
+        .count();
     let mut pruned = Vec::new();
 
     loop {
@@ -345,6 +359,10 @@ fn select_cache_files_to_prune(
             files
                 .iter()
                 .position(|file| file.kind == PersistedSubtitleCacheKind::Alignment)
+        } else if route_count > max_good_tracks {
+            files
+                .iter()
+                .position(|file| file.kind == PersistedSubtitleCacheKind::Routes)
         } else {
             None
         };
@@ -356,6 +374,7 @@ fn select_cache_files_to_prune(
         match file.kind {
             PersistedSubtitleCacheKind::GoodTrack => good_track_count -= 1,
             PersistedSubtitleCacheKind::Alignment => alignment_count -= 1,
+            PersistedSubtitleCacheKind::Routes => route_count -= 1,
         }
         pruned.push(file);
     }
@@ -1527,10 +1546,141 @@ pub(crate) struct SidecarSubtitleRoute {
     pub(crate) subtitle: crate::addons::SubtitleInfo,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ExternalSubtitleRoute {
     index: i64,
     subtitle: crate::addons::SubtitleInfo,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedExternalSubtitleRoutes {
+    saved_at_unix: u64,
+    actual_source_id: Uuid,
+    source_identity: Option<Uuid>,
+    routes: Vec<ExternalSubtitleRoute>,
+}
+
+fn external_subtitle_routes_path(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    source_id: Uuid,
+) -> std::path::PathBuf {
+    let key = external_subtitle_routes_key(device_id, item_id, source_id);
+    ctx.config
+        .data_dir
+        .join("subtitle-routes")
+        .join(format!(
+            "{}.json",
+            Uuid::new_v5(&Uuid::nil(), key.as_bytes()),
+        ))
+}
+
+async fn subtitle_route_source_identity(
+    ctx: &crate::AppContext,
+    source: Uuid,
+) -> Option<Uuid> {
+    let row = db::Media::get_by_id(&ctx.db, &source)
+        .await
+        .ok()
+        .flatten()?;
+    alignment::source_identity(
+        row.id,
+        row.stream_info
+            .as_ref()?,
+        row.probe_data
+            .as_ref()
+            .and_then(|probe| probe.run_time_ticks),
+    )
+}
+
+async fn restore_external_subtitle_routes(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    source_id: Uuid,
+) {
+    if load_external_subtitle_routes(ctx, device_id, item_id, source_id)
+        .is_some_and(|routes| !routes.is_empty())
+    {
+        return;
+    }
+    let actual = resolve_subtitle_source(ctx, device_id, item_id, source_id);
+    for key in [source_id, actual] {
+        let path = external_subtitle_routes_path(ctx, device_id, item_id, key);
+        let Ok(metadata) = tokio::fs::metadata(&path).await else {
+            continue;
+        };
+        if metadata.len() > MAX_GOOD_TRACK_BYTES as u64 {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(path).await else {
+            continue;
+        };
+        let Ok(saved) =
+            serde_json::from_slice::<PersistedExternalSubtitleRoutes>(&bytes)
+        else {
+            continue;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now.saturating_sub(saved.saved_at_unix) >= GOOD_TRACK_CACHE_TTL.as_secs()
+            || (actual != source_id && actual != saved.actual_source_id)
+            || (saved
+                .source_identity
+                .is_some()
+                && subtitle_route_source_identity(ctx, saved.actual_source_id).await
+                    != saved.source_identity)
+        {
+            continue;
+        }
+        save_subtitle_source(
+            ctx,
+            device_id,
+            item_id,
+            source_id,
+            saved.actual_source_id,
+        );
+        save_external_subtitle_routes(ctx, device_id, item_id, source_id, saved.routes);
+        break;
+    }
+}
+
+async fn persist_external_subtitle_routes(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    source_id: Uuid,
+) -> anyhow::Result<()> {
+    let Some(routes) =
+        load_external_subtitle_routes(ctx, device_id, item_id, source_id)
+            .filter(|routes| !routes.is_empty())
+    else {
+        return Ok(());
+    };
+    let actual_source_id = resolve_subtitle_source(ctx, device_id, item_id, source_id);
+    let saved = PersistedExternalSubtitleRoutes {
+        saved_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+        actual_source_id,
+        source_identity: subtitle_route_source_identity(ctx, actual_source_id).await,
+        routes: routes
+            .as_ref()
+            .clone(),
+    };
+    let bytes = serde_json::to_vec(&saved)?;
+    if bytes.len() > MAX_GOOD_TRACK_BYTES {
+        anyhow::bail!("subtitle route catalogue is too large");
+    }
+    save_subtitle_cache_file(
+        ctx,
+        &external_subtitle_routes_path(ctx, device_id, item_id, source_id),
+        &bytes,
+    )
+    .await
 }
 
 // Item and PlaybackInfo requests may publish tracks concurrently. Keep their
@@ -2019,6 +2169,15 @@ async fn subtitles_stream_inner(
     bypass: bool,
 ) -> Result<impl IntoResponse> {
     let advertised_source_id = media_source_id;
+    restore_external_subtitle_routes(
+        &state.ctx,
+        &session
+            .device
+            .id,
+        item_id,
+        advertised_source_id,
+    )
+    .await;
     let media_source_id = resolve_subtitle_source(
         &state.ctx,
         &session
@@ -3010,6 +3169,9 @@ pub(crate) async fn append_external_subtitles_with_context(
     dedup: SubtitleDedupSettings,
     release_ready_first_redirect: bool,
 ) {
+    for source in media_sources.iter() {
+        restore_external_subtitle_routes(ctx, device_id, item_id, source.id).await;
+    }
     let restore_targets = append_external_subtitles_inner(
         Some(ctx),
         device_id,
@@ -3022,6 +3184,13 @@ pub(crate) async fn append_external_subtitles_with_context(
         dedup,
         release_ready_first_redirect,
     );
+    for source in media_sources.iter() {
+        if let Err(error) =
+            persist_external_subtitle_routes(ctx, device_id, item_id, source.id).await
+        {
+            warn!(%item_id, %error, "could not persist subtitle routes");
+        }
+    }
     for (source_index, stream_index, subtitle_id, language) in restore_targets {
         if let Some(source) = media_sources.get_mut(source_index) {
             let source_id = source.id;
@@ -3346,16 +3515,23 @@ async fn retain_servable_dub_subtitles(
     item: Uuid,
     device_id: &str,
     languages: &[String],
+    api_key: &str,
 ) {
     // A cache outage must not add two seconds for every track/version.
     // Local cached text is still checked after this network budget expires.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     for source in sources {
-        if !crate::services::dubmux::is_mux_path(
+        let mux_path = crate::services::dubmux::is_mux_path(
             source
                 .path
                 .as_deref(),
-        ) {
+        );
+        if !mux_path
+            && source
+                .native_stream_index_max
+                .unwrap_or(-1)
+                < crate::services::dubmux::SUBTITLE_INDEX_OFFSET
+        {
             continue;
         }
         let actual = resolve_subtitle_source(&state.ctx, device_id, item, source.id);
@@ -3368,15 +3544,15 @@ async fn retain_servable_dub_subtitles(
         .await
         .ok()
         .flatten();
+        if !mux_path
+            && !row
+                .as_ref()
+                .is_some_and(crate::services::dubmux::is_dubmux_row)
+        {
+            continue;
+        }
         let mut available = std::collections::HashSet::new();
         if let Some(row) = row.filter(|row| row.kind == db::MediaKind::Stream) {
-            let allow_extraction = row
-                .allows_subtitle_extraction(
-                    &state
-                        .ctx
-                        .db,
-                )
-                .await;
             if let Some(probe) = &row.probe_data {
                 for stream in &probe.media_streams {
                     if stream.type_ != Some(api::MediaStreamType::Subtitle)
@@ -3411,7 +3587,7 @@ async fn retain_servable_dub_subtitles(
                     )
                     .await
                     .is_some();
-                    if allow_extraction || cached {
+                    if cached {
                         available.insert(stream.index);
                         // A cached external copy is usable even when the device
                         // cannot embed ASS and remote extraction is disabled.
@@ -3424,16 +3600,14 @@ async fn retain_servable_dub_subtitles(
                                 .media_streams
                                 .push(stream.clone());
                         }
-                        if cached {
-                            if let Some(track) = source
-                                .media_streams
-                                .iter_mut()
-                                .find(|s| s.index == stream.index)
-                            {
-                                track.supports_external_stream = true;
-                                track.delivery_method =
-                                    Some(api::SubtitleDeliveryMethod::External);
-                            }
+                        if let Some(track) = source
+                            .media_streams
+                            .iter_mut()
+                            .find(|s| s.index == stream.index)
+                        {
+                            present_cached_dub_subtitle(
+                                track, item, source.id, api_key,
+                            );
                         }
                     }
                 }
@@ -3468,7 +3642,7 @@ pub(crate) async fn inject_prefetched_external_subtitles(
     state: &AppState,
     media_sources: &mut [api::MediaSourceInfo],
     item_id: Uuid,
-    subs: Vec<crate::addons::SubtitleInfo>,
+    mut subs: Vec<crate::addons::SubtitleInfo>,
     sub_langs: &[String],
     device_profile: Option<&api::DeviceProfile>,
     api_key: &str,
@@ -3477,8 +3651,106 @@ pub(crate) async fn inject_prefetched_external_subtitles(
     release_ready_first_redirect: bool,
     empty_gate_policy: EmptySubtitleGatePolicy,
 ) {
-    retain_servable_dub_subtitles(state, media_sources, item_id, device_id, sub_langs)
-        .await;
+    // A provider can return a broken placeholder, an empty list, or disappear.
+    // Reuse only locally validated text from tracks this device was shown.
+    // Historical descriptors never trigger background network reads here.
+    let requirements = subtitle_requirements(state, item_id, None, false).await;
+    let mut saved_by_source =
+        std::collections::HashMap::<Uuid, Vec<crate::addons::SubtitleInfo>>::new();
+    for source in media_sources.iter() {
+        let saved_subs = saved_by_source
+            .entry(source.id)
+            .or_default();
+        restore_external_subtitle_routes(&state.ctx, device_id, item_id, source.id)
+            .await;
+        if let Some(routes) =
+            load_external_subtitle_routes(&state.ctx, device_id, item_id, source.id)
+        {
+            for route in routes.iter() {
+                let sub = &route.subtitle;
+                if saved_subs
+                    .iter()
+                    .any(|current| current.id == sub.id && current.lang == sub.lang)
+                {
+                    continue;
+                }
+                let needs = quality::Requirements {
+                    forced: sub.is_forced,
+                    ..requirements
+                };
+                let ready = good_track_key(
+                    "ready",
+                    item_id,
+                    Some(resolve_subtitle_source(
+                        &state.ctx, device_id, item_id, source.id,
+                    )),
+                    &sub.id,
+                    sub.lang
+                        .as_deref(),
+                    Some("vtt"),
+                );
+                let alias_ready = good_track_key(
+                    "ready",
+                    item_id,
+                    Some(source.id),
+                    &sub.id,
+                    sub.lang
+                        .as_deref(),
+                    Some("vtt"),
+                );
+                let raw = good_track_key(
+                    "raw",
+                    item_id,
+                    None,
+                    &sub.id,
+                    sub.lang
+                        .as_deref(),
+                    None,
+                );
+                let mut usable = false;
+                for key in [ready, alias_ready, raw]
+                    .into_iter()
+                    .flatten()
+                {
+                    if load_usable_track(&state.ctx, &key, needs)
+                        .await
+                        .is_some()
+                    {
+                        usable = true;
+                        break;
+                    }
+                }
+                if usable {
+                    saved_subs.push(sub.clone());
+                }
+            }
+        }
+    }
+    subs.retain(|current| {
+        !media_sources
+            .iter()
+            .filter(|source| has_real_probe_data(source))
+            .all(|source| {
+                saved_by_source
+                    .get(&source.id)
+                    .is_some_and(|saved| {
+                        saved
+                            .iter()
+                            .any(|saved| {
+                                saved.id == current.id && saved.lang == current.lang
+                            })
+                    })
+            })
+    });
+    retain_servable_dub_subtitles(
+        state,
+        media_sources,
+        item_id,
+        device_id,
+        sub_langs,
+        api_key,
+    )
+    .await;
     let subs = validate_external_subtitles_for_advertising(
         state,
         item_id,
@@ -3489,13 +3761,24 @@ pub(crate) async fn inject_prefetched_external_subtitles(
         dedup,
     )
     .await;
-
-    if subs.is_empty()
-        && matches!(empty_gate_policy, EmptySubtitleGatePolicy::AllSources)
+    for (index, source) in media_sources
+        .iter_mut()
+        .enumerate()
     {
-        for (index, source) in media_sources
-            .iter_mut()
-            .enumerate()
+        let mut scoped = subs.clone();
+        for saved in saved_by_source
+            .remove(&source.id)
+            .unwrap_or_default()
+        {
+            if !scoped
+                .iter()
+                .any(|current| current.id == saved.id && current.lang == saved.lang)
+            {
+                scoped.push(saved);
+            }
+        }
+        if scoped.is_empty()
+            && matches!(empty_gate_policy, EmptySubtitleGatePolicy::AllSources)
         {
             advertise_subtitle_gate(
                 &state.ctx,
@@ -3505,23 +3788,22 @@ pub(crate) async fn inject_prefetched_external_subtitles(
                 index,
                 release_ready_first_redirect,
             );
+            continue;
         }
-        return;
+        append_external_subtitles_with_context(
+            &state.ctx,
+            device_id,
+            std::slice::from_mut(source),
+            &scoped,
+            sub_langs,
+            device_profile,
+            item_id,
+            api_key,
+            dedup,
+            release_ready_first_redirect && index == 0,
+        )
+        .await;
     }
-
-    append_external_subtitles_with_context(
-        &state.ctx,
-        device_id,
-        media_sources,
-        &subs,
-        sub_langs,
-        device_profile,
-        item_id,
-        api_key,
-        dedup,
-        release_ready_first_redirect,
-    )
-    .await;
 }
 
 /// PATCH (uduchi2nd): the "[+VN dub]" muxed rows carry the HQ release's
@@ -3567,6 +3849,48 @@ fn external_subtitle_labels<'a>(
             }
         })
         .collect()
+}
+
+fn present_cached_dub_subtitle(
+    stream: &mut api::MediaStream,
+    item_id: Uuid,
+    source_id: Uuid,
+    api_key: &str,
+) {
+    let idx = stream.index;
+    stream.is_external = true;
+    stream.supports_external_stream = true;
+    stream.is_text_subtitle_stream = true;
+    // The client receives converted WebVTT, not the source ASS bytes.
+    // Keep the stored probe's codec unchanged for release extraction.
+    stream.codec = Some("vtt".into());
+    stream.delivery_method = Some(api::SubtitleDeliveryMethod::External);
+    stream.delivery_url = Some(format!(
+        "/Videos/{item_id}/{source_id}/Subtitles/{idx}/0/Stream.vtt?ApiKey={api_key}"
+    ));
+    // "(release)": tells the viewer this is the HQ release's own
+    // text track, not the addon one (both show as external here).
+    let lang = stream
+        .language
+        .clone()
+        .unwrap_or_else(|| "und".into());
+    if stream
+        .path
+        .is_none()
+    {
+        // the trailing ".<lang>.vtt" is how Jellyfin sidecars carry
+        // their language; VidHub's language preference reads it
+        // (2026-10-02: it picked the first track, Chinese, without)
+        let name = remux_sdks::remux::language_label(&lang);
+        stream.path = Some(format!("{name} (release).{lang}.vtt"));
+    }
+    // "English (release)", like the online tracks' "English (online)"
+    let forced = stream.is_forced;
+    stream.display_title = Some(format!(
+        "{}{} (release)",
+        remux_sdks::remux::language_label(&lang),
+        if forced { " forced" } else { "" }
+    ));
 }
 
 pub(crate) fn present_dub_row_embedded_subtitles(
@@ -3617,40 +3941,7 @@ pub(crate) fn present_dub_row_embedded_subtitles(
             {
                 continue;
             }
-            let idx = stream.index;
-            stream.is_external = true;
-            stream.supports_external_stream = true;
-            stream.is_text_subtitle_stream = true;
-            // The client receives converted WebVTT, not the source ASS bytes.
-            // Keep the stored probe's codec unchanged for release extraction.
-            stream.codec = Some("vtt".into());
-            stream.delivery_method = Some(api::SubtitleDeliveryMethod::External);
-            stream.delivery_url = Some(format!(
-                "/Videos/{item_id}/{source_id}/Subtitles/{idx}/0/Stream.vtt?ApiKey={api_key}"
-            ));
-            // "(release)": tells the viewer this is the HQ release's own
-            // text track, not the addon one (both show as external here).
-            let lang = stream
-                .language
-                .clone()
-                .unwrap_or_else(|| "und".into());
-            if stream
-                .path
-                .is_none()
-            {
-                // the trailing ".<lang>.vtt" is how Jellyfin sidecars carry
-                // their language; VidHub's language preference reads it
-                // (2026-10-02: it picked the first track, Chinese, without)
-                let name = remux_sdks::remux::language_label(&lang);
-                stream.path = Some(format!("{name} (release).{lang}.vtt"));
-            }
-            // "English (release)", like the online tracks' "English (online)"
-            let forced = stream.is_forced;
-            stream.display_title = Some(format!(
-                "{}{} (release)",
-                remux_sdks::remux::language_label(&lang),
-                if forced { " forced" } else { "" }
-            ));
+            present_cached_dub_subtitle(stream, item_id, source_id, api_key);
         }
     }
 }
@@ -3740,7 +4031,15 @@ fn has_supported_embedded_subtitle(
         .iter()
         .any(|stream| {
             if stream.type_ != Some(api::MediaStreamType::Subtitle)
-                || stream.is_external
+                || (stream.is_external
+                    && !(source
+                        .native_stream_index_max
+                        .is_some_and(|max| stream.index <= max)
+                        && stream.index
+                            >= crate::services::dubmux::SUBTITLE_INDEX_OFFSET
+                        && stream.supports_external_stream
+                        && stream.delivery_method
+                            == Some(api::SubtitleDeliveryMethod::External)))
                 || stream.is_forced != external.is_forced
                 || stream.is_hearing_impaired != external.is_hi
                 || crate::subtitle_selection::normalized_language(
@@ -3975,6 +4274,29 @@ mod tests {
         );
         assert_eq!(pruned.len(), 1);
         assert_eq!(pruned[0].path, std::path::PathBuf::from("old-good"));
+
+        let pruned = select_cache_files_to_prune(
+            vec![
+                test_cache_file(
+                    "old-routes",
+                    PersistedSubtitleCacheKind::Routes,
+                    40,
+                    1,
+                ),
+                test_cache_file("good", PersistedSubtitleCacheKind::GoodTrack, 40, 2),
+                test_cache_file(
+                    "new-routes",
+                    PersistedSubtitleCacheKind::Routes,
+                    40,
+                    3,
+                ),
+            ],
+            100,
+            1,
+            1,
+        );
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].path, std::path::PathBuf::from("old-routes"));
 
         let pruned = select_cache_files_to_prune(
             vec![
@@ -5782,6 +6104,217 @@ mod advertised_external_route_tests {
             )
             .unwrap()
             .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_routes_restore_aligned_tracks_without_provider_results_or_raw_text()
+    {
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let state = crate::AppState {
+            tasks: crate::tasks::TaskService::new(ctx.clone())
+                .await
+                .unwrap(),
+            ctx: ctx.clone(),
+        };
+        let item = Uuid::new_v4();
+        let source_id = Uuid::new_v4();
+        let subtitle = crate::addons::SubtitleInfo {
+            id: "retained-vietnamese".into(),
+            url: Some(crate::stream::StreamDescriptor::http(
+                "https://offline.invalid/gone.vtt",
+            )),
+            lang: Some("vi".into()),
+            is_forced: false,
+            is_hi: false,
+            filename: None,
+            from_trusted: None,
+            ai_translated: None,
+        };
+        save_external_subtitle_routes(
+            ctx,
+            "test-device",
+            item,
+            source_id,
+            vec![ExternalSubtitleRoute {
+                index: 125,
+                subtitle: subtitle.clone(),
+            }],
+        );
+        persist_external_subtitle_routes(ctx, "test-device", item, source_id)
+            .await
+            .unwrap();
+        let ready = good_track_key(
+            "ready",
+            item,
+            Some(source_id),
+            &subtitle.id,
+            Some("vi"),
+            Some("vtt"),
+        )
+        .unwrap();
+        save_good_track(
+            ctx,
+            &ready,
+            &axum::body::Bytes::from_static(
+                b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nXin chao\n",
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+        ctx.store
+            .delete(external_subtitle_routes_key("test-device", item, source_id));
+        let source = api::MediaSourceInfo {
+            id: source_id,
+            native_stream_index_max: Some(123),
+            media_streams: vec![api::MediaStream {
+                index: 0,
+                type_: Some(api::MediaStreamType::Video),
+                ..Default::default()
+            }],
+            remux: Some(api::MediaSourceRemuxInfo {
+                source: Some(api::ProbeOrigin::Ffprobe),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut other = source.clone();
+        other.id = Uuid::new_v4();
+        other.native_stream_index_max = Some(1);
+        let mut sources = [source, other];
+        inject_prefetched_external_subtitles(
+            &state,
+            &mut sources,
+            item,
+            Vec::new(),
+            &["vi".into()],
+            None,
+            "fixture-token",
+            "test-device",
+            SubtitleDedupSettings {
+                enabled: true,
+                max_external_per_language_when_disabled: 1,
+            },
+            false,
+            EmptySubtitleGatePolicy::AllSources,
+        )
+        .await;
+        let source = &sources[0];
+        assert!(
+            !sources[1]
+                .media_streams
+                .iter()
+                .any(|stream| stream.type_ == Some(api::MediaStreamType::Subtitle)),
+            "an alignment cached for one release must not be advertised on another"
+        );
+        assert_eq!(
+            source
+                .media_streams
+                .len(),
+            2
+        );
+        assert_eq!(source.media_streams[1].index, 125);
+        let routes =
+            load_external_subtitle_routes(ctx, "test-device", item, source_id).unwrap();
+        let restored = external_subtitle_route_for_index(&routes, 125).unwrap();
+        let response = external_subtitle_route_response(
+            &state,
+            None,
+            item,
+            source_id,
+            125,
+            &restored.subtitle,
+            "webvtt",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["X-Remux-Subtitle-Alignment"], "aligned");
+
+        // Monthly metadata expiry must not resurrect an old published entry.
+        let path = external_subtitle_routes_path(ctx, "test-device", item, source_id);
+        let mut record: PersistedExternalSubtitleRoutes = serde_json::from_slice(
+            &tokio::fs::read(&path)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        record.saved_at_unix = record
+            .saved_at_unix
+            .saturating_sub(GOOD_TRACK_CACHE_TTL.as_secs() + 1);
+        tokio::fs::write(&path, serde_json::to_vec(&record).unwrap())
+            .await
+            .unwrap();
+        ctx.store
+            .delete(external_subtitle_routes_key("test-device", item, source_id));
+        restore_external_subtitle_routes(ctx, "test-device", item, source_id).await;
+        assert!(
+            load_external_subtitle_routes(ctx, "test-device", item, source_id)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_release_identity_cannot_restore_saved_subtitle_routes() {
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let mut row = crate::integration_test::insert_test_source(ctx).await;
+        row.stream_info
+            .as_mut()
+            .unwrap()
+            .descriptor = crate::stream::StreamDescriptor::http(
+            "https://offline.invalid/release.mkv",
+        );
+        row.stream_info
+            .as_mut()
+            .unwrap()
+            .filename = Some("release.mkv".into());
+        row.stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(10_000);
+        row.save(&ctx.db)
+            .await
+            .unwrap();
+        let item = Uuid::new_v4();
+        let subtitle = crate::addons::SubtitleInfo {
+            id: "guarded".into(),
+            url: None,
+            lang: Some("vi".into()),
+            is_forced: false,
+            is_hi: false,
+            filename: None,
+            from_trusted: None,
+            ai_translated: None,
+        };
+        save_external_subtitle_routes(
+            ctx,
+            "test-device",
+            item,
+            row.id,
+            vec![ExternalSubtitleRoute {
+                index: 125,
+                subtitle,
+            }],
+        );
+        persist_external_subtitle_routes(ctx, "test-device", item, row.id)
+            .await
+            .unwrap();
+        row.stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(20_000);
+        row.save(&ctx.db)
+            .await
+            .unwrap();
+        ctx.store
+            .delete(external_subtitle_routes_key("test-device", item, row.id));
+        restore_external_subtitle_routes(ctx, "test-device", item, row.id).await;
+        assert!(
+            load_external_subtitle_routes(ctx, "test-device", item, row.id).is_none()
         );
     }
 

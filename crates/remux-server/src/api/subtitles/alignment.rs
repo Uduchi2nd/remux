@@ -1556,6 +1556,7 @@ mod tests {
             item,
             "test-player",
             &["vi".into(), "en".into()],
+            "test-token",
         )
         .await;
         assert!(
