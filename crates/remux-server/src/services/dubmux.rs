@@ -964,20 +964,16 @@ async fn existing_dub_rows(ctx: &AppContext, media: &db::Media) -> Vec<db::Media
     rows
 }
 
-/// The preparation pause must not hide completed cached playback. This path
-/// only GETs small cache metadata; it never prepares, starts, or registers a
+/// Completed cached playback survives provider refreshes with preparation
+/// enabled or paused. This path only GETs small cache metadata; it never
+/// prepares, starts, or registers a
 /// source. A match record alone is insufficient: the service must confirm a
 /// complete, decode-checked local mux with its seekable-file layout intact.
 pub(crate) async fn restore_cached_dub_rows(
     ctx: &AppContext,
     media: &db::Media,
 ) -> Vec<db::Media> {
-    if ctx
-        .config
-        .dubmux_url
-        .is_some()
-        || !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
-    {
+    if !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
         return vec![];
     }
     let Some(base) = ctx

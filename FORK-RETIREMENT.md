@@ -80,6 +80,13 @@ must not offer that pending track as a playable subtitle. The cold Item control
 uses an HTTP-redirect addon and verifies that an allowed but uncached track is
 absent while its cached neighbour is advertised and delivered.
 
+Completed-cache discovery also runs while automatic preparation is enabled.
+A provider refresh can replace the HQ source ID without invalidating an already
+completed, decode-checked local mux. Its cached row must remain visible and
+retain its subtitle routes. Both preparation modes are covered by cold Item
+HTTP controls with a stale stored row, a valid cached-file reply and no prepare
+POSTs. The same bounded read-only cache lookup serves both modes.
+
 ## What currently belongs in remux
 
 | Change | Purpose | Retirement evidence |

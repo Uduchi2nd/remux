@@ -13,6 +13,15 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn cold_item_autoplay_alias_only_advertises_ready_cached_dub_text() {
+    cached_dub_item_after_refresh(false).await;
+}
+
+#[tokio::test]
+async fn cold_item_restores_completed_dub_with_preparation_enabled() {
+    cached_dub_item_after_refresh(true).await;
+}
+
+async fn cached_dub_item_after_refresh(preparation_enabled: bool) {
     let provider = httpmock::MockServer::start_async().await;
     provider
         .mock_async(|when, then| {
@@ -42,6 +51,23 @@ async fn cold_item_autoplay_alias_only_advertises_ready_cached_dub_text() {
                 .body("1\n00:00:01,000 --> 00:00:02,000\nXin chao\n\n");
         })
         .await;
+    provider
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path_matches(regex::Regex::new(r"^/cached/[^/]+/[^/]+$").unwrap());
+            then.status(200)
+                .json_body(json!({"status":"ready", "result":{
+                    "video_check":"ok", "file_ready":true, "file_size":10000
+                }}));
+        })
+        .await;
+    let prepare = provider
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/prepare");
+            then.status(503);
+        })
+        .await;
     let data = tempfile::tempdir().unwrap();
     let (app, ctx) = init_app_with_ctx(Config {
         data_dir: data
@@ -51,6 +77,9 @@ async fn cold_item_autoplay_alias_only_advertises_ready_cached_dub_text() {
         torrent_http_port: None,
         torrent_peer_port: None,
         disable_dht: true,
+        dubmux_url: preparation_enabled.then(|| provider.base_url()),
+        dubmux_public_url: Some(provider.base_url()),
+        dubmux_cache_url: Some(provider.base_url()),
         dubmux_subtitle_cache_url: Some(provider.base_url()),
         ..Default::default()
     })
@@ -109,6 +138,7 @@ async fn cold_item_autoplay_alias_only_advertises_ready_cached_dub_text() {
             episode: None,
         }),
         title: "Cold cached dub".into(),
+        original_language: Some("ja".into()),
         kind: db::MediaKind::Movie,
         external_ids,
         runtime: Some(10),
@@ -123,7 +153,7 @@ async fn cold_item_autoplay_alias_only_advertises_ready_cached_dub_text() {
         .unwrap();
     let mut row = db::Media {
         id: Uuid::new_v4(),
-        title: "Cached dub source".into(),
+        title: "[+VN dub · kkphim] Cached dub source".into(),
         kind: db::MediaKind::Stream,
         parent_id: Some(movie.id),
         stream_info: Some(StreamInfo {
@@ -207,6 +237,14 @@ async fn cold_item_autoplay_alias_only_advertises_ready_cached_dub_text() {
     )
     .await
     .unwrap();
+    // The provider refresh has replaced its list. Only a completed-cache
+    // lookup can bring this older synthetic row back, in either job mode.
+    sqlx::query("UPDATE media SET updated_at=? WHERE id=?")
+        .bind(now - chrono::Duration::days(1))
+        .bind(row.id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
     let response = server
         .get(&format!("/items/{}", movie.id))
         .add_header(AUTHORIZATION, auth.clone())
@@ -246,6 +284,13 @@ async fn cold_item_autoplay_alias_only_advertises_ready_cached_dub_text() {
         subtitles
             .text()
             .contains("Xin chao")
+    );
+    assert_eq!(
+        prepare
+            .hits_async()
+            .await,
+        0,
+        "cache restoration must not prepare media"
     );
     ctx.shutdown()
         .await;
