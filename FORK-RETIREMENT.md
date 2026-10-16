@@ -460,3 +460,17 @@ Client-facing release tracks identify their delivered WebVTT codec accurately;
 the stored original ASS codec remains unchanged. Cache-only network lookups
 share one two-second metadata budget across tracks and versions, while local
 cached text remains usable after that budget expires.
+
+Detail-page latency follow-up: unchanged completed dub rows no longer enter the
+global database write gate on every Item read. Stale rows are still restored
+after provider refresh, and changed cache size, probe or ordering is persisted.
+Identical unexpired subtitle bodies and route catalogues retain their original
+timestamp instead of being rewritten and triggering another complete cache
+scan. Necessary pruning batches filesystem operations in one blocking task;
+the shared 200 MiB limit, 512-entry limits and 30-day retention still apply.
+Item stage timings distinguish source refresh, cache restoration, metadata and
+subtitle work without logging credentials or source URLs. Public Item tests
+cover stale restoration, unchanged reads and changed metadata in both automatic
+preparation modes; filesystem tests exercise expiry and count/byte eviction.
+Retire when upstream preserves these behaviors without read-side write or
+filesystem-scan amplification.

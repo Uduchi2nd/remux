@@ -51,7 +51,7 @@ async fn cached_dub_item_after_refresh(preparation_enabled: bool) {
                 .body("1\n00:00:01,000 --> 00:00:02,000\nXin chao\n\n");
         })
         .await;
-    provider
+    let cached = provider
         .mock_async(|when, then| {
             when.method(httpmock::Method::GET)
                 .path_matches(regex::Regex::new(r"^/cached/[^/]+/[^/]+$").unwrap());
@@ -272,6 +272,63 @@ async fn cached_dub_item_after_refresh(preparation_enabled: bool) {
             .iter()
             .any(|s| s["Index"] == 124),
         "uncached mux text must stay hidden: {summary:?}"
+    );
+    let restored = db::Media::get_by_id(&ctx.db, &row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        restored.updated_at >= now,
+        "a stale completed row must be restored"
+    );
+    let repeated = server
+        .get(&format!("/items/{}", movie.id))
+        .add_header(AUTHORIZATION, auth.clone())
+        .await;
+    let repeated_body: serde_json::Value = repeated.json();
+    assert_eq!(repeated_body["MediaSources"][0]["Size"], 10000);
+    let unchanged = db::Media::get_by_id(&ctx.db, &row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged.updated_at, restored.updated_at,
+        "reading an unchanged visible dub must not rewrite the database"
+    );
+
+    cached
+        .delete_async()
+        .await;
+    provider
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path_matches(regex::Regex::new(r"^/cached/[^/]+/[^/]+$").unwrap());
+            then.status(200)
+                .json_body(json!({"status":"ready", "result":{
+                    "video_check":"ok", "file_ready":true, "file_size":12000
+                }}));
+        })
+        .await;
+    let changed = server
+        .get(&format!("/items/{}", movie.id))
+        .add_header(AUTHORIZATION, auth.clone())
+        .await;
+    let changed_body: serde_json::Value = changed.json();
+    assert_eq!(changed_body["MediaSources"][0]["Size"], 12000);
+    let updated = db::Media::get_by_id(&ctx.db, &row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        updated
+            .stream_info
+            .unwrap()
+            .size,
+        Some(12000)
+    );
+    assert!(
+        updated.updated_at > restored.updated_at,
+        "changed completed-cache metadata must still be persisted"
     );
     let subtitles = server
         .get(&format!(

@@ -1670,6 +1670,7 @@ async fn item_for_user(
     fields: Option<&[api::ItemFields]>,
     target_user_id: Option<Uuid>,
 ) -> Result<Option<api::BaseItemDto>> {
+    let detail_started = std::time::Instant::now();
     let want_streams = fields
         .map(|f| f.contains(&api::ItemFields::MediaSources))
         .unwrap_or(true);
@@ -1752,6 +1753,7 @@ async fn item_for_user(
     )
     .await;
 
+    let loaded_at = detail_started.elapsed();
     let needs_streams = want_streams
         && matches!(
             media.kind,
@@ -1817,6 +1819,7 @@ async fn item_for_user(
                 .id,
         );
     }
+    let refreshed_at = detail_started.elapsed();
 
     // PATCH (uduchi2nd, 2026-09-29): a page opened without MediaSources (or a
     // show page) fetches the stream list in the background, so pressing play
@@ -2059,6 +2062,7 @@ async fn item_for_user(
                 .db,
         )
         .await?;
+    let sources_at = detail_started.elapsed();
     // Native clients choose their player and tracks from the item document,
     // before PlaybackInfo. Do not advertise a filename guess (often MP4 with
     // no audio) for a known HLS source. Reuse the normal persisted probe cache.
@@ -2612,6 +2616,7 @@ async fn item_for_user(
         }
     }
 
+    let subtitles_started_at = detail_started.elapsed();
     if want_streams
         && server_config
             .enable_subtitles_detail
@@ -2714,6 +2719,7 @@ async fn item_for_user(
             }
         }
     }
+    let subtitles_finished_at = detail_started.elapsed();
     if want_streams
         && session
             .device
@@ -2744,6 +2750,15 @@ async fn item_for_user(
         }
     }
     apply_permissions(&mut base_item, &session.user);
+    if needs_streams {
+        tracing::info!(target: "remux_server::item_detail", item=%id,
+            base_ms=loaded_at.as_millis(),
+            refresh_ms=(refreshed_at-loaded_at).as_millis(),
+            sources_ms=(sources_at-refreshed_at).as_millis(),
+            presentation_ms=(subtitles_started_at-sources_at).as_millis(),
+            subtitles_ms=(subtitles_finished_at-subtitles_started_at).as_millis(),
+            total_ms=detail_started.elapsed().as_millis(), "item detail ready");
+    }
     Ok(Some(base_item))
 }
 

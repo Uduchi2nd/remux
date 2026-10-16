@@ -1007,7 +1007,22 @@ pub(crate) async fn restore_cached_dub_rows(
     else {
         return vec![];
     };
+    let lookup_started = std::time::Instant::now();
     let mut stored = existing_dub_rows(ctx, media).await;
+    let previous: std::collections::HashMap<_, _> = stored
+        .iter()
+        .map(|row| {
+            (
+                row.id,
+                (
+                    row.updated_at,
+                    row.idx,
+                    serde_json::to_value(&row.stream_info).ok(),
+                    serde_json::to_value(&row.probe_data).ok(),
+                ),
+            )
+        })
+        .collect();
     stored.sort_by_key(|row| {
         row.idx
             .unwrap_or(i64::MAX)
@@ -1039,12 +1054,37 @@ pub(crate) async fn restore_cached_dub_rows(
         .map(|row| row.id)
         .collect();
     order_rows(&mut rows, &checked);
-    if !rows.is_empty()
-        && let Err(error) = db::Media::upsert(&ctx.db, &rows).await
+    let lookup_ms = lookup_started
+        .elapsed()
+        .as_millis();
+    // Already-visible, unchanged rows need no write. Otherwise a detail-page
+    // read queues behind every library refresh in the global DB write gate.
+    let dirty: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            let Some((updated, idx, info, probe)) = previous.get(&row.id) else {
+                return true;
+            };
+            media
+                .streams_refreshed_at
+                .is_some_and(|refreshed| *updated < refreshed)
+                || *idx != row.idx
+                || *info != serde_json::to_value(&row.stream_info).ok()
+                || *probe != serde_json::to_value(&row.probe_data).ok()
+        })
+        .cloned()
+        .collect();
+    let write_started = std::time::Instant::now();
+    if !dirty.is_empty()
+        && let Err(error) = db::Media::upsert(&ctx.db, &dirty).await
     {
         warn!(item = %media.id, "cached dub row restore failed: {error:#}");
         return vec![];
     }
+    tracing::info!(target:"remux_server::item_detail", item=%media.id,
+        lookup_ms, write_ms=write_started.elapsed().as_millis(), written=dirty.len(),
+        visible=rows.len(), "completed dub cache checked");
+
     rows
 }
 

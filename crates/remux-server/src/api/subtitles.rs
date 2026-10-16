@@ -237,6 +237,27 @@ async fn save_subtitle_cache_file(
         use std::os::unix::fs::PermissionsExt as _;
         tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
     }
+    // Repeated Item/PlaybackInfo documents often publish identical bodies or
+    // route catalogues. Preserve their original retention timestamp and avoid
+    // rewriting/pruning the entire cache for an unchanged valid record.
+    if let Ok(metadata) = tokio::fs::metadata(path).await {
+        if metadata.len() <= (MAX_GOOD_TRACK_BYTES * 6 + 1024) as u64 {
+            if let Ok(previous) = tokio::fs::read(path).await {
+                if persisted_cache_payload_unchanged(&previous, bytes) {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        tokio::fs::set_permissions(
+                            path,
+                            std::fs::Permissions::from_mode(0o600),
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
     let staging = dir.join(format!(".{}.tmp", Uuid::new_v4()));
     tokio::fs::write(&staging, bytes).await?;
     #[cfg(unix)]
@@ -254,10 +275,51 @@ async fn save_subtitle_cache_file(
     Ok(())
 }
 
+/// Equal cache content does not require a fresh disk write. Expired records
+/// still get replaced, and changed language/timing/sync metadata always writes.
+fn persisted_cache_payload_unchanged(previous: &[u8], current: &[u8]) -> bool {
+    let (Ok(mut previous), Ok(mut current)) = (
+        serde_json::from_slice::<serde_json::Value>(previous),
+        serde_json::from_slice::<serde_json::Value>(current),
+    ) else {
+        return false;
+    };
+    let (Some(previous), Some(current)) =
+        (previous.as_object_mut(), current.as_object_mut())
+    else {
+        return false;
+    };
+    let (Some(saved), Some(now)) = (
+        previous
+            .remove("saved_at_unix")
+            .and_then(|v| v.as_u64()),
+        current
+            .remove("saved_at_unix")
+            .and_then(|v| v.as_u64()),
+    ) else {
+        return false;
+    };
+    now.saturating_sub(saved) < GOOD_TRACK_CACHE_TTL.as_secs() && previous == current
+}
+
 pub(super) async fn prune_persisted_subtitle_caches(data_dir: &std::path::Path) {
     let _guard = PERSISTED_SUBTITLE_CACHE_PRUNE_LOCK
         .lock()
         .await;
+    let data_dir = data_dir.to_path_buf();
+    // Each async DirEntry::metadata previously dispatched another blocking job.
+    // A directory scan is one bounded blocking operation, not hundreds of
+    // sequential round trips through Tokio's blocking pool per written track.
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        prune_persisted_subtitle_caches_blocking(&data_dir);
+    })
+    .await
+    {
+        warn!(?error, "subtitle cache pruning task failed");
+    }
+}
+
+fn prune_persisted_subtitle_caches_blocking(data_dir: &std::path::Path) {
     let mut files = Vec::new();
     for (directory, kind) in [
         (
@@ -270,18 +332,11 @@ pub(super) async fn prune_persisted_subtitle_caches(data_dir: &std::path::Path) 
         ),
         ("subtitle-routes", PersistedSubtitleCacheKind::Routes),
     ] {
-        let Ok(mut entries) = tokio::fs::read_dir(data_dir.join(directory)).await
-        else {
+        let Ok(entries) = std::fs::read_dir(data_dir.join(directory)) else {
             continue;
         };
-        while let Ok(Some(entry)) = entries
-            .next_entry()
-            .await
-        {
-            let Ok(metadata) = entry
-                .metadata()
-                .await
-            else {
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
                 continue;
             };
             let path = entry.path();
@@ -300,7 +355,7 @@ pub(super) async fn prune_persisted_subtitle_caches(data_dir: &std::path::Path) 
                 .unwrap_or_default()
                 >= GOOD_TRACK_CACHE_TTL
             {
-                let _ = tokio::fs::remove_file(path).await;
+                let _ = std::fs::remove_file(path);
             } else {
                 files.push(PersistedSubtitleCacheFile {
                     modified,
@@ -311,15 +366,13 @@ pub(super) async fn prune_persisted_subtitle_caches(data_dir: &std::path::Path) 
             }
         }
     }
-
-    let files_to_remove = select_cache_files_to_prune(
+    for file in select_cache_files_to_prune(
         files,
         MAX_PERSISTED_SUBTITLE_CACHE_BYTES,
         MAX_PERSISTED_GOOD_TRACKS,
         MAX_PERSISTED_ALIGNMENT_FILES,
-    );
-    for file in files_to_remove {
-        let _ = tokio::fs::remove_file(file.path).await;
+    ) {
+        let _ = std::fs::remove_file(file.path);
     }
 }
 
@@ -6484,5 +6537,73 @@ mod advertised_external_route_tests {
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("Xin chao"));
+    }
+}
+
+#[cfg(test)]
+mod persistence_write_tests {
+    use super::*;
+
+    #[test]
+    fn batched_pruning_enforces_retention_counts_and_combined_bytes() {
+        let data = tempfile::tempdir().unwrap();
+        let good = data
+            .path()
+            .join("subtitle-good-tracks");
+        let aligned = data
+            .path()
+            .join("subtitle-alignment-results");
+        std::fs::create_dir(&good).unwrap();
+        std::fs::create_dir(&aligned).unwrap();
+        let now = std::time::SystemTime::now();
+        let expired = good.join("expired.json");
+        let file = std::fs::File::create(&expired).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(now - GOOD_TRACK_CACHE_TTL - Duration::from_secs(1)),
+        )
+        .unwrap();
+        let oversized = aligned.join("oversized.json");
+        let file = std::fs::File::create(&oversized).unwrap();
+        // Sparse size exercises the real byte limit without allocating 200 MB.
+        file.set_len(MAX_PERSISTED_SUBTITLE_CACHE_BYTES + 1)
+            .unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(now - Duration::from_secs(24 * 3600)),
+        )
+        .unwrap();
+        for index in 0..MAX_PERSISTED_GOOD_TRACKS + 3 {
+            std::fs::write(good.join(format!("{index}.json")), b"{}").unwrap();
+        }
+        prune_persisted_subtitle_caches_blocking(data.path());
+        assert!(!expired.exists(), "expired text must still be removed");
+        assert!(!oversized.exists(), "alignment shares the same byte budget");
+        assert_eq!(
+            std::fs::read_dir(&good)
+                .unwrap()
+                .count(),
+            MAX_PERSISTED_GOOD_TRACKS
+        );
+    }
+
+    #[test]
+    fn unchanged_cache_preserves_retention_but_changed_or_expired_records_write() {
+        let original = br#"{"saved_at_unix":100,"text":"same","auto_synced":true}"#;
+        let refreshed = br#"{"saved_at_unix":101,"text":"same","auto_synced":true}"#;
+        assert!(persisted_cache_payload_unchanged(original, refreshed));
+        assert!(!persisted_cache_payload_unchanged(
+            original,
+            br#"{"saved_at_unix":101,"text":"same","auto_synced":false}"#
+        ));
+        assert!(!persisted_cache_payload_unchanged(
+            original,
+            br#"{"saved_at_unix":101,"text":"changed","auto_synced":true}"#
+        ));
+        let expired=serde_json::to_vec(&serde_json::json!({
+            "saved_at_unix":100+GOOD_TRACK_CACHE_TTL.as_secs(),"text":"same","auto_synced":true
+        })).unwrap();
+        assert!(!persisted_cache_payload_unchanged(original, &expired));
+        assert!(!persisted_cache_payload_unchanged(b"broken", refreshed));
     }
 }
