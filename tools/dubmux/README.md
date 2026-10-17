@@ -537,6 +537,14 @@ deleted on 2026-09-29.
   pair. Versions still preparing appear on a later refresh.
 
 ## Keeper (2026-09-30)
+
+Completed muxes also survive provider ID changes through the existing
+`aliased_from` preparation records. A checked completed donor with the same
+video duration and the same cached dub input supplies the alias's segments and
+repaired byte layout. Cache browsing remains read-only; playback touches the
+donor's retention timestamp and does not reopen a paid source or duplicate the
+video. Missing, failed, rejected or differently aligned donors are not reused.
+
 `~/dubmux/keeper.sh` on the seedbox, cron every 2 min: starts the container when it is not running (rootless podman does not revive a container stopped by a SIGTERM — Whatbox maintenance on 2026-09-29 left the muxer down while every other keeper-managed container came back), and restarts it only after two failed `/health` checks in a row (5-min cooldown; a restart cuts playback). Log: `~/dubmux/keeper.log`.
 
 ## Torrentio placeholders; orphaned container after maintenance (2026-09-30)

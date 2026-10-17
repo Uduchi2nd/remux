@@ -822,7 +822,7 @@ def _playback_result(k, result):
     """Report the current file entity, including a completed layout repair."""
     result = dict(result)
     if result.get("verdict") == "accept":
-        result["video_check"] = _video_check(k)
+        result["video_check"] = _video_check(k) or _video_check(_session_dir(k).name)
         lay = _file_layout(k, k.split("__", 1)[0])
         result["file_ready"] = lay is not None
         result["file_size"] = lay[2] if lay else None
@@ -919,13 +919,15 @@ def cached_playback(dub_id: str, video_id: str):
     k = _key(_check_id(dub_id), _check_id(video_id))
     unavailable = {"status": "unknown"}
     m = _load_match(k)
-    if not m or m.get("verdict") != "accept" or _video_check(k) != "ok":
+    if not m or m.get("verdict") != "accept":
         return unavailable
     if (m.get("sync_check") or {}).get("ok") is False:
         return unavailable
     if _needs_aligned(m) and (not m.get("aligned") or not (MATCH / m["aligned"]).is_file()):
         return unavailable
     d = _session_dir(k)
+    if (_video_check(k) or _video_check(d.name)) != "ok":
+        return unavailable
     if not (d / ".done").is_file() or (d / ".failed").exists() or not _session_consistent(d):
         return unavailable
     try:
@@ -966,7 +968,57 @@ _producers: dict[str, dict] = {}   # session key -> {"proc", "start", "cursor", 
 
 
 def _session_dir(k):
-    return HLS / k
+    """Reuse completed media behind an existing same-content preparation alias.
+
+    Provider refreshes can give one release a new ID. The preparation alias
+    already reuses its alignment and segment table; keep using the completed
+    video too, without duplicating it or opening the new paid URL. An unfinished
+    alias remains its own production directory if no verified donor survives.
+    """
+    own = HLS / k
+    if (own / ".done").exists():
+        return own
+    seen = {k}
+    child = k
+    for _ in range(16):
+        match = _load_match(child) or {}
+        parent = match.get("aliased_from")
+        if not isinstance(parent, str) or parent in seen or Path(parent).name != parent \
+                or parent.count("__") != 1:
+            break
+        seen.add(parent)
+        donor = _load_match(parent) or {}
+        if not _same_mux_timeline(child, match, parent, donor):
+            break
+        directory = HLS / parent
+        if (directory / ".done").is_file() and not (directory / ".failed").exists() \
+                and _video_check(parent) == "ok":
+            return directory
+        child = parent
+    return own
+
+
+def _same_mux_timeline(left_key, left, right_key, right):
+    """Read-only guard: the same checked release and the same cached dub input."""
+    if any(m.get("verdict") != "accept" or (m.get("sync_check") or {}).get("ok") is False
+           for m in (left, right)):
+        return False
+    if not left.get("video_duration") or left.get("video_duration") != right.get("video_duration"):
+        return False
+
+    def audio(key, match):
+        if _needs_aligned(match):
+            return (MATCH / match["aligned"], 0.0) if match.get("aligned") else (None, None)
+        return AUDIO / (key.split("__", 1)[0] + ".m4a"), match.get("lag", 0.0)
+
+    left_audio, left_lag = audio(left_key, left)
+    right_audio, right_lag = audio(right_key, right)
+    if left_audio is None or right_audio is None or left_lag != right_lag:
+        return False
+    try:
+        return left_audio.samefile(right_audio)
+    except OSError:
+        return False
 
 
 def hq_id_of(k):
@@ -1829,7 +1881,10 @@ def _file_layout(k, dub_id, create=True):
 
 
 def _file_layout_locked(k, dub_id, create=True):
-    p = _file_layout_path(k)
+    d = _session_dir(k)
+    # Aliases serve the donor's exact byte representation, including any prior
+    # completed-layout repair. Ignore the alias's old raw-size estimate.
+    p = _file_layout_path(d.name)
     slots = None
     try:
         lay = json.loads(p.read_text())
@@ -1840,7 +1895,6 @@ def _file_layout_locked(k, dub_id, create=True):
         pass
     if not create and slots is None:
         return None
-    d = _session_dir(k)
     sizes = None
     src = None
     if create and (d / ".done").exists() and _session_consistent(d):
