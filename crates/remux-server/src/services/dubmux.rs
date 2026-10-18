@@ -91,8 +91,8 @@ pub(crate) fn is_dubmux_row(stream: &db::Media) -> bool {
     filename(stream).is_some_and(|f| f.contains(".VNDub-"))
 }
 
-/// In cache-only mode, previously visible rows must also pass the current
-/// cache lookup. An old match/row can outlive its actual media files.
+/// Synthetic rows must be confirmed by the current cache/preparation lookup.
+/// An old row may have lost its video and now be blocked by transfer admission.
 pub(crate) fn merge_dub_rows(
     config: &crate::Config,
     mut streams: Vec<db::Media>,
@@ -100,8 +100,8 @@ pub(crate) fn merge_dub_rows(
 ) -> Vec<db::Media> {
     if config
         .dubmux_url
-        .is_none()
-        && config
+        .is_some()
+        || config
             .dubmux_cache_url
             .is_some()
     {
@@ -276,6 +276,31 @@ impl PrepareReply {
             .and_then(|v| v.as_str())
             == Some("ok")
     }
+
+    fn playback_available(&self) -> bool {
+        self.result
+            .as_ref()
+            .and_then(|r| r.get("playback_available"))
+            .and_then(|v| v.as_bool())
+            != Some(false)
+    }
+}
+
+/// Prefer the same completed representations shown by the item-detail path.
+/// A newly prepared alignment is a fallback, even if its layout is known.
+fn prefer_completed_rows(
+    mut prepared: Vec<db::Media>,
+    mut completed: Vec<db::Media>,
+    max_rows: usize,
+) -> Vec<db::Media> {
+    let ids: std::collections::HashSet<_> = completed
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    prepared.retain(|row| !ids.contains(&row.id));
+    completed.extend(prepared);
+    completed.truncate(max_rows);
+    completed
 }
 
 /// PATCH (uduchi2nd, user decision 2026-09-28): the Vietnamese-dub mux is only
@@ -665,6 +690,14 @@ pub(crate) async fn ensure_dub_rows(
     // the caller passes the freshly fetched addon list, which never
     // contains our synthetic rows (that is exactly when carry-over matters).
     let stored = existing_dub_rows(ctx, media).await;
+    let completed = restore_cached_dub_rows(ctx, media).await;
+    if completed.len()
+        >= ctx
+            .config
+            .dubmux_max_rows as usize
+    {
+        return completed;
+    }
     let existing: Vec<&db::Media> = streams
         .iter()
         .filter(|s| is_dubmux_row(s))
@@ -695,14 +728,13 @@ pub(crate) async fn ensure_dub_rows(
         .take(MAX_HQ)
         .collect();
     if hqs.is_empty() {
-        return vec![];
+        return completed;
     }
     let now = chrono::Utc::now().naive_utc();
     if dubs.is_empty() {
-        // The dub addon answered nothing this time (vnphim's upstream or
-        // its VN proxy was down): the muxes already made are still good,
-        // so keep the rows that were built on releases still listed.
-        return carry_over(ctx, media, &existing, &hqs, &[], now).await;
+        // Provider disappearance must preserve completed video, not revive
+        // durable matches that would require another paid download.
+        return completed;
     }
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
@@ -711,18 +743,21 @@ pub(crate) async fn ensure_dub_rows(
     let mut rows = Vec::new();
     let mut checked: Vec<Uuid> = Vec::new();
     let mut rejected: Vec<Uuid> = Vec::new();
+    let mut unavailable: Vec<Uuid> = Vec::new();
     // PATCH (uduchi2nd, 2026-09-29): the wait stops at the first AVAILABLE
     // version. Pass 1 asks every pair without waiting (a cached pair answers
     // at once); only when none is ready yet does pass 2 spend the caller's
     // wait on the first pair. Versions still preparing join the list on a
     // later refresh — the muxer keeps preparing them either way.
     for attempt in 0..2u8 {
-        if attempt == 1 && (!rows.is_empty() || wait_secs == 0) {
+        if attempt == 1 && (!rows.is_empty() || !completed.is_empty() || wait_secs == 0)
+        {
             break;
         }
         rows.clear();
         checked.clear();
         rejected.clear();
+        unavailable.clear();
         let mut wait = if attempt == 0 { 0 } else { wait_secs };
         let mut failures = 0u32;
         let mut pairs_seen: u32 = 0;
@@ -832,6 +867,10 @@ pub(crate) async fn ensure_dub_rows(
                     if reply.status == "rejected" {
                         rejected.push(row_id(media, dub_id, &hq.id));
                     }
+                    continue;
+                }
+                if !reply.playback_available() {
+                    unavailable.push(row_id(media, dub_id, &hq.id));
                     continue;
                 }
                 let mut row = hq.clone();
@@ -947,7 +986,12 @@ pub(crate) async fn ensure_dub_rows(
             .copied()
             .filter(|r| !have.contains(&r.id))
             .collect();
-        for row in carried_rows(&keep, &hqs, &rejected, now) {
+        let omitted: Vec<_> = rejected
+            .iter()
+            .chain(&unavailable)
+            .copied()
+            .collect();
+        for row in carried_rows(&keep, &hqs, &omitted, now) {
             if rows.len() >= max_rows {
                 break;
             }
@@ -969,6 +1013,12 @@ pub(crate) async fn ensure_dub_rows(
             info!(item = %media.id, row = %id, "dubmux row removed: pair rejected");
         }
     }
+    checked.extend(
+        completed
+            .iter()
+            .map(|row| row.id),
+    );
+    let mut rows = prefer_completed_rows(rows, completed, max_rows);
     if rows.is_empty() {
         return rows;
     }
@@ -1398,26 +1448,6 @@ fn carried_rows(
     out
 }
 
-async fn carry_over(
-    ctx: &AppContext,
-    media: &db::Media,
-    existing: &[&db::Media],
-    hqs: &[&db::Media],
-    rejected: &[Uuid],
-    now: chrono::NaiveDateTime,
-) -> Vec<db::Media> {
-    let rows = carried_rows(existing, hqs, rejected, now);
-    if rows.is_empty() {
-        return rows;
-    }
-    if let Err(e) = db::Media::upsert(&ctx.db, &rows).await {
-        warn!(item = %media.id, "dubmux carry-over upsert failed: {e:#}");
-        return vec![];
-    }
-    info!(item = %media.id, rows = rows.len(), "dubmux rows carried over (no dub streams listed)");
-    rows
-}
-
 /// Priority for pairs requested because the viewer opened the item's detail
 /// page: ahead of the walk, behind an actual playback request.
 pub(crate) const PRIORITY_OPEN: u32 = 10;
@@ -1634,6 +1664,233 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].updated_at, cached.updated_at);
         assert!(is_dubmux_row(&rows[0]));
+    }
+
+    #[test]
+    fn automatic_jobs_cannot_revive_a_dub_omitted_by_live_admission() {
+        let normal = http_media("https://cdn.invalid/movie.mkv", "Movie.mkv");
+        let old =
+            http_media("https://mux.invalid/old/file.ts", "Movie.VNDub-hotphim.ts");
+        let config = crate::Config {
+            dubmux_url: Some("http://mux.invalid".into()),
+            ..Default::default()
+        };
+        let rows = merge_dub_rows(&config, vec![old, normal.clone()], vec![]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, normal.id);
+    }
+
+    #[test]
+    fn completed_video_wins_over_new_alignment_and_stale_size() {
+        let mut completed = http_media(
+            "https://mux.invalid/cached/file.ts",
+            "Movie.VNDub-hotphim.ts",
+        );
+        completed.id = Uuid::new_v4();
+        completed
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(855_000_000);
+        let mut stale = completed.clone();
+        stale
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(721_000_000);
+        let mut fresh =
+            http_media("https://mux.invalid/new/file.ts", "Movie.VNDub-kkphim.ts");
+        fresh.id = Uuid::new_v4();
+        let rows =
+            prefer_completed_rows(vec![fresh, stale], vec![completed.clone()], 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, completed.id);
+        assert_eq!(
+            rows[0]
+                .stream_info
+                .as_ref()
+                .unwrap()
+                .size,
+            Some(855_000_000)
+        );
+    }
+
+    #[test]
+    fn admission_failure_is_independent_of_alignment_and_file_layout() {
+        let reply: PrepareReply = serde_json::from_value(serde_json::json!({
+            "status":"ready", "result": {"video_check":"ok", "file_ready":true,
+                "file_size":6_458_226_384_i64, "playback_available":false}
+        }))
+        .unwrap();
+        assert!(reply.video_checked() && reply.file_ready());
+        assert!(!reply.playback_available());
+    }
+
+    #[tokio::test]
+    async fn prepared_but_transfer_limited_video_cannot_replace_completed_playback() {
+        use axum::{body::Body, http::Request};
+        use std::sync::{Arc, Mutex};
+
+        let old_hq = Uuid::new_v4();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        let app = axum::Router::new().fallback(move |request: Request<Body>| {
+            let recorded = recorded.clone();
+            async move {
+                let path = request.uri().path().to_string();
+                recorded.lock().unwrap().push((request.method().clone(), path.clone()));
+                if path.starts_with("/cached/") {
+                    return axum::Json(if path.ends_with(&old_hq.simple().to_string()) {
+                        serde_json::json!({"status":"ready","result":{
+                            "video_check":"ok","file_ready":true,"file_size":855_000_000
+                        }})
+                    } else {
+                        serde_json::json!({"status":"unknown"})
+                    });
+                }
+                assert_eq!(path, "/prepare", "listing may only inspect preparation/cache metadata");
+                axum::Json(serde_json::json!({"status":"ready","result":{
+                    "video_check":"ok","file_ready":true,"file_size":6_458_226_384_i64,
+                    "playback_available":false,"playback_deferred":"daily_reservation_budget"
+                }}))
+            }
+        });
+        let mux = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap()
+        });
+        let (_server, guard) =
+            crate::integration_test::new_test_server_with_config(crate::Config {
+                database_url: Some("sqlite::memory:".into()),
+                torrent_http_port: None,
+                torrent_peer_port: None,
+                disable_dht: true,
+                dubmux_url: Some(base.clone()),
+                dubmux_public_url: Some(base.clone()),
+                dubmux_cache_url: Some(base.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let mut media = db::Media {
+            id: Uuid::new_v4(),
+            kind: db::MediaKind::Movie,
+            title: "Early Spring test".into(),
+            original_language: Some("zh".into()),
+            external_ids: db::ExternalIds {
+                imdb: db::NonEmptyString::try_new("tt9999997").ok(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        media
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let mut dub = http_media(
+            "https://offline.invalid/dub.ts",
+            "Early.Spring.Vietnamese.ThuyetMinh.hotphim.mp4",
+        );
+        dub.id = Uuid::new_v4();
+        let dub_identity = dub_id(&media, filename(&dub).unwrap());
+        let mut hq = http_media(
+            "https://offline.invalid/new.mkv",
+            "Early.Spring.2160p.WEB-DL.mkv",
+        );
+        hq.id = Uuid::new_v4();
+        let mut completed = http_media(
+            &format!("{base}/mux/{dub_identity}/{}/file.ts", old_hq.simple()),
+            "Early.Spring.VNDub-hotphim.ts",
+        );
+        completed.id = row_id(&media, &dub_identity, &old_hq);
+        completed.kind = db::MediaKind::Stream;
+        completed.parent_id = Some(media.id);
+        completed.title = "[+VN dub · hotphim] cached video".into();
+        completed.idx = Some(-3);
+        completed.probe_data = Some(minimal_probe("hotphim"));
+        completed
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let mut stale = completed.clone();
+        stale.id = row_id(&media, &dub_identity, &hq.id);
+        stale
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .descriptor = StreamDescriptor::Http {
+            url: format!(
+                "{base}/mux/{dub_identity}/{}/file.ts",
+                hq.id
+                    .simple()
+            ),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        stale
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let snapshot = vec![stale.clone(), hq, dub];
+        let added = ensure_dub_rows(ctx, &media, &snapshot, 0, PRIORITY_PLAYBACK).await;
+        let visible = merge_dub_rows(&ctx.config, snapshot.clone(), added);
+        assert_eq!(visible[0].id, completed.id);
+        assert_eq!(
+            visible[0]
+                .stream_info
+                .as_ref()
+                .unwrap()
+                .size,
+            Some(855_000_000)
+        );
+        assert!(
+            !visible
+                .iter()
+                .any(|r| r.id == stale.id)
+        );
+        {
+            let mut seen = requests
+                .lock()
+                .unwrap();
+            assert!(
+                seen.iter()
+                    .any(|(_, path)| path == "/prepare")
+            );
+            assert!(
+                seen.iter()
+                    .any(|(_, path)| path.starts_with("/cached/"))
+            );
+            seen.clear();
+        }
+        let mut cached_ctx = (*ctx).clone();
+        cached_ctx
+            .config
+            .dubmux_max_rows = 1;
+        let ready =
+            ensure_dub_rows(&cached_ctx, &media, &snapshot, 2, PRIORITY_PLAYBACK).await;
+        assert_eq!(ready[0].id, completed.id);
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(method, path)| *method == axum::http::Method::GET
+                    && path.starts_with("/cached/")),
+            "a full completed cache must not start replacement preparation"
+        );
+        mux.abort();
     }
 
     #[test]

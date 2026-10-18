@@ -87,6 +87,43 @@ class CachedPlaybackTests(unittest.TestCase):
         self.assertEqual(self.lookup()["status"], "unknown")
         self.assertFalse(self.layout.exists())
 
+    def test_completed_video_stays_available_when_paid_work_is_blocked(self):
+        with patch.object(server.MEDIA_READS, "check", side_effect=AssertionError("cached media checked admission")):
+            result = server.status(self.dub, self.hq)["result"]
+        self.assertTrue(result["playback_available"])
+        self.assertEqual(result["video_check"], "ok")
+
+    def test_evicted_video_does_not_claim_playability_when_admission_denies_it(self):
+        (self.session / ".done").unlink()
+        before = (server.MATCH / (self.key + ".json")).read_bytes()
+        blocked = server.provider_budget.Limited("daily_reservation_budget", 120)
+        with patch.object(server.MEDIA_READS, "check", side_effect=blocked) as check:
+            result = server.status(self.dub, self.hq)["result"]
+        check.assert_called_once_with(self.hq, self.match["video_url"])
+        self.assertFalse(result["playback_available"])
+        self.assertEqual(result["playback_deferred"], "daily_reservation_budget")
+        self.assertEqual(result["video_check"], "ok", "admission is separate from decode proof")
+        self.assertTrue(result["file_ready"], "an old layout is not completed media")
+        self.assertEqual(before, (server.MATCH / (self.key + ".json")).read_bytes())
+        self.assertFalse((self.session / ".done").exists())
+
+    def test_evicted_video_can_recover_with_admission_and_current_url(self):
+        (self.session / ".done").unlink()
+        current_url = "https://offline.invalid/refreshed-video"
+        with patch.object(server.MEDIA_READS, "check") as check:
+            result = server._playback_result(self.key, self.match, current_url)
+        check.assert_called_once_with(self.hq, current_url)
+        self.assertTrue(result["playback_available"])
+
+    def test_completed_raw_video_needs_no_paid_read(self):
+        (self.session / ".done").unlink()
+        raw = server._raw_dir(self.hq)
+        raw.mkdir(exist_ok=True)
+        (raw / ".done").write_text("complete")
+        with patch.object(server.MEDIA_READS, "check", side_effect=AssertionError("raw cache checked admission")):
+            result = server.status(self.dub, self.hq)["result"]
+        self.assertTrue(result["playback_available"])
+
     def test_wrong_slot_count_or_undersized_slot_is_not_playable(self):
         for slots in ([376], [376, 100], [], [-376, 376]):
             with self.subTest(slots=slots):

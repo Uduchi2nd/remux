@@ -818,7 +818,7 @@ def _prepare_worker(dub, video, k):
         job["finished"] = time.time()
 
 
-def _playback_result(k, result):
+def _playback_result(k, result, video_url=None):
     """Report the current file entity, including a completed layout repair."""
     result = dict(result)
     if result.get("verdict") == "accept":
@@ -826,6 +826,19 @@ def _playback_result(k, result):
         lay = _file_layout(k, k.split("__", 1)[0])
         result["file_ready"] = lay is not None
         result["file_size"] = lay[2] if lay else None
+        # A durable alignment/layout can outlive its downloaded video. Check
+        # admission before advertising that source; this reserves no bytes and
+        # opens no upstream URL. Completed media (including aliases) needs no
+        # provider admission at all.
+        result["playback_available"] = True
+        if not (_session_dir(k) / ".done").is_file() \
+                and not (_raw_dir(hq_id_of(k)) / ".done").is_file():
+            try:
+                MEDIA_READS.check(hq_id_of(k), video_url or result.get("video_url") or "")
+            except provider_budget.Limited as error:
+                result.update(playback_available=False,
+                              playback_deferred=error.reason,
+                              playback_retry_after=error.retry_after)
     return result
 
 
@@ -844,7 +857,7 @@ async def prepare(req: Request):
     cached = _load_match(k)
     if cached:
         return {"status": "ready" if cached["verdict"] == "accept" else "rejected",
-                "stage": "done", "result": _playback_result(k, cached), "cached": True}
+                "stage": "done", "result": _playback_result(k, cached, video["url"]), "cached": True}
     _require_budget_auth(req)
     # Lower = sooner. remux sends 0 for the episode being played, ~100+ for
     # the on-play walk (next episodes first; a pair's rank within its
@@ -882,6 +895,8 @@ async def prepare(req: Request):
     deadline = time.time() + min(wait, 60)
     while job["status"] == "running" and time.time() < deadline:
         await asyncio.sleep(0.25)
+    if job["status"] == "ready":
+        return dict(job, result=_playback_result(k, job.get("result") or {}, video["url"]))
     return job
 
 

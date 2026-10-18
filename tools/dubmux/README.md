@@ -76,6 +76,13 @@ front of the source list for every accepted pair.
   external (`Path <lang>.vtt`) so VidHub/Infuse list them.
 
 ## Operations
+- Playback availability is separate from a saved alignment and virtual-file
+  layout. `/prepare` and `/status` report `result.playback_available=false`
+  when rebuilding missing video fails the existing provider admission check;
+  this preflight reserves no transfer and opens no upstream URL. Completed
+  muxes, completed aliases and complete raw copies bypass provider admission.
+  Remux prefers the completed-cache rows used by the item-detail path, omits
+  currently transfer-limited variants and keeps their durable matches intact.
 - Extraction traffic: completed raw audio is reused for matching. Separate HLS
   audio renditions are preferred when present. Paid text subtitle cache misses
   use a bounded indexed MKV reader; unsupported indexes defer without a full

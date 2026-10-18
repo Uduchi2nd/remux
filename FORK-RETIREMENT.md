@@ -492,3 +492,27 @@ per item. Fresh checked metadata takes precedence over the stored snapshot,
 including before that save commits; errors leave the checked current response
 usable and the next lookup can retry persistence. A database-pool exhaustion
 test verifies immediate merge/current size, coalescing and eventual saving.
+
+## VN-dub playback must reuse completed video (2026-10-18)
+
+Early Spring S01E02 exposed different defaults between Item and PlaybackInfo:
+the detail page advertised a completed 854,799,152-byte ANDY/hotphim mux, while
+default PlaybackInfo selected a 6,458,226,384-byte version with only a durable
+alignment/layout. Its start requests returned the local admission gate's 429;
+its saved source registry had reclassified a TorBox-labeled fallback as
+Premiumize. The first cached mux decodes cleanly at its start, middle and end.
+
+The shared dub-row preparation now restores completed-cache rows before
+considering new alignments, preserves their current file sizes and preferred
+order, and starts no replacement preparation when completed rows fill the cap.
+Item/default playback merges cannot revive omitted stale synthetic rows.
+The muxer reports playback_available separately from video_check/file_ready;
+an uncached paid input is preflighted against existing admission without a
+reservation or an upstream read. Limited pairs stay saved for later recovery,
+and completed muxes/aliases/raw copies bypass paid admission. Source-specific
+explicit requests retain their identities; clients must reopen stale lists.
+
+Keep this patch until both metadata paths consistently select usable completed
+representations and missing-video admission failures cannot become autoplay
+defaults. Provider quotas, normal next-episode automation, subtitle alignment
+rules and the existing playback delivery architecture are preserved.
