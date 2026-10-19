@@ -2469,7 +2469,8 @@ async fn item_for_user(
                 id,
                 row.id,
                 msi.id,
-            );
+            )
+            .await;
             let Some(si) = row
                 .stream_info
                 .as_ref()

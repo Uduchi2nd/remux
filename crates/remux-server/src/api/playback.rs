@@ -1030,7 +1030,7 @@ async fn items_playbackinfo_inner(
     }
 
     for (source, extras) in media_sources
-        .iter()
+        .iter_mut()
         .zip(source_extras)
     {
         let (delivery_source_id, routes) = extras.subtitle_routes;
@@ -1051,15 +1051,20 @@ async fn items_playbackinfo_inner(
         // some clients construct the route from the final MediaSourceInfo ID.
         // Cache both keys when auto-play rewrites the first source ID.
         if source.id != delivery_source_id {
-            super::subtitles::copy_external_subtitle_routes(
+            super::subtitles::alias_external_subtitle_routes(
                 &state.ctx,
                 &session
                     .device
                     .id,
                 id,
                 delivery_source_id,
-                source.id,
-            );
+                source,
+                session
+                    .device
+                    .access_token
+                    .expose(),
+            )
+            .await;
             save_sidecar_subtitle_routes(
                 &state.ctx,
                 &session

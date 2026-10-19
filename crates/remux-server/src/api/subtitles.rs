@@ -1783,7 +1783,23 @@ fn save_external_subtitle_routes(
                     .iter_mut()
                     .find(|r| r.index == route.index)
                 {
-                    *previous = route;
+                    // A disk restore can finish after a concurrent request
+                    // publishes its menu. Never replace that index's identity.
+                    if previous
+                        .subtitle
+                        .id
+                        == route
+                            .subtitle
+                            .id
+                        && previous
+                            .subtitle
+                            .lang
+                            == route
+                                .subtitle
+                                .lang
+                    {
+                        *previous = route;
+                    }
                 } else {
                     saved.push(route);
                 }
@@ -1877,7 +1893,7 @@ fn load_external_subtitle_routes(
         ))
 }
 
-pub(crate) fn copy_external_subtitle_routes(
+pub(crate) async fn copy_external_subtitle_routes(
     ctx: &crate::AppContext,
     device_id: &str,
     item_id: Uuid,
@@ -1887,18 +1903,100 @@ pub(crate) fn copy_external_subtitle_routes(
     if from_source_id == to_source_id {
         return;
     }
+    restore_external_subtitle_routes(ctx, device_id, item_id, from_source_id).await;
+    restore_external_subtitle_routes(ctx, device_id, item_id, to_source_id).await;
     if let Some(routes) =
         load_external_subtitle_routes(ctx, device_id, item_id, from_source_id)
     {
-        save_external_subtitle_routes(
+        let first_index = routes
+            .iter()
+            .map(|route| route.index)
+            .min()
+            .unwrap_or(0);
+        let subtitles: Vec<_> = routes
+            .iter()
+            .map(|route| &route.subtitle)
+            .collect();
+        update_external_subtitle_routes(
             ctx,
             device_id,
             item_id,
             to_source_id,
-            routes
-                .as_ref()
-                .clone(),
+            |saved| assign_external_subtitle_routes(saved, &subtitles, first_index),
         );
+    }
+}
+
+/// The autoplay alias has its own published index history. A source can hide
+/// English behind a usable embedded track and number its only online Vietnamese
+/// track 11, while Item already advertised English 11 and Vietnamese 12. Merge
+/// by track identity, then update the returned menu and URLs to that alias map.
+pub(crate) async fn alias_external_subtitle_routes(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    from_source_id: Uuid,
+    source: &mut api::MediaSourceInfo,
+    api_key: &str,
+) {
+    if from_source_id == source.id {
+        return;
+    }
+    restore_external_subtitle_routes(ctx, device_id, item_id, source.id).await;
+    let Some(routes) =
+        load_external_subtitle_routes(ctx, device_id, item_id, from_source_id)
+    else {
+        return;
+    };
+    let advertised: Vec<_> = source
+        .media_streams
+        .iter()
+        .enumerate()
+        .filter_map(|(position, stream)| {
+            stream
+                .is_external
+                .then(|| {
+                    external_subtitle_route_for_index(&routes, stream.index)
+                        .map(|route| (position, route))
+                })
+                .flatten()
+        })
+        .collect();
+    let Some(first_index) = advertised
+        .iter()
+        .map(|(_, route)| route.index)
+        .min()
+    else {
+        return;
+    };
+    let subtitles: Vec<_> = advertised
+        .iter()
+        .map(|(_, route)| &route.subtitle)
+        .collect();
+    let assigned =
+        update_external_subtitle_routes(ctx, device_id, item_id, source.id, |saved| {
+            assign_external_subtitle_routes(saved, &subtitles, first_index)
+        });
+    let selected = source.default_subtitle_stream_index;
+    for ((position, previous), assigned) in advertised
+        .into_iter()
+        .zip(assigned)
+    {
+        let stream = &mut source.media_streams[position];
+        stream.index = assigned.index;
+        stream.delivery_url = Some(format!(
+            "/Videos/{item_id}/{source_id}/Subtitles/{index}/0/Stream.vtt?ApiKey={api_key}",
+            source_id = source.id,
+            index = assigned.index,
+        ));
+        if selected == Some(previous.index) {
+            source.default_subtitle_stream_index = Some(assigned.index);
+        }
+    }
+    if let Err(error) =
+        persist_external_subtitle_routes(ctx, device_id, item_id, source.id).await
+    {
+        warn!(%item_id, %error, "could not persist autoplay subtitle routes");
     }
 }
 
@@ -5004,7 +5102,7 @@ mod tests {
         let with_new_language = advertise(&subtitles[1..]);
         assert_eq!(with_new_language.media_streams[1].index, 125);
         assert_eq!(with_new_language.media_streams[2].index, 126);
-        copy_external_subtitle_routes(ctx, "player-a", item, source.id, item);
+        copy_external_subtitle_routes(ctx, "player-a", item, source.id, item).await;
         let alias = load_external_subtitle_routes(ctx, "player-a", item, item).unwrap();
         assert_eq!(
             external_subtitle_route_for_index(&alias, 124)
@@ -5015,6 +5113,156 @@ mod tests {
         );
         assert_eq!(
             external_subtitle_route_for_index(&alias, 125)
+                .unwrap()
+                .subtitle
+                .id,
+            "online-vie"
+        );
+    }
+
+    #[tokio::test]
+    async fn autoplay_alias_keeps_item_languages_when_playback_hides_english() {
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let item = Uuid::new_v4();
+        let actual = Uuid::new_v4();
+        let mut source = source_with_subtitles(vec![api::MediaStream {
+            index: 0,
+            type_: Some(api::MediaStreamType::Video),
+            ..Default::default()
+        }]);
+        source.native_stream_index_max = Some(10);
+        source.remux = Some(api::MediaSourceRemuxInfo {
+            source: Some(api::ProbeOrigin::Ffprobe),
+            ..Default::default()
+        });
+        let subtitles: Vec<_> = ["eng", "vie"]
+            .into_iter()
+            .map(|language| crate::addons::SubtitleInfo {
+                id: format!("online-{language}"),
+                url: Some(crate::stream::StreamDescriptor::http(format!(
+                    "https://offline.invalid/{language}.srt"
+                ))),
+                lang: Some(language.into()),
+                is_forced: false,
+                is_hi: false,
+                filename: None,
+                from_trusted: None,
+                ai_translated: None,
+            })
+            .collect();
+        let advertise = |id, subtitles: &[crate::addons::SubtitleInfo]| {
+            let mut fresh = source.clone();
+            fresh.id = id;
+            append_external_subtitles_inner(
+                Some(ctx),
+                "player-a",
+                std::slice::from_mut(&mut fresh),
+                subtitles,
+                &["en".into(), "vi".into()],
+                Some(&no_embed_profile()),
+                item,
+                "fixture-token",
+                DEDUP_ON,
+                false,
+            );
+            fresh
+        };
+        let first = advertise(item, &subtitles);
+        assert_eq!(first.media_streams[1].index, 11);
+        assert_eq!(
+            first.media_streams[1]
+                .language
+                .as_deref(),
+            Some("eng")
+        );
+        assert_eq!(first.media_streams[2].index, 12);
+
+        // The alias must also work after restart, before a fresh Item request.
+        save_subtitle_source(ctx, "player-a", item, item, actual);
+        persist_external_subtitle_routes(ctx, "player-a", item, item)
+            .await
+            .unwrap();
+        ctx.store
+            .delete(external_subtitle_routes_key("player-a", item, item));
+
+        // Playback keeps native English and only advertises online Vietnamese.
+        let mut playback = advertise(actual, &subtitles[1..]);
+        assert_eq!(playback.media_streams[1].index, 11);
+        assert_eq!(playback.default_subtitle_stream_index, Some(11));
+        playback.id = item;
+        alias_external_subtitle_routes(
+            ctx,
+            "player-a",
+            item,
+            actual,
+            &mut playback,
+            "fixture-token",
+        )
+        .await;
+        assert_eq!(playback.media_streams[1].index, 12);
+        assert_eq!(
+            playback.media_streams[1]
+                .language
+                .as_deref(),
+            Some("vie")
+        );
+        assert_eq!(playback.default_subtitle_stream_index, Some(12));
+        assert!(
+            playback.media_streams[1]
+                .delivery_url
+                .as_deref()
+                .unwrap()
+                .contains(&format!("/{item}/Subtitles/12/0/Stream.vtt?"))
+        );
+
+        // Item's import of the source catalogue must not undo the alias mapping.
+        ctx.store
+            .delete(external_subtitle_routes_key("player-a", item, item));
+        copy_external_subtitle_routes(ctx, "player-a", item, actual, item).await;
+        let refreshed = advertise(item, &subtitles);
+        assert_eq!(refreshed.media_streams[1].index, 11);
+        assert_eq!(refreshed.media_streams[2].index, 12);
+        let saved = load_external_subtitle_routes(ctx, "player-a", item, item).unwrap();
+        assert_eq!(
+            external_subtitle_route_for_index(&saved, 11)
+                .unwrap()
+                .subtitle
+                .id,
+            "online-eng"
+        );
+        assert_eq!(
+            external_subtitle_route_for_index(&saved, 12)
+                .unwrap()
+                .subtitle
+                .id,
+            "online-vie"
+        );
+        let explicit =
+            load_external_subtitle_routes(ctx, "player-a", item, actual).unwrap();
+        assert_eq!(
+            external_subtitle_route_for_index(&explicit, 11)
+                .unwrap()
+                .subtitle
+                .id,
+            "online-vie"
+        );
+
+        // Persisted aliases retain the same language after playback and refresh.
+        ctx.store
+            .delete(external_subtitle_routes_key("player-a", item, item));
+        restore_external_subtitle_routes(ctx, "player-a", item, item).await;
+        let restored =
+            load_external_subtitle_routes(ctx, "player-a", item, item).unwrap();
+        assert_eq!(
+            external_subtitle_route_for_index(&restored, 11)
+                .unwrap()
+                .subtitle
+                .id,
+            "online-eng"
+        );
+        assert_eq!(
+            external_subtitle_route_for_index(&restored, 12)
                 .unwrap()
                 .subtitle
                 .id,
