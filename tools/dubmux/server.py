@@ -16,6 +16,7 @@ State on disk under DUBMUX_DATA:
   hls/<dub_id>__<video_id>/       segments + playlist (+ .done when VOD)
 """
 import asyncio, hashlib, hmac, json, os, re, shutil, subprocess, sys, threading, time
+from contextlib import ExitStack
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -29,12 +30,15 @@ import align  # noqa: E402
 import release_subtitles  # noqa: E402
 import provider_budget  # noqa: E402
 import indexed_subtitles  # noqa: E402
+import bounded_matching  # noqa: E402
 
 DATA = Path(os.environ.get("DUBMUX_DATA", "/data"))
 AUDIO, MATCH, HLS = DATA / "audio", DATA / "match", DATA / "hls"
 SUBTITLES = DATA / "subtitles"
+MATCHING = DATA / "matching"
 for d in (AUDIO, MATCH, HLS):
     d.mkdir(parents=True, exist_ok=True)
+MATCHING.mkdir(parents=True, exist_ok=True)
 dubmux.CACHE = str(AUDIO)
 MEDIA_READS = provider_budget.MediaReads(DATA)
 
@@ -95,6 +99,10 @@ def transfer_status(request: Request):
     status["indexed_extraction"] = {"max_response_bytes": indexed_subtitles.MAX_BYTES,
         "max_requests": indexed_subtitles.MAX_REQUESTS, "timeout_seconds": indexed_subtitles.TIMEOUT,
         "max_artifact_bytes": indexed_subtitles.MAX_OUTPUT, "connections_per_source": 4}
+    status["matching"] = {"max_response_bytes": bounded_matching.MAX_BYTES,
+        "reservation_increment_bytes": bounded_matching.RESERVATION_BYTES,
+        "max_requests": bounded_matching.MAX_REQUESTS, "timeout_seconds": bounded_matching.TIMEOUT,
+        "connections_per_source": bounded_matching.CONNECTIONS}
     return status
 
 
@@ -593,19 +601,106 @@ def _index_backfill():
         print(f"content index: {n} match records indexed", file=sys.stderr, flush=True)
 
 
+def _matching_identity(video, dubfile):
+    stat = Path(dubfile).stat()
+    return {"url": hashlib.sha256(video["url"].encode()).hexdigest(),
+            "size": video.get("size"), "dub_size": stat.st_size,
+            "dub_mtime": stat.st_mtime_ns, "version": ALIGN_VERSION}
+
+
+def _matching_checkpoint(k, video, dubfile):
+    try:
+        record = json.loads((MATCHING / f"{k}.json").read_text())
+        if record["result"].get("verdict") == "needs_full_alignment" \
+                and record["identity"] == _matching_identity(video, dubfile) \
+                and time.time() - record["created"] < 30 * 86400:
+            return dict(record["result"], video_url=video["url"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def _save_matching_checkpoint(k, video, dubfile, result):
+    path = MATCHING / f"{k}.json"
+    record = {"identity": _matching_identity(video, dubfile), "created": time.time(),
+              "result": {key: value for key, value in result.items() if key != "video_url"}}
+    temp = path.with_suffix(f".{threading.get_ident()}.tmp")
+    temp.write_text(json.dumps(record))
+    os.replace(temp, path)
+    records = []
+    for item in MATCHING.glob("*.json"):
+        try:
+            records.append((item.stat().st_mtime, item))
+        except FileNotFoundError:
+            pass
+    for _mtime, old in sorted(records, reverse=True)[512:]:
+        old.unlink(missing_ok=True)
+
+
+def _prescreen_match(job, dub, video, hq_audio_input, duration_input, input_options=()):
+    job["stage"] = "match:bounded"
+    vdur = dubmux.ffprobe_duration(duration_input, input_options=input_options)
+    ddur = json.loads((AUDIO / f"{dub['id']}.json").read_text())["duration"]
+    dubfile = str(AUDIO / f"{dub['id']}.m4a")
+    result = {"dub": dub["id"], "video": video["id"], "video_duration": vdur,
+              "dub_duration": ddur, "duration_delta": round(vdur - ddur, 3),
+              "created": int(time.time()), "video_url": video["url"], "align_version": ALIGN_VERSION}
+    pre = dubmux.prescreen(hq_audio_input, dubfile, vdur, ddur,
+                          max_lag=max(75.0, abs(vdur - ddur) + 15.0), input_options=input_options)
+    conf = [(t, lag, r) for t, lag, r in pre if lag is not None and r >= 10.0]
+    undecodable = sum(1 for _t, lag, _r in pre if lag is None)
+    result["prescreen"] = {"windows": pre, "confident": len(conf), "undecodable": undecodable}
+    if pre and undecodable == len(pre):
+        raise RuntimeError("release unreadable: no pre-screen window decoded")
+    weak = [(t, lag, r) for t, lag, r in pre if lag is not None and r >= 7.0]
+    clustered = max((sum(1 for _t, l2, _r in weak if abs(l2 - l1) <= 1.0)
+                     for _t, l1, _r in weak), default=0)
+    inconclusive = len(conf) < 3 and (undecodable >= len(pre) // 2 or len(conf) >= 2 or clustered >= 3)
+    if inconclusive:
+        result["prescreen"]["inconclusive"] = {"confident": len(conf), "clustered_weak": clustered}
+        conf = []
+    if len(conf) < 3 and not inconclusive:
+        result["verdict"] = "reject:prescreen"
+        return result
+    lags = sorted(l for _t, l, _r in conf)
+    spread = lags[-1] - lags[0] if lags else None
+    if bool(lags) and abs(vdur - ddur) <= 1.5 and len(conf) >= 5 and spread <= 0.15:
+        result.update(lag=round(lags[len(lags) // 2], 3), lag_spread=round(spread, 3),
+                      verdict="accept", match="prescreen")
+        return result
+    for cand in sorted(MATCH.glob(f"{dub['id']}__*.aligned.m4a")):
+        job["stage"] = "prescreen:aligned"
+        pre2 = dubmux.prescreen(hq_audio_input, str(cand), vdur, vdur, max_lag=5.0, input_options=input_options)
+        c2 = [l for _t, l, r in pre2 if l is not None and r >= 10.0]
+        if len(c2) >= 5 and max(c2) - min(c2) <= 0.15 and abs(sorted(c2)[len(c2) // 2]) <= 0.2:
+            result.update(lag=0.0, verdict="accept", match="aligned-reuse", aligned=cand.name,
+                          prescreen_aligned={"track": cand.name, "confident": len(c2)})
+            return result
+    result["verdict"] = "needs_full_alignment"
+    return result
+
+
+def _full_reference(video, k, priority):
+    hq = video["id"]
+    if (_raw_dir(hq) / ".done").exists():
+        return _raw_dir(hq), video["url"]
+    # Bounded matching has finished/released its slot before this independent
+    # full-media admission. Nested raw-copy work shares this full lease only.
+    with MEDIA_READS.scope(hq, video["url"]):
+        resolved = dubmux.resolve_url(video["url"], background=priority > 9)
+        MEDIA_READS.check_resolved(hq, video["url"], resolved)
+        raw = _raw_copy(hq, resolved, k, priority)
+    if not raw:
+        raise RuntimeError("raw release unavailable; refusing a second full remote audio read")
+    return raw, resolved
+
+
 def _prepare_worker(dub, video, k):
     job = _jobs[k]
     slot_held = False
     hq_id = video["id"]
-    raw_thread = None
-    raw_box: dict = {}
     rejected = True
-    budget_lease = None
     try:
-        # Interactive requests (someone is waiting): download the release in
-        # parallel with the dub extraction. Background/evaluation ones wait
-        # for the pre-screen so a rejected pair never downloads the file.
-        # Same dub x same release already prepared under other ids? Reuse.
         hq_name = _hq_name(video["url"])
         origin = _dub_origin(dub["url"]) if hq_name else None
         hit = _index_get(origin, hq_name) if origin else None
@@ -615,206 +710,112 @@ def _prepare_worker(dub, video, k):
                 rejected = result["verdict"] != "accept"
                 job.update(status="ready" if not rejected else "rejected", stage="done",
                            result=result, aliased_from=hit["pair"])
-                print(f"prepare {k}: reused {hit['pair']} ({result['verdict']})", file=sys.stderr, flush=True)
                 if not rejected and job["priority"] <= 9:
                     _ensure_mux(k, dub["id"], result, video["url"])
                 return
-        orig_url = video["url"]   # kept in the record: the release identity (file name)
         raw = _raw_dir(hq_id)
         local_audio = raw / "audio.mka"
         cached_audio = (raw / ".done").exists() and local_audio.is_file()
-        if not cached_audio:
-            budget_lease = MEDIA_READS.acquire(hq_id, orig_url)
-            video["url"] = dubmux.resolve_url(video["url"], background=job["priority"] > 9)
-            MEDIA_READS.check_resolved(hq_id, orig_url, video["url"])
-        hq_audio_input = str(local_audio) if cached_audio else video["url"]
-        job["video_url"] = video["url"]
         _raw_ref(hq_id, k)
-        if job["priority"] <= 99 and not (_raw_dir(hq_id) / ".done").exists():
-            def _dl():
-                try:
-                    raw_box["dir"] = _raw_copy(hq_id, video["url"], k, job["priority"])
-                except CorruptSource as e:
-                    raw_box["corrupt"] = e
-                except (provider_budget.Limited, subprocess.TimeoutExpired) as error:
-                    raw_box["error"] = error
-            raw_thread = threading.Thread(target=_dl, daemon=True)
-            raw_thread.start()
         meta = AUDIO / f"{dub['id']}.json"
-        # One extraction per dub even when several HQ sources ask at once
-        # (PlaybackInfo pairs every HQ release with every dub).
         with _extract_lock(dub["id"]):
             if not meta.exists():
                 job["stage"] = "extract:queued"
                 EXTRACT_GATE.acquire(k, job["priority"])
                 try:
                     job["stage"] = "extract"
-                    args = type("A", (), {"name": dub["id"], "url": dub["url"], "reencode": False,
-                                          "parallel": WORKERS})
+                    args = type("A", (), {"name": dub["id"], "url": dub["url"],
+                                          "reencode": False, "parallel": WORKERS})
                     dubmux.cmd_extract(args)
                 finally:
                     EXTRACT_GATE.release(k)
         job["stage"] = "match:queued"
         MATCH_GATE.acquire(k, job["priority"])
         slot_held = True
-        job["stage"] = "prescreen"
-        vdur = dubmux.ffprobe_duration(str(raw / "index.m3u8") if cached_audio else video["url"])
-        ddur = json.load(open(meta))["duration"]
         dubfile = str(AUDIO / f"{dub['id']}.m4a")
-        result = {"dub": dub["id"], "video": video["id"], "video_duration": vdur,
-                  "dub_duration": ddur, "duration_delta": round(vdur - ddur, 3),
-                  "created": int(time.time()), "video_url": orig_url, "align_version": ALIGN_VERSION}
-        # Pre-screen: 8 windows by byte range (~1 % of the file). Fewer than
-        # 3 confident windows = a different edit or the wrong episode; stop
-        # before reading the whole release.
-        pre = dubmux.prescreen(hq_audio_input, dubfile, vdur, ddur, max_lag=max(75.0, abs(vdur - ddur) + 15.0))
-        conf = [(t, lag, r) for t, lag, r in pre if lag is not None and r >= 10.0]
-        undecodable = sum(1 for _t, lag, _r in pre if lag is None)
-        result["prescreen"] = {"windows": pre, "confident": len(conf), "undecodable": undecodable}
-        if pre and undecodable == len(pre):
-            # nothing could be read (source down, dead link, unseekable
-            # container): not a verdict about the pair — fail so it is
-            # retried later instead of caching a rejection
-            raise RuntimeError("release unreadable: no pre-screen window decoded")
-        # Weak-but-consistent evidence: >= 3 windows at ratio >= 7 sharing one
-        # lag (+-1 s) is a real match with a quiet music bed (kkphim dubs sat
-        # at 7-9 for whole episodes); >= 2 confident windows likewise. The
-        # pre-screen only exists to skip downloads for OBVIOUS mismatches —
-        # the full aligner is the judge for everything else.
-        weak = [(t, lag, r) for t, lag, r in pre if lag is not None and r >= 7.0]
-        clustered = max((sum(1 for _t, l2, _r in weak if abs(l2 - l1) <= 1.0) for _t, l1, _r in weak), default=0)
-        if len(conf) < 3 and (undecodable >= len(pre) // 2 or len(conf) >= 2 or clustered >= 3):
-            # too little evidence either way: decide on the full local copy
-            result["prescreen"]["inconclusive"] = {"confident": len(conf), "clustered_weak": clustered}
-            conf = []
-            pre_inconclusive = True
+        result = _matching_checkpoint(k, video, dubfile)
+        if result is not None:
+            job["matching"] = {"bytes": 0, "requests": 0, "checkpoint": True}
         else:
-            pre_inconclusive = False
-        if len(conf) < 3 and not pre_inconclusive:
-            result["verdict"] = "reject:prescreen"
-        else:
-            lags = sorted(l for _t, l, _r in conf)
-            spread = (lags[-1] - lags[0]) if lags else None
-            same_cut = bool(lags) and abs(vdur - ddur) <= 1.5 and len(conf) >= 5 and spread <= 0.15
-            if same_cut:
-                # Same cut: one constant offset, no piecewise, no full audio needed.
-                result["lag"] = round(lags[len(lags) // 2], 3)
-                result["lag_spread"] = round(spread, 3)
-                result["verdict"] = "accept"
-                result["match"] = "prescreen"
+            bounded = None
+            try:
+                with ExitStack() as matching:
+                    if cached_audio:
+                        input_url, duration_input = str(local_audio), str(raw / "index.m3u8")
+                    else:
+                        reserve = matching.enter_context(MEDIA_READS.matching(
+                            hq_id, video["url"], bounded_matching.MAX_BYTES,
+                            bounded_matching.RESERVATION_BYTES))
+                        source = MEDIA_READS.source(hq_id, video["url"])
+                        bounded = bounded_matching.MatchingInput(video["url"], source["size"], reserve,
+                            resolved=lambda url: MEDIA_READS.check_resolved(hq_id, video["url"], url))
+                        matching.enter_context(bounded)
+                        input_url = duration_input = bounded.url
+                    result = _prescreen_match(job, dub, video, input_url, duration_input,
+                        input_options=bounded_matching.INPUT_OPTIONS if bounded else ())
+                    if bounded:
+                        bounded.check()
+            finally:
+                if bounded:
+                    job["matching"] = bounded.stats()
+            if result["verdict"] == "needs_full_alignment":
+                _save_matching_checkpoint(k, video, dubfile, result)
+        if result["verdict"] == "needs_full_alignment":
+            job["stage"] = "match:full-media"
+            rd, _resolved = _full_reference(video, k, job["priority"])
+            job["stage"] = "match:piecewise"
+            rep = align.align(video["url"], dubfile, str(MATCH), k, hq_audio=str(rd / "audio.mka"))
+            result["piecewise"] = {kk: vv for kk, vv in rep.items() if kk != "aligned"}
+            if rep.get("verdict") == "reject:skew" and abs(result["video_duration"] - result["dub_duration"]) <= align.MAX_SKEW:
+                raise RuntimeError(f"decoded audio length mismatch: {rep}")
+            if rep.get("verdict") == "accept":
+                result.update(lag=0.0, verdict="accept", aligned=f"{k}.aligned.m4a")
+                _aligned_note(MATCH / f"{k}.aligned.m4a", hq_id, video["url"])
             else:
-                # A dub already aligned for another release of the same cut
-                # (TB vs PM copies of one source, a re-encode) fits this one
-                # too: check each known aligned track of this dub with the
-                # same cheap windows before reading the release.
-                reused = None
-                for cand in sorted(MATCH.glob(f"{dub['id']}__*.aligned.m4a")):
-                    job["stage"] = "prescreen:aligned"
-                    pre2 = dubmux.prescreen(hq_audio_input, str(cand), vdur, vdur, max_lag=5.0)
-                    c2 = [l for _t, l, r in pre2 if l is not None and r >= 10.0]
-                    if len(c2) >= 5 and max(c2) - min(c2) <= 0.15 and abs(sorted(c2)[len(c2) // 2]) <= 0.2:
-                        reused = cand
-                        result["prescreen_aligned"] = {"track": cand.name, "confident": len(c2)}
-                        break
-                if reused is not None:
-                    result["lag"] = 0.0
-                    result["verdict"] = "accept"
-                    result["match"] = "aligned-reuse"
-                    result["aligned"] = reused.name
-                    _aligned_note(reused, hq_id, video["url"])
-                else:
-                    job["stage"] = "match:raw"
-                    if raw_thread is None:
-                        raw_box["dir"] = _raw_copy(hq_id, video["url"], k, job["priority"])
-                    else:
-                        raw_thread.join()
-                        raw_thread = None
-                        if raw_box.get("corrupt"):
-                            raise raw_box["corrupt"]
-                    rd = raw_box.get("dir")
-                    if not rd:
-                        raise RuntimeError("raw release unavailable; refusing a second full remote audio read")
-                    job["stage"] = "match:piecewise"
-                    rep = align.align(video["url"], dubfile, str(MATCH), k,
-                                      hq_audio=str(rd / "audio.mka") if rd else None)
-                    result["piecewise"] = {kk: vv for kk, vv in rep.items() if kk != "aligned"}
-                    if rep.get("verdict") == "reject:skew" and abs(vdur - ddur) <= align.MAX_SKEW:
-                        # the pre-screen (or the probes) saw two same-length
-                        # streams; a huge skew here means a decode came back
-                        # short (truncated raw copy / dub) — retry later
-                        raise RuntimeError(f"decoded audio length mismatch: {rep}")
-                    if rep.get("verdict") == "accept":
-                        result["lag"] = 0.0
-                        result["verdict"] = "accept"
-                        result["aligned"] = f"{k}.aligned.m4a"
-                        _aligned_note(MATCH / f"{k}.aligned.m4a", hq_id, video["url"])
-                    else:
-                        result["verdict"] = "reject:duration"
-                    hq = MATCH / f"{k}.hq.mka"
-                    if hq.exists():
-                        hq.unlink()
+                result["verdict"] = "reject:duration"
+            (MATCH / f"{k}.hq.mka").unlink(missing_ok=True)
+        if result.get("match") == "aligned-reuse":
+            _aligned_note(MATCH / result["aligned"], hq_id, video["url"])
         rejected = result["verdict"] != "accept"
-        json.dump(result, open(_match_path(k), "w"), indent=1)
+        _match_path(k).write_text(json.dumps(result, indent=1))
+        (MATCHING / f"{k}.json").unlink(missing_ok=True)
         if origin and hq_name:
             _index_put(origin, hq_name, k, result["verdict"])
-        if result["verdict"] == "accept":
-            result["video_check"] = _video_check(k) or ("ok" if (_raw_dir(hq_id) / ".video_ok").exists() else None)
-            json.dump(result, open(_match_path(k), "w"), indent=1)
-            # sync check BEFORE the pair is ever served, when the release's
-            # audio is local (raw copy); otherwise it runs when a session starts
-            if (_raw_dir(hq_id) / "audio.mka").exists():
+        if not rejected:
+            result["video_check"] = _video_check(k) or ("ok" if (raw / ".video_ok").exists() else None)
+            _match_path(k).write_text(json.dumps(result, indent=1))
+            if local_audio.exists():
                 job["stage"] = "sync-check"
                 sc = _sync_check(k, dub["id"])
                 if sc is not None and not sc["ok"]:
                     result = _load_match(k) or result
                     rejected = True
             lay = _file_layout(k, dub["id"])
-            result["file_ready"] = lay is not None
-            result["file_size"] = lay[2] if lay else None
-        job.update(status="ready" if result["verdict"] == "accept" else "rejected",
-                   stage="done", result=result)
-        # Playing / next episode + accepted: the raw copy is (being)
-        # downloaded — build the play-cache session right away so the row
-        # plays without a cold wait. Merely opened/walked items stop at the
-        # aligned audio + segment table (JIT playback then starts in ~1 s),
-        # so browsing never fills the play cache.
+            result.update(file_ready=lay is not None, file_size=lay[2] if lay else None)
+        job.update(status="ready" if not rejected else "rejected", stage="done", result=result)
+        # Interactive accepted pairs may now prepare playback under a separate
+        # full-file lease. No raw-video thread can precede the matching verdict.
         if not rejected and job["priority"] <= 9:
-            if raw_thread is not None:
-                raw_thread.join()
-                raw_thread = None
-                if raw_box.get("corrupt"):
-                    raise raw_box["corrupt"]
-                if not raw_box.get("dir"):
-                    raise RuntimeError("raw release unavailable; refusing a second remote download")
-            _start_mux(k, video["url"], dub["id"], result["lag"])
-    except provider_budget.Limited as error:
+            job["stage"] = "video:admission"
+            _rd, resolved = _full_reference(video, k, job["priority"])
+            _start_mux(k, resolved, dub["id"], result["lag"])
+            job["stage"] = "done"
+    except provider_budget.Limited as exc:
         rejected = False
-        job.update(status="limited", stage=error.reason, retry_at=time.time()+error.retry_after)
-    except CorruptSource as e:
+        job.update(status="limited", stage=exc.reason, retry_at=time.time() + exc.retry_after)
+    except CorruptSource as exc:
         result = {"dub": dub["id"], "video": video["id"], "verdict": "reject:corrupt-source",
-                  "detail": str(e), "created": int(time.time()), "align_version": ALIGN_VERSION,
+                  "detail": str(exc), "created": int(time.time()), "align_version": ALIGN_VERSION,
                   "video_url": video.get("url", "")}
-        json.dump(result, open(_match_path(k), "w"), indent=1)
+        _match_path(k).write_text(json.dumps(result, indent=1))
         job.update(status="rejected", stage="done", result=result)
-    except Exception as e:  # noqa: BLE001
-        print(f"prepare {k} failed at stage {job.get('stage')}: {str(e)[-600:]}",
-              file=sys.stderr, flush=True)
-        job.update(status="error", stage="done", error=str(e)[-500:])
+    except Exception as exc:
+        print(f"prepare {k} failed at stage {job.get('stage')}: {str(exc)[-600:]}", file=sys.stderr, flush=True)
+        job.update(status="error", stage="done", error=str(exc)[-500:])
     finally:
         if slot_held:
             MATCH_GATE.release(k)
-        if raw_thread is not None:
-            raw_thread.join()
-        if raw_box.get("corrupt") and job.get("status") == "ready":
-            result = {"dub": dub["id"], "video": video["id"], "verdict": "reject:corrupt-source",
-                      "detail": str(raw_box["corrupt"]), "created": int(time.time()),
-                      "align_version": ALIGN_VERSION, "video_url": video.get("url", "")}
-            json.dump(result, open(_match_path(k), "w"), indent=1)
-            job.update(status="rejected", result=result)
-            rejected = True
         _raw_release(hq_id, k, rejected)
-        if budget_lease:
-            budget_lease.close()
         job["finished"] = time.time()
 
 

@@ -90,7 +90,7 @@ def uint_element(tag, value):
 
 class RangeReader:
     def __init__(self, url, expected_size=0, resolved=None, max_bytes=MAX_BYTES,
-                 max_requests=MAX_REQUESTS, timeout=TIMEOUT, request_gap=0.05):
+                 max_requests=MAX_REQUESTS, timeout=TIMEOUT, request_gap=0.05, reserve=None):
         self.url = url
         self.total = expected_size or None
         self.resolved = resolved
@@ -104,6 +104,7 @@ class RangeReader:
         self.lock = threading.Lock()
         self.cancelled = threading.Event()
         self.opener = urllib.request.build_opener(NoRedirect)
+        self.reserve = reserve
 
     def request_slot(self):
         with self.lock:
@@ -158,6 +159,8 @@ class RangeReader:
                 count = min(count, self.total - offset)
             if count > self.max_bytes - self.reserved:
                 raise Unavailable("byte_limit")
+            if self.reserve:
+                self.reserve(self.reserved + count)
             self.reserved += count
             url, etag = self.url, self.etag
         headers = {"Range": f"bytes={offset}-{offset + count - 1}",

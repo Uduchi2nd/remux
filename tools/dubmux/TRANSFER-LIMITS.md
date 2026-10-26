@@ -15,8 +15,9 @@ The initial policy is deliberately tighter for Premiumize:
 | Minimum gap between full jobs | 3,600 seconds | 10 seconds |
 | Minimum gap between background probes | 60 seconds | 5 seconds |
 
-The full-job and probe start clocks are separate; they share the daily budget
-and concurrency. Busy or over-budget jobs are deferred, not treated as broken
+Full-job, probe and bounded-matching start clocks are separate; they share the
+daily budget and concurrency. Matching starts use the existing probe gap
+(Premiumize 60 seconds, TorBox 5 seconds). Busy or over-budget jobs are deferred, not treated as broken
 streams or rejected dub pairs. Direct foreground playback probes retain their
 existing path; the background probe queue uses this ledger. The existing
 placeholder circuit breaker remains an additional protection.
@@ -31,6 +32,10 @@ It does not reserve the entire release size. A probe reserves the
 smaller of the known file size and 128 MiB (128 MiB if size is unknown). A
 full-file read without a valid size is denied. The extra 10% allows for normal
 metadata and seek overhead; unusual demuxer reads can exceed an estimate.
+Bounded matching instead starts with at most 64 MiB and reserves more in
+64 MiB increments **before** additional upstream response bodies are read.
+Top-ups share the same lease and do not reset its concurrency/start clock.
+These remain conservative reservations; unused credit is not refunded.
 
 Reservations stay spent after errors and timeouts. The day changes at midnight
 UTC; counters survive both service restarts. Failed lease release can hold a
@@ -138,6 +143,50 @@ back an image/binary must not remove the ledger or resume automation.
 
 
 ## Reduce extraction traffic
+
+### Match before preparing the video
+
+Cold dub preparation no longer starts a raw-video thread before its audio
+prescreen. FFmpeg's remote matching input is a private, one-source loopback
+reader backed by the same validated Range reader used by indexed extraction.
+It serves no playback traffic. All upstream body reads, redirects, overfetch
+and matching variants share a 2 GiB ceiling, 6,000-request/300-second deadline,
+four connections and 20 upstream requests/second per matching job. The ceiling
+can be lowered with `DUBMUX_MATCH_MAX_BYTES`; it is independent of the daily
+10 GB/80 GB provider limits. Stream probing is bounded and matching accepts
+Matroska/MOV-family files only; playlists and external input protocols are
+blocked so child URLs cannot escape accounting. A refused Range, changed
+source, exhausted read ceiling or failed top-up defers the job. Partial audio
+must never be accepted or stored as a permanent rejected match.
+
+The existing eight-window correlation, confidence, constant-offset and
+piecewise validation thresholds are unchanged. A rejected prescreen never
+starts a full video read. Constant-offset/already-aligned matches can finish
+with only bounded reads. A differing cut may still need the complete local
+reference for the full piecewise aligner: this is a separate full-media stage,
+admitted at the whole-file rate after the matching lease has been released.
+Thus this does not promise audio-only network reads for every interleaved
+container. Interactive accepted pairs likewise obtain a separate full-media
+allowance before preparing their video; merely checking a pair cannot launch
+that copy in parallel with its initial matching.
+
+An inconclusive prescreen is checkpointed separately under `/data/matching`,
+bound to the pair, URL hash, release size, dub-file fingerprint and aligner
+version. A later full-media admission retry reuses it rather than paying for
+the same windows again. Checkpoints expire after 30 days and are capped at512;
+they are not accepted dub matches. Existing complete video/audio caches still
+bypass paid admission and use their local reference clock. Successful matching
+alone does not make a source playable: the existing video, sync and current
+full-media availability gates remain in force.
+
+`GET /transfer-budget/status` reports the matching ceilings/increment;
+`GET /jobs` reports actual matching response bytes and requests separately from
+the ledger's conservative reserved allowance. A matching retry from a saved
+checkpoint records zero matching reads. Existing ledger counters are retained
+on upgrade and rollback; correcting provider classifications never refunds
+previous reservations.
+
+### Indexed subtitles and reusable audio
 
 Paid remote **text** subtitle cache misses use authenticated `POST
 /subtitles/indexed` on the same private service configured by

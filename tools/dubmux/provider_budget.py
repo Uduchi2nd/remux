@@ -88,15 +88,15 @@ class Ledger:
         service = provider(service)
         if service == "other":
             return None
-        if kind not in ("full", "probe", "indexed"):
+        if kind not in ("full", "probe", "indexed", "match"):
             raise ValueError("invalid read kind")
         if type(size) is not int or size <= 0:
             raise Limited("unknown_file_size", 3600)
         # Probe allowance is an estimate. Full jobs reserve the whole release
         # plus 10% for metadata/seeks. This is not a hard network byte meter.
         cost = (min(size, 128 * 1024 * 1024) if kind == "probe" else
-                size if kind == "indexed" else (size * 11 + 9) // 10)
-        clock = "probe" if kind == "probe" else "full"
+                size if kind in ("indexed", "match") else (size * 11 + 9) // 10)
+        clock = kind if kind in ("probe", "match") else "full"
         now = time.time() if now is None else now
         day = int(now // 86400)
         policy = self.policies[service]
@@ -122,7 +122,7 @@ class Ledger:
             c.execute("INSERT INTO usage VALUES(?,?,?) ON CONFLICT(day,provider) DO UPDATE SET reserved=reserved+excluded.reserved",
                       (day, service, cost))
             c.execute("INSERT INTO leases VALUES(?,?,?)", (token, service, now + 2 * 3600))
-            gap = policy.probe_gap if kind == "probe" else policy.full_gap
+            gap = policy.probe_gap if kind in ("probe", "match") else policy.full_gap
             c.execute("INSERT INTO starts VALUES(?,?,?) ON CONFLICT(provider,kind) DO UPDATE SET next=excluded.next",
                       (service, clock, now + gap))
             c.commit()
@@ -137,6 +137,29 @@ class Ledger:
         if token:
             with closing(self.connect()) as c:
                 c.execute("DELETE FROM leases WHERE id=?", (token,))
+
+    def extend(self, token, size, now=None):
+        """Reserve another bounded read without another slot or start-clock tick."""
+        if type(size) is not int or size <= 0:
+            raise ValueError("invalid reservation extension")
+        now = time.time() if now is None else now
+        day = int(now // 86400)
+        with closing(self.connect()) as c:
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                row = c.execute("SELECT provider FROM leases WHERE id=? AND expires>?", (token, now)).fetchone()
+                if not row:
+                    raise Limited("expired_read_lease", 60)
+                service = row[0]
+                used = c.execute("SELECT reserved FROM usage WHERE day=? AND provider=?", (day, service)).fetchone()
+                if size > self.policies[service].daily_bytes - (used[0] if used else 0):
+                    raise Limited("daily_reservation_budget", (day + 1) * 86400 - now)
+                c.execute("INSERT INTO usage VALUES(?,?,?) ON CONFLICT(day,provider) DO UPDATE SET reserved=reserved+excluded.reserved",
+                          (day, service, size))
+                c.commit()
+            except Exception:
+                c.rollback()
+                raise
 
     def status(self, now=None):
         now = time.time() if now is None else now
@@ -252,6 +275,31 @@ class MediaReads:
         with self.lock:
             if (video_id, source["provider"]) not in self.active:
                 self.ledger.reserve(source["provider"], source["size"], check_only=True)
+
+    @contextmanager
+    def matching(self, video_id, url, ceiling, increment):
+        """A separate lease, topped up before bounded matching reads happen."""
+        source = self.source(video_id, url)
+        if not source["size"] and source["provider"] != "other":
+            raise Limited("unknown_file_size", 3600)
+        limit = min(source["size"] or ceiling, ceiling)
+        credit = min(limit, increment)
+        token = self.ledger.reserve(source["provider"], credit, "match")
+        lock = threading.Lock()
+        def reserve(total):
+            nonlocal credit
+            with lock:
+                if total > limit:
+                    raise Limited("matching_byte_limit", 3600)
+                if total > credit:
+                    extra = min(limit - credit, ((total - credit + increment - 1) // increment) * increment)
+                    if token:
+                        self.ledger.extend(token, extra)
+                    credit += extra
+        try:
+            yield reserve
+        finally:
+            self.ledger.release(token)
 
     @contextmanager
     def scope(self, video_id, url):

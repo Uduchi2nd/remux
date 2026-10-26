@@ -173,8 +173,8 @@ def ts_video_bsf(url):
     return ["-bsf:v", bsf] if bsf else []
 
 
-def ffprobe_duration(url):
-    out = run(["ffprobe", "-v", "error", *ua_for(url), "-show_entries",
+def ffprobe_duration(url, input_options=()):
+    out = run(["ffprobe", "-v", "error", *ua_for(url), *input_options, "-show_entries",
                "format=duration", "-of", "csv=p=0", url]).stdout.decode().strip()
     return float(out)
 
@@ -195,7 +195,7 @@ def decode(url, start, span, extra=()):
     return np.frombuffer(pcm, dtype=np.float32)
 
 
-def prescreen(video_url, dubfile, vdur, ddur, n=8, span=60.0, max_lag=75.0, min_ratio=10.0):
+def prescreen(video_url, dubfile, vdur, ddur, n=8, span=60.0, max_lag=75.0, min_ratio=10.0, input_options=()):
     """Cheap decision before any full read of the release: correlate `n`
     60 s windows spread over the file (byte-range seeks, ~30 MB each of
     interleaved data) against the dub at the same nominal time. Returns
@@ -209,7 +209,7 @@ def prescreen(video_url, dubfile, vdur, ddur, n=8, span=60.0, max_lag=75.0, min_
 
     def one(t):
         try:
-            a = decode(video_url, t, span)
+            a = decode(video_url, t, span, extra=input_options)
             b = decode(dubfile, t, span)
             m = min(len(a), len(b))
             if m < int(span * RATE * 0.8):

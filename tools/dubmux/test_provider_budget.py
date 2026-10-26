@@ -120,6 +120,50 @@ class ProviderBudgetTest(unittest.TestCase):
         reads.register(video)
         self.assertEqual(reads.source(video['id'],video['url'])['provider'],'premiumize')
 
+    def test_matching_reservations_extend_without_ticking_full_clock(self):
+        token=self.ledger.reserve('premiumize',50,'match',now=1000)
+        self.ledger.extend(token,50,now=1001)
+        self.assertEqual(self.ledger.status(1001)['providers']['premiumize']['reserved_bytes'],100)
+        self.assertEqual(self.ledger.status(1001)['providers']['premiumize']['active'],1)
+        with self.assertRaisesRegex(Limited,'daily_reservation_budget'):
+            self.ledger.extend(token,121,now=1002)
+        self.assertEqual(self.ledger.status(1002)['providers']['premiumize']['reserved_bytes'],100)
+        self.ledger.release(token)
+        self.ledger.reserve('premiumize',100,'full',now=1002)
+        self.assertEqual(self.ledger.status(1002)['providers']['premiumize']['reserved_bytes'],210)
+        with self.assertRaisesRegex(Limited,'expired_read_lease'):
+            self.ledger.extend(token,1,now=1003)
+
+    def test_matching_topups_are_atomic(self):
+        token=self.ledger.reserve('torbox',100,'match',now=1000)
+        def attempt(_):
+            try:
+                self.ledger.extend(token,200,now=1001)
+                return True
+            except Limited:return False
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            result=list(pool.map(attempt,range(20)))
+        self.assertEqual(sum(result),10)
+        self.assertEqual(self.ledger.status(1001)['providers']['torbox']['reserved_bytes'],2100)
+
+    def test_matching_cost_tracks_bounded_chunks_and_keeps_failed_reservations(self):
+        reads=MediaReads(self.root/'media')
+        reads.ledger=Ledger(self.root/'media/chunks.sqlite',
+                           {'premiumize':Policy(1000,1,3600,0), 'torbox':Policy(1000,3,0,0)})
+        video={'id':'hq','url':'https://source.invalid/file','provider':'premiumize','size':999999}
+        reads.register(video)
+        with self.assertRaisesRegex(RuntimeError,'fixture failure'):
+            with reads.matching('hq',video['url'],ceiling=600,increment=100) as reserve:
+                reserve(1)
+                reserve(101)
+                self.assertEqual(reads.ledger.status()['providers']['premiumize']['reserved_bytes'],200)
+                self.assertEqual(reads.ledger.status()['providers']['premiumize']['active'],1)
+                with self.assertRaisesRegex(Limited,'matching_byte_limit'):reserve(601)
+                raise RuntimeError('fixture failure')
+        status=reads.ledger.status()['providers']['premiumize']
+        self.assertEqual(status['reserved_bytes'],200)
+        self.assertEqual(status['active'],0)
+
     def test_official_torbox_cdns_keep_the_torbox_reservation(self):
         reads=MediaReads(self.root/'media')
         reads.ledger=Ledger(self.root/'media/cdn-test.sqlite',
