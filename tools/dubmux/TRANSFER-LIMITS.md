@@ -48,10 +48,16 @@ Native HTTP subtitle extraction disables automatic FFmpeg reconnects.
 Provider metadata identifies Premiumize/TorBox. Unknown HTTP sources use the
 stricter Premiumize bucket; recognized local/Vietnamese/Usenet sources bypass
 paid-provider accounting. The muxer binds trusted source metadata to URL hashes.
-A TorBox-labelled source resolving outside `*.torbox.app` is pinned to the
-strict bucket and deferred before its full read. This is conservative for
-unrecognized TorBox CDN domains. No signed URL or provider API key is stored
-in this registry or ledger.
+A TorBox-labelled source resolving outside TorBox's documented domains is
+pinned to the strict bucket and deferred before its full read. Recognized
+domains are `torbox.app` and `tb-cdn.{cx,io,pw,sh,st,to,earth}`, including their
+subdomains; matching requires a DNS label boundary. The list comes from
+[TorBox's official support page](https://support.torbox.app/en/articles/12667085-torbox-is-being-blocked-by-my-anti-virus-software).
+Unknown destinations still use the strict policy. Existing strict pins are
+preserved; correcting a false pin requires verifying the current destination
+and backing up the affected registry entry. Classification corrections never
+refund or reset previous reservations. No signed URL or provider API key is
+stored in this registry or ledger.
 
 ## Configuration
 

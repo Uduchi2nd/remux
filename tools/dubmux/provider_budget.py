@@ -17,6 +17,20 @@ from urllib.parse import urlsplit
 import uuid
 
 
+# TorBox's documented CDN domains, including the tb-cdn.st hosts returned by
+# Meteor. Match DNS label boundaries: similarly named third-party domains must
+# still fall back to the strict allowance.
+# https://support.torbox.app/en/articles/12667085-torbox-is-being-blocked-by-my-anti-virus-software
+TORBOX_DOMAINS = ("torbox.app", "tb-cdn.cx", "tb-cdn.io", "tb-cdn.pw",
+                  "tb-cdn.sh", "tb-cdn.st", "tb-cdn.to", "tb-cdn.earth")
+
+
+def is_torbox_host(host):
+    host = (host or "").lower().rstrip(".")
+    return any(host == domain or host.endswith("." + domain)
+               for domain in TORBOX_DOMAINS)
+
+
 @dataclass(frozen=True)
 class Policy:
     daily_bytes: int
@@ -200,7 +214,7 @@ class MediaReads:
             source = self.source(video_id, original)
             host = (urlsplit(resolved).hostname or "").lower()
             path = self.source_path(video_id)
-            strict = source["provider"] == "torbox" and not (host == "torbox.app" or host.endswith(".torbox.app"))
+            strict = source["provider"] == "torbox" and not is_torbox_host(host)
             # A TorBox label may fail over to another provider. Never allow that
             # unknown CDN to inherit TorBox's larger allowance.
             if strict:

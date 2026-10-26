@@ -120,5 +120,47 @@ class ProviderBudgetTest(unittest.TestCase):
         reads.register(video)
         self.assertEqual(reads.source(video['id'],video['url'])['provider'],'premiumize')
 
+    def test_official_torbox_cdns_keep_the_torbox_reservation(self):
+        reads=MediaReads(self.root/'media')
+        reads.ledger=Ledger(self.root/'media/cdn-test.sqlite',
+                           {'premiumize':Policy(1000,1,0,0),
+                            'torbox':Policy(10000,3,0,0)})
+        hosts=['cdn.torbox.app', 'nexus-292.weur.tb-cdn.st',
+               'store-046.wnam.tb-cdn.io', 'nexus.tb-cdn.cx',
+               'nexus.tb-cdn.pw', 'nexus.tb-cdn.sh', 'nexus.tb-cdn.to',
+               'nexus.tb-cdn.earth', 'NEXUS.WEUR.TB-CDN.ST.']
+        for i,host in enumerate(hosts):
+            with self.subTest(host=host):
+                video={'id':str(i),'url':'https://resolver.invalid/'+str(i),
+                       'provider':'torbox','size':100}
+                reads.register(video)
+                with reads.scope(video['id'],video['url']):
+                    reads.check_resolved(video['id'],video['url'],
+                                         'https://'+host+'/file')
+                # Reopen the registry to cover classification persistence.
+                reopened=MediaReads(self.root/'media')
+                self.assertEqual(reopened.source(video['id'],video['url'])['provider'],
+                                 'torbox')
+        status=reads.ledger.status()['providers']
+        self.assertEqual(status['premiumize']['reserved_bytes'],0)
+        self.assertEqual(status['torbox']['reserved_bytes'],len(hosts)*110)
+
+    def test_torbox_cdn_lookalikes_remain_pinned_to_strict_budget(self):
+        reads=MediaReads(self.root/'media')
+        hosts=['tb-cdn.st.attacker.invalid', 'nexus.tb-cdn.st.attacker.invalid',
+               'not-tb-cdn.st', 'torbox.app.attacker.invalid',
+               'tb-cdn.invalid', 'unknown-cdn.invalid']
+        for i,host in enumerate(hosts):
+            with self.subTest(host=host):
+                video={'id':str(i),'url':'https://resolver.invalid/'+str(i),
+                       'provider':'torbox','size':100}
+                reads.register(video)
+                with self.assertRaisesRegex(Limited,'provider_changed'):
+                    reads.check_resolved(video['id'],video['url'],
+                                         'https://'+host+'/file')
+                reads.register(video)
+                self.assertEqual(reads.source(video['id'],video['url'])['provider'],
+                                 'premiumize')
+
 
 if __name__=='__main__': unittest.main()
